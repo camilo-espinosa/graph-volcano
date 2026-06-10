@@ -6,7 +6,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.data_utils import generate_cross_volcano_eval_manifests
-from utils.data_utils import generate_nvchvc_5x2_manifests
+from utils.data_utils import generate_nvchvc_manifests
 
 DATA_ROOT = PROJECT_ROOT / "data"
 PREPARED_ROOT = DATA_ROOT / "prepared_data"
@@ -14,11 +14,10 @@ TARGET_VOLCANO = "NVCHVC"
 
 # Reproducible split/augmentation generation.
 RANDOM_SEED = 42
-REPEATS_5X2 = 5
-VAL_FRACTION_WITHIN_TRAIN = 0.20
+N_FOLDS = 5
+VAL_FRACTION_WITHIN_TRAIN = 0.15
 
-# AV and IC are upsampled per train split until each class reaches this count.
-AUGMENT_TARGET_COUNTS = {"AV": 1500, "IC": 1500}
+# AV and IC targets are inferred internally per fold as mean count of VT/LP/TR.
 AUGMENT_POLICIES = {
     "AV": (("shift", 0.50), ("shift_amp", 0.25), ("shift_noise", 0.25)),
     "IC": (("shift", 0.70), ("shift_amp", 0.20), ("shift_noise", 0.10)),
@@ -41,16 +40,15 @@ def main() -> None:
     gitkeep_path.touch(exist_ok=True)
 
     print(
-        "Generating NVCHVC 5x2 manifests with inner validation and augmented train splits..."
+        "Generating NVCHVC stratified 5-fold manifests with inner validation and augmented train splits..."
     )
-    generate_nvchvc_5x2_manifests(
+    generate_nvchvc_manifests(
         data_root=DATA_ROOT,
         prepared_root=PREPARED_ROOT,
         target_volcano=TARGET_VOLCANO,
         random_seed=RANDOM_SEED,
-        repeats=REPEATS_5X2,
+        n_splits=N_FOLDS,
         val_fraction_within_train=VAL_FRACTION_WITHIN_TRAIN,
-        augment_target_counts=AUGMENT_TARGET_COUNTS,
         augment_policies=AUGMENT_POLICIES,
         augment_time_shift=AUGMENT_TIME_SHIFT,
         augment_amplitude_low=AUGMENT_AMPLITUDE_LOW,
