@@ -1,0 +1,11 @@
+# Keep DATA folder structure, ignore actual data contents
+DATA/**
+!DATA/
+!DATA/**/
+!DATA/**/.gitkeep
+utils/__pycache__/data_utils.cpython-311.pyc
+utils/__pycache__/data_utils.cpython-313.pyc
+utils/__pycache__/model_utils.cpython-313.pyc
+models/__pycache__/UNet_GraphSAGE.cpython-313.pyc
+scripts/__pycache__/01_prepare_data.cpython-313.pyc
+.vscode/settings.json
