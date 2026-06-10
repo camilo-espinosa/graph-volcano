@@ -10,10 +10,9 @@ models/__pycache__/UNet_GraphSAGE.cpython-313.pyc
 scripts/__pycache__/01_prepare_data.cpython-313.pyc
 .vscode/settings.json
 models/__pycache__/UNet_GraphSAGE.cpython-311.pyc
-results/experiments/EXP_20260609_205359_NVCHVC_5fold/environment.json
-results/experiments/EXP_20260609_205359_NVCHVC_5fold/run_manifest.json
-results/experiments/EXP_20260609_205503_NVCHVC_5fold/environment.json
-results/experiments/EXP_20260609_205503_NVCHVC_5fold/run_manifest.json
-results/experiments/EXP_20260609_205651_NVCHVC_5fold/environment.json
-results/experiments/EXP_20260609_205651_NVCHVC_5fold/run_manifest.json
+# Keep RESULTS folder structure, ignore generated outputs
+results/**
+!results/
+!results/**/
+!results/.gitkeep
 utils/__pycache__/train_utils.cpython-311.pyc

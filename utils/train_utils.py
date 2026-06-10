@@ -1312,7 +1312,7 @@ def train_one_ablation_fold(
             optimizer.step()
             train_loss += float(loss.item())
 
-            if batch_idx % 50 == 0:
+            if batch_idx % 100 == 0:
                 print(
                     f"  Epoch {epoch:03d} batch {batch_idx:04d}/{len(train_loader)} | "
                     f"loss={loss.item():.4f} dice={dice_component.item():.4f} ce={ce_component.item():.4f}"

@@ -116,6 +116,7 @@ CONFIG = {
     "save_confusion_matrix_each_epoch": True,
     "seed": 42,
 }
+FOLDS = range(1, 3)
 
 
 # ------------------------------ PATHS AND OUTPUTS -------------------------------
@@ -125,8 +126,6 @@ EXPERIMENTS_ROOT = RESULTS_ROOT / "experiments"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 EXPERIMENT_NAME = f"EXP_{TIMESTAMP}_{CONFIG['volcano']}_5fold"
 EXPERIMENT_ROOT = EXPERIMENTS_ROOT / EXPERIMENT_NAME
-
-FOLDS = range(1, 6)
 
 
 def main() -> None:
