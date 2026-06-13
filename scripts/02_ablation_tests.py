@@ -47,15 +47,25 @@ V5_FULL_KWARGS = {
     "virtual_node_pool_mode": "learned",
     "bottleneck_virtual_node_pool_mode": "learned",
     "use_skip_graph": True,
+    "init_features": 16,
+    "depth": 5,
 }
 
 ABLATION_MODEL_KWARGS = {
-    "v5_full": {
+    # "v5_full_with_level_2": {
+    #     **V5_FULL_KWARGS,
+    #     "graph_levels":[2, 3, 4]
+    # },
+    "v5_full_bigger_model": {
         **V5_FULL_KWARGS,
+          "init_features": 24,
     },
     "v5_full_all_levels": {
         **V5_FULL_KWARGS,
         "attention_pool_mode": "all_levels",
+    },
+    "v5_full": {
+        **V5_FULL_KWARGS,
     },
     "ablation_2_mlp_backend": {
         **V5_FULL_KWARGS,
@@ -105,18 +115,18 @@ ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
 CONFIG = {
     "volcano": "NVCHVC",
     "arch": "UNet_GraphSAGE",
-    "batch_size": 12,
-    "epochs": 1,
-    "early_stop_patience": 20,
-    "lr": 5e-4,
-    "lr_final": 5e-6,
+    "batch_size": 14,
+    "epochs": 200,
+    "early_stop_patience": 30,
+    "lr": 1e-4,
+    "lr_final": 1e-6,
     "dice_weight": 0.7,
     "ce_weight": 0.3,
-    "val_plot_events": 1,
+    "val_plot_events": 20,
     "save_confusion_matrix_each_epoch": True,
     "seed": 42,
 }
-FOLDS = range(1, 3)
+FOLDS = range(1, 6)
 
 
 # ------------------------------ PATHS AND OUTPUTS -------------------------------
@@ -177,6 +187,8 @@ def main() -> None:
     leaderboard_rows = []
 
     for ablation_name in selected:
+        if ablation_name == 'v5_full_bigger_model':
+            CONFIG['batch_size'] = 8
         ablation_root = EXPERIMENT_ROOT / "ablations" / ablation_name
         aggregate_dir = ablation_root / "aggregate"
         aggregate_dir.mkdir(parents=True, exist_ok=True)

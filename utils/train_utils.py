@@ -1258,8 +1258,6 @@ def train_one_ablation_fold(
     model = UNet_GraphSAGE(
         in_channels=1,
         out_channels=6,
-        init_features=16,
-        depth=5,
         **model_kwargs,
     ).to(device)
 
@@ -1270,7 +1268,7 @@ def train_one_ablation_fold(
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=max(1, int(config["epochs"] / 2)),
+        T_max=max(1, int(config["epochs"] / 4)),
         eta_min=config["lr_final"],
     )
 
