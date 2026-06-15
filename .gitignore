@@ -16,3 +16,13 @@ results/**
 !results/**/
 !results/.gitkeep
 utils/__pycache__/train_utils.cpython-311.pyc
+architecture
+architecture_depth_1
+architecture_depth_1_nested
+architecture_depth_1_nested.pdf
+architecture_depth_1.pdf
+architecture_depth_2
+architecture_depth_2_nested
+architecture_depth_2_nested.pdf
+architecture_depth_2.pdf
+architecture.pdf

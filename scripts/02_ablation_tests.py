@@ -56,17 +56,17 @@ ABLATION_MODEL_KWARGS = {
     #     **V5_FULL_KWARGS,
     #     "graph_levels":[2, 3, 4]
     # },
-    "v5_full_bigger_model": {
-        **V5_FULL_KWARGS,
-          "init_features": 24,
-    },
-    "v5_full_all_levels": {
-        **V5_FULL_KWARGS,
-        "attention_pool_mode": "all_levels",
-    },
-    "v5_full": {
-        **V5_FULL_KWARGS,
-    },
+    # "v5_full_bigger_model": {
+    #     **V5_FULL_KWARGS,
+    #       "init_features": 24,
+    # },
+    # "v5_full_all_levels": {
+    #     **V5_FULL_KWARGS,
+    #     "attention_pool_mode": "all_levels",
+    # },
+    # "v5_full": {
+    #     **V5_FULL_KWARGS,
+    # },
     "ablation_2_mlp_backend": {
         **V5_FULL_KWARGS,
         "graph_backend": "mlp",
@@ -100,24 +100,35 @@ ABLATION_MODEL_KWARGS = {
         **V5_FULL_KWARGS,
         "use_skip_graph": False,
     },
-    "ablation_10_learned_station_embedding_only": {
-        **V5_FULL_KWARGS,
-        "node_feature_mode": "learned_station_embedding",
-        "station_embedding_dim": 3,
-    },
+    # "ablation_10_learned_station_embedding_only": {
+    #     **V5_FULL_KWARGS,
+    #     "node_feature_mode": "learned_station_embedding",
+    #     "station_embedding_dim": 3,
+    # },
 }
 
+
+batch_sizes = {
+    "ablation_2_mlp_backend": 24,
+    "ablation_3_no_message_passing": 28,
+    "ablation_4_no_bottleneck_attention": 20,
+    "ablation_5_no_norm": 26,
+    "ablation_6_batchnorm": 24,
+    "ablation_7_mean_virtual_node_pool": 20,
+    "ablation_8_graph_only_bottleneck": 36,
+    "ablation_9_no_skip_graph": 24,
+}
 # By default, run all listed ablations. Customize this list as needed.
 ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
-
+ABLATIONS_TO_RUN.reverse()
 
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
     "volcano": "NVCHVC",
     "arch": "UNet_GraphSAGE",
-    "batch_size": 14,
+    "batch_size": 24,
     "epochs": 200,
-    "early_stop_patience": 30,
+    "early_stop_patience": 20,
     "lr": 1e-4,
     "lr_final": 1e-6,
     "dice_weight": 0.7,
@@ -187,8 +198,7 @@ def main() -> None:
     leaderboard_rows = []
 
     for ablation_name in selected:
-        if ablation_name == 'v5_full_bigger_model':
-            CONFIG['batch_size'] = 8
+        CONFIG["batch_size"] = batch_sizes[ablation_name]
         ablation_root = EXPERIMENT_ROOT / "ablations" / ablation_name
         aggregate_dir = ablation_root / "aggregate"
         aggregate_dir.mkdir(parents=True, exist_ok=True)
