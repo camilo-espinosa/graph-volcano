@@ -657,10 +657,10 @@ def compute_event_f1_iou_graphsage(
     model.eval()
     pred_label = []
     true_label = []
-    y_pred_temporal_all = []
-    y_true_temporal_all = []
     iou_scores = []
     iou_by_true_class = {c: [] for c in event_classes}
+    temporal_intersections = np.zeros(6, dtype=np.int64)
+    temporal_unions = np.zeros(6, dtype=np.int64)
     val_loss_sum = 0.0
     val_batch_count = 0
     class_names = ["BG", "VT", "LP", "TR", "AV", "IC"]
@@ -895,8 +895,13 @@ def compute_event_f1_iou_graphsage(
             # argmax over classes -> BG mask -> event mask.
             true_max_idx = torch.argmax(y_onehot, dim=1)  # [B, T]
             pred_max_idx = torch.argmax(probs, dim=1)  # [B, T]
-            y_true_temporal_all.append(true_max_idx.detach().cpu().numpy().reshape(-1))
-            y_pred_temporal_all.append(pred_max_idx.detach().cpu().numpy().reshape(-1))
+            true_max_idx_np = true_max_idx.detach().cpu().numpy().reshape(-1)
+            pred_max_idx_np = pred_max_idx.detach().cpu().numpy().reshape(-1)
+            for c in range(6):
+                pred_mask = pred_max_idx_np == c
+                true_mask = true_max_idx_np == c
+                temporal_intersections[c] += int(np.logical_and(pred_mask, true_mask).sum())
+                temporal_unions[c] += int(np.logical_or(pred_mask, true_mask).sum())
             true_bg_mask = (true_max_idx == 0).float()
             pred_bg_mask = (pred_max_idx == 0).float()
             true_event_mask = 1.0 - true_bg_mask
@@ -916,6 +921,31 @@ def compute_event_f1_iou_graphsage(
                 if class_vals.size > 0:
                     iou_by_true_class[c].extend(class_vals.tolist())
 
+            del (
+                xb,
+                y_onehot,
+                y_label,
+                output,
+                probs,
+                pred_evt_batch,
+                true_evt_batch,
+                true_max_idx,
+                pred_max_idx,
+                true_bg_mask,
+                pred_bg_mask,
+                true_event_mask,
+                pred_event_mask,
+                inter,
+                denom,
+                iou_like_batch,
+            )
+            if descriptor_payload is not None:
+                del descriptor_payload
+            if envelope_b is not None:
+                del envelope_b
+            if descriptors_b is not None:
+                del descriptors_b
+
     cm = confusion_matrix(true_label, pred_label, labels=list(event_classes))
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
     mean_f1 = float(np.mean(f1_scores))
@@ -927,14 +957,10 @@ def compute_event_f1_iou_graphsage(
     mean_iou = float(np.mean(iou_scores)) if len(iou_scores) > 0 else 0.0
 
     # Extra multiclass temporal IoU over all classes [BG, VT, LP, TR, AV, IC].
-    y_true_temporal = np.concatenate(y_true_temporal_all)
-    y_pred_temporal = np.concatenate(y_pred_temporal_all)
     iou_all_classes = []
     for c in range(6):
-        pred_mask = y_pred_temporal == c
-        true_mask = y_true_temporal == c
-        inter = np.logical_and(pred_mask, true_mask).sum()
-        union = np.logical_or(pred_mask, true_mask).sum()
+        inter = int(temporal_intersections[c])
+        union = int(temporal_unions[c])
         iou_all_classes.append(float(inter / union) if union > 0 else 0.0)
     mean_iou_all = float(np.mean(iou_all_classes))
     mean_val_loss = (
@@ -965,10 +991,10 @@ class UNetPatchDataset(Dataset):
         return_debug: bool = False,
         return_meta: bool = False,
     ):
-        data = np.load(npz_path)
-        self.filepaths = data["filepaths"]
-        self.labels = data["labels"]
-        self.label_ids = data["label_ids"].astype(np.int64)
+        with np.load(npz_path) as data:
+            self.filepaths = data["filepaths"].copy()
+            self.labels = data["labels"].copy()
+            self.label_ids = data["label_ids"].astype(np.int64, copy=True)
         self.return_debug = return_debug
         self.return_meta = return_meta
 
@@ -1038,13 +1064,15 @@ class GraphSAGEDataset(Dataset):
         npz_path: Path,
         descriptor_names: Sequence[str] | str | None = None,
     ):
-        data = np.load(npz_path)
-        self.filepaths = data["filepaths"]
-        self.descriptor_paths = (
-            data["descriptor_paths"] if "descriptor_paths" in data else None
-        )
-        self.labels = data["labels"]
-        self.label_ids = data["label_ids"].astype(np.int64)
+        with np.load(npz_path) as data:
+            self.filepaths = data["filepaths"].copy()
+            self.descriptor_paths = (
+                data["descriptor_paths"].copy()
+                if "descriptor_paths" in data
+                else None
+            )
+            self.labels = data["labels"].copy()
+            self.label_ids = data["label_ids"].astype(np.int64, copy=True)
 
         self.descriptor_names = self._normalize_descriptor_names(descriptor_names)
         self.use_descriptors = len(self.descriptor_names) > 0
@@ -1252,7 +1280,7 @@ def train_one_ablation_fold(
         train_ds.label_ids, batch_size=config["batch_size"]
     )
     train_loader = DataLoader(train_ds, batch_sampler=balanced_batch_sampler)
-    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False,)
     test_loader = DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False)
 
     model = UNet_GraphSAGE(

@@ -13,6 +13,7 @@ Results are written under:
 
 from __future__ import annotations
 
+import gc
 import json
 from datetime import datetime
 from pathlib import Path
@@ -100,35 +101,24 @@ ABLATION_MODEL_KWARGS = {
         **V5_FULL_KWARGS,
         "use_skip_graph": False,
     },
-    # "ablation_10_learned_station_embedding_only": {
-    #     **V5_FULL_KWARGS,
-    #     "node_feature_mode": "learned_station_embedding",
-    #     "station_embedding_dim": 3,
-    # },
+    "ablation_10_learned_station_embedding_only": {
+        **V5_FULL_KWARGS,
+        "node_feature_mode": "learned_station_embedding",
+        "station_embedding_dim": 3,
+    },
 }
 
-
-batch_sizes = {
-    "ablation_2_mlp_backend": 24,
-    "ablation_3_no_message_passing": 28,
-    "ablation_4_no_bottleneck_attention": 20,
-    "ablation_5_no_norm": 26,
-    "ablation_6_batchnorm": 24,
-    "ablation_7_mean_virtual_node_pool": 20,
-    "ablation_8_graph_only_bottleneck": 36,
-    "ablation_9_no_skip_graph": 24,
-}
 # By default, run all listed ablations. Customize this list as needed.
 ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
-ABLATIONS_TO_RUN.reverse()
+
 
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
     "volcano": "NVCHVC",
     "arch": "UNet_GraphSAGE",
-    "batch_size": 24,
+    "batch_size": 16,
     "epochs": 200,
-    "early_stop_patience": 20,
+    "early_stop_patience": 30,
     "lr": 1e-4,
     "lr_final": 1e-6,
     "dice_weight": 0.7,
@@ -196,9 +186,13 @@ def main() -> None:
     print(f"Ablations to run ({len(selected)}): {selected}")
 
     leaderboard_rows = []
+    base_batch_size = int(CONFIG["batch_size"])
 
     for ablation_name in selected:
-        CONFIG["batch_size"] = batch_sizes[ablation_name]
+        if ablation_name == 'v5_full_bigger_model':
+            ablation_config = {**CONFIG, "batch_size": 8}
+        else:
+            ablation_config = {**CONFIG, "batch_size": base_batch_size}
         ablation_root = EXPERIMENT_ROOT / "ablations" / ablation_name
         aggregate_dir = ablation_root / "aggregate"
         aggregate_dir.mkdir(parents=True, exist_ok=True)
@@ -217,7 +211,7 @@ def main() -> None:
                 fold_data_dir=fold_data_dir,
                 fold_out_dir=fold_out_dir,
                 device=device,
-                config=CONFIG,
+                config=ablation_config,
             )
             fold_summaries.append(fold_summary)
 
@@ -274,6 +268,17 @@ def main() -> None:
         )
 
         cleanup_gpu_cache()
+        del (
+            fold_df,
+            fold_summaries,
+            val_f1_values,
+            test_f1_values,
+            test_iou_values,
+            test_iou_all_values,
+            ablation_summary,
+            ablation_config,
+        )
+        gc.collect()
 
     comparisons_dir = EXPERIMENT_ROOT / "comparisons"
     comparisons_dir.mkdir(parents=True, exist_ok=True)
