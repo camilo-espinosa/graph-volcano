@@ -541,8 +541,10 @@ class UNet_MPNN(nn.Module):
         """Repeat static edge attrs to [num_graphs*num_edges, static_dim]."""
         ea = self.edge_attr_base.to(device=device, dtype=dtype)
         num_edges, dim = ea.shape
-        return ea.unsqueeze(0).expand(num_graphs, num_edges, dim).reshape(
-            num_graphs * num_edges, dim
+        return (
+            ea.unsqueeze(0)
+            .expand(num_graphs, num_edges, dim)
+            .reshape(num_graphs * num_edges, dim)
         )
 
     def _build_batched_edge_attr_dynamic(
@@ -622,9 +624,7 @@ class UNet_MPNN(nn.Module):
             )
         if self.use_rsam_node_feat:
             if rsam is None:
-                rsam_nodes = torch.zeros(
-                    B, self.n_nodes, 1, device=device, dtype=dtype
-                )
+                rsam_nodes = torch.zeros(B, self.n_nodes, 1, device=device, dtype=dtype)
             else:
                 r = rsam.to(device=device, dtype=dtype)
                 stn = r.unsqueeze(-1)  # [B, S, 1]
@@ -636,9 +636,7 @@ class UNet_MPNN(nn.Module):
                 .reshape(num_graphs, self.n_nodes, 1)
             )
         if not parts:
-            return torch.empty(
-                num_graphs, self.n_nodes, 0, device=device, dtype=dtype
-            )
+            return torch.empty(num_graphs, self.n_nodes, 0, device=device, dtype=dtype)
         return torch.cat(parts, dim=2)
 
     # =============================== graph op ==================================
@@ -682,9 +680,7 @@ class UNet_MPNN(nn.Module):
         x_aug = torch.cat([x_bst, network_feature], dim=1)  # [B, n_nodes, C, T_l]
         x_nodes_in = x_aug.permute(0, 3, 1, 2).reshape(num_graphs, self.n_nodes, C)
 
-        node_feats = self._build_node_features(
-            num_graphs, B, T_l, rsam, device, dtype
-        )
+        node_feats = self._build_node_features(num_graphs, B, T_l, rsam, device, dtype)
         if node_feats.shape[-1] > 0:
             x_in = torch.cat([x_nodes_in, node_feats], dim=2)
         else:
@@ -941,4 +937,3 @@ MPNN_ABLATION_KWARGS = {
         graph_norm="none",
     ),
 }
-

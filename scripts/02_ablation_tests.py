@@ -97,7 +97,6 @@ ABLATION_MODEL_KWARGS = {
 }
 
 
-
 # GraphSAGE batch sizes (commented out, for reference)
 # batch_sizes = {
 #     "ablation_11_no_node_features": 20,
@@ -113,14 +112,14 @@ ABLATION_MODEL_KWARGS = {
 
 # MPNN batch sizes
 batch_sizes = {
-    "edge_mpnn__bottleneck": 24,
-    "edge_mpnn__no_edge_feats": 24,
-    "edge_mpnn__encoder": 24,
-    "edge_mpnn__star_topology": 24,
-    "edge_mpnn__xcorr": 24,
-    "edge_mpnn__no_spatial_info": 24,
-    "edge_mpnn__rsam": 24,
-    "edge_mpnn__no_attention": 24,
+    "edge_mpnn__bottleneck": 10,
+    "edge_mpnn__no_edge_feats": 10,
+    "edge_mpnn__encoder": 10,
+    "edge_mpnn__star_topology": 10,
+    "edge_mpnn__xcorr": 10,
+    "edge_mpnn__no_spatial_info": 10,
+    "edge_mpnn__rsam": 10,
+    "edge_mpnn__no_attention": 10,
 }
 # By default, run all listed ablations. Customize this list as needed.
 ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
@@ -368,7 +367,9 @@ def write_ablation_aggregate(
     return leaderboard_row
 
 
-def write_global_comparisons(experiment_root: Path, leaderboard_rows: list[dict]) -> None:
+def write_global_comparisons(
+    experiment_root: Path, leaderboard_rows: list[dict]
+) -> None:
     comparisons_dir = experiment_root / "comparisons"
     comparisons_dir.mkdir(parents=True, exist_ok=True)
 
@@ -454,7 +455,12 @@ def write_global_comparisons(experiment_root: Path, leaderboard_rows: list[dict]
     )
 
 
-def run_train_mode(device: torch.device, selected: list[str], experiment_root: Path, experiment_name: str) -> None:
+def run_train_mode(
+    device: torch.device,
+    selected: list[str],
+    experiment_root: Path,
+    experiment_name: str,
+) -> None:
     run_manifest = {
         "experiment_name": experiment_name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -522,7 +528,9 @@ def run_train_mode(device: torch.device, selected: list[str], experiment_root: P
         )
         cleanup_gpu_cache()
 
-    write_global_comparisons(experiment_root=experiment_root, leaderboard_rows=leaderboard_rows)
+    write_global_comparisons(
+        experiment_root=experiment_root, leaderboard_rows=leaderboard_rows
+    )
 
     latest_dir = RESULTS_ROOT / "latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
@@ -540,7 +548,9 @@ def run_train_mode(device: torch.device, selected: list[str], experiment_root: P
     print("=" * 80)
     print("Ablation 5-fold run complete")
     print(f"Experiment folder: {experiment_root}")
-    print(f"Leaderboard: {experiment_root / 'comparisons' / 'ablation_leaderboard.csv'}")
+    print(
+        f"Leaderboard: {experiment_root / 'comparisons' / 'ablation_leaderboard.csv'}"
+    )
     print("=" * 80)
 
 
@@ -561,7 +571,9 @@ def run_aggregate_only_mode(
     for ablation_name in selected:
         ablation_root = ablations_root / ablation_name
         if not ablation_root.exists():
-            print(f"[WARN] Skipping '{ablation_name}': folder not found at {ablation_root}")
+            print(
+                f"[WARN] Skipping '{ablation_name}': folder not found at {ablation_root}"
+            )
             continue
 
         aggregate_dir = ablation_root / "aggregate"
@@ -598,9 +610,13 @@ def run_aggregate_only_mode(
         )
 
     if not leaderboard_rows:
-        raise RuntimeError("No ablations could be aggregated. Check folders and fold_summary.json files.")
+        raise RuntimeError(
+            "No ablations could be aggregated. Check folders and fold_summary.json files."
+        )
 
-    write_global_comparisons(experiment_root=experiment_root, leaderboard_rows=leaderboard_rows)
+    write_global_comparisons(
+        experiment_root=experiment_root, leaderboard_rows=leaderboard_rows
+    )
 
     latest_dir = RESULTS_ROOT / "latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
@@ -618,7 +634,9 @@ def run_aggregate_only_mode(
     print("=" * 80)
     print("Ablation aggregation complete")
     print(f"Experiment folder: {experiment_root}")
-    print(f"Leaderboard: {experiment_root / 'comparisons' / 'ablation_leaderboard.csv'}")
+    print(
+        f"Leaderboard: {experiment_root / 'comparisons' / 'ablation_leaderboard.csv'}"
+    )
     print("=" * 80)
 
 
@@ -640,7 +658,9 @@ def main() -> None:
         )
         return
 
-    experiment_root = resolve_project_path(args.experiment_root or EXPERIMENT_ROOT, PROJECT_ROOT)
+    experiment_root = resolve_project_path(
+        args.experiment_root or EXPERIMENT_ROOT, PROJECT_ROOT
+    )
     experiment_root.mkdir(parents=True, exist_ok=True)
     run_train_mode(
         device=device,
