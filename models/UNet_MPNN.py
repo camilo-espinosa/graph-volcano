@@ -853,17 +853,44 @@ class UNet_MPNN(nn.Module):
 MPNN_ABLATION_KWARGS = {
     # Defaults: fully_connected, delta_pos edges, bottleneck-only MPNN,
     # skip-graph off, bottleneck attention on, no graph norm. Run first.
-    "edge_mpnn__bottleneck": dict(
+    # "edge_mpnn__bottleneck": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),
+    # THE key test: drop edge features architecturally (message MLP loses its
+    # edge slice). Proves whether edge geometry matters.
+    "edge_mpnn__early_l2": dict(
         graph_topology="fully_connected",
         edge_feature_mode="delta_pos",
         node_feature_mode="geometry",
-        graph_levels=[],
+        graph_levels=[2],           # level 2 only, no bottleneck graph
         use_skip_graph=False,
         use_bottleneck_attention=True,
         graph_norm="none",
     ),
-    # THE key test: drop edge features architecturally (message MLP loses its
-    # edge slice). Proves whether edge geometry matters.
+    "edge_mpnn__early_l1": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="delta_pos",
+        node_feature_mode="geometry",
+        graph_levels=[1],           # level 1 only, no bottleneck graph
+        use_skip_graph=False,
+        use_bottleneck_attention=True,
+        graph_norm="none",
+    ),
+    "edge_mpnn__both_l2_bottleneck": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="delta_pos",
+        node_feature_mode="geometry",
+        graph_levels=[2],           # early + bottleneck (bottleneck always present)
+        use_skip_graph=False,
+        use_bottleneck_attention=True,
+        graph_norm="none",
+    ),    
     "edge_mpnn__no_edge_feats": dict(
         graph_topology="fully_connected",
         edge_feature_mode="none",
