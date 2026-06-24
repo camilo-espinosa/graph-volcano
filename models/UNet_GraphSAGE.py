@@ -12,6 +12,35 @@ Input:  [B, S, T]  where B=batch, S=stations (8), T=temporal samples (8192)
 Output: [B, 6, T]  where 6 = number of classes (BG, VT, LP, TR, AV, IC)
 """
 
+"""
+**New structural components**
+
+- **Star graph**: S station nodes + 1 virtual network node, with bidirectional edges between each station and the virtual node. Geometry features (x_km, y_km, dist_to_crater) or learned station embeddings are concatenated to node features before message passing.
+- **GraphSAGE layers** applied at selected encoder levels and on skip connections, replacing independent per-station processing with cross-station message passing.
+- **Virtual node readout**: the network node aggregates all station information and its embedding is used as the skip/bottleneck feature passed to the decoder, collapsing [B*S, C, T] → [B, C, T].
+- **StationAttentionPool**: a small MLP that computes per-station attention scores and produces a weighted pooled representation of the virtual node (instead of simple mean pooling).
+- **Bottleneck temporal self-attention (MHSA)**: a Transformer-style block (LayerNorm → MultiheadAttention + residual → FFN + residual) applied on the bottleneck sequence [B, T_bottleneck, C] after the graph readout.
+- **GraphNorm / BatchNorm** applied after every graph operation.
+
+**What can be configured**
+
+| Parameter | Controls |
+|---|---|
+| `graph_levels` | Which encoder depths run GraphSAGE |
+| `use_skip_graph` / `skip_graph_levels` | Whether skip connections also run GraphSAGE |
+| `graphsage_layers` / `skip_graphsage_layers` | Depth of GraphSAGE stacks |
+| `graph_backend` | `"graphsage"` (message passing) or `"mlp"` (per-station, no communication) |
+| `use_message_passing` | Bypass GraphSAGE and use virtual-node readout only |
+| `virtual_node_pool_mode` | `"learned"` (attention pool) or `"mean"` for all non-bottleneck levels |
+| `bottleneck_virtual_node_pool_mode` | Override pooling specifically at bottleneck |
+| `attention_pool_mode` | `"bottleneck_only"` or `"all_levels"` for learned pooling |
+| `use_bottleneck_attention` | Toggle the MHSA block |
+| `bottleneck_attn_heads/dropout/ff_mult` | MHSA hyperparameters |
+| `graph_norm_type` | `"graphnorm"`, `"batchnorm"`, or `"none"` |
+| `node_feature_mode` | `"geometry"`, `"learned_station_embedding"`, or `"both"` |
+| `n_stations`, `station_coords`, `crater_coords` | Station count and spatial layout |
+
+"""
 from collections import OrderedDict
 from typing import List, Literal, Optional
 
