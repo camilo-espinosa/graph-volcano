@@ -28,3 +28,14 @@ architecture_depth_2.pdf
 architecture.pdf
 scripts/__pycache__/02_ablation_tests.cpython-311.pyc
 scripts/__pycache__/EXAMPLE_TRAIN.cpython-313.pyc
+models/__pycache__/UNet_bottleneck_attention.cpython-311.pyc
+models/__pycache__/UNet.cpython-311.pyc
+utils/__pycache__/station_info.cpython-311.pyc
+utils/__pycache__/script_common.cpython-311.pyc
+utils/__pycache__/metrics_report_utils.cpython-311.pyc
+utils/__pycache__/fold_io_utils.cpython-311.pyc
+utils/__pycache__/finetune_utils.cpython-311.pyc
+scripts/__pycache__/06_ablations_finetune_cross_volcano.cpython-311.pyc
+scripts/__pycache__/05_zero_shot_unet_cross_volcano.cpython-311.pyc
+scripts/__pycache__/04_zero_shot_cross_volcano.cpython-311.pyc
+scripts/__pycache__/03_unet_5fold.cpython-311.pyc

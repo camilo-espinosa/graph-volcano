@@ -10,10 +10,19 @@ import torch.nn as nn
 # original documentation and usage guidelines.
 
 
-class UNet(nn.Module):
+class UNetBottleneckAttention(nn.Module):
 
-    def __init__(self, in_channels=3, out_channels=1, init_features=32, depth=4):
-        super(UNet, self).__init__()
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=1,
+        init_features=32,
+        depth=4,
+        bottleneck_attn_heads=4,
+        bottleneck_attn_dropout=0.0,
+        bottleneck_attn_ff_mult=2,
+    ):
+        super().__init__()
 
         features = init_features
         self.encoder_list = nn.ModuleList()
@@ -24,14 +33,43 @@ class UNet(nn.Module):
         feat_in = in_channels
         for idx in range(depth):
             feat_out = features * 2 ** (idx)
-            encoder = UNet._block(feat_in, feat_out, name=f"enc{idx}")
+            encoder = self._block(feat_in, feat_out, name=f"enc{idx}")
             feat_in = feat_out
             pool = nn.MaxPool2d(kernel_size=2, stride=2)
             self.encoder_list.append(encoder)
             self.pool_list.append(pool)
 
-        self.bottleneck = UNet._block(
+        self.bottleneck_channels = features * 2**depth
+        self.bottleneck = self._block(
             features * 2 ** (depth - 1), features * 2**depth, name="bottleneck"
+        )
+
+        if self.bottleneck_channels % bottleneck_attn_heads != 0:
+            raise ValueError(
+                "bottleneck channels must be divisible by bottleneck_attn_heads. "
+                f"Got C={self.bottleneck_channels}, heads={bottleneck_attn_heads}."
+            )
+
+        self.bottleneck_attn_norm1 = nn.LayerNorm(self.bottleneck_channels)
+        self.bottleneck_attn = nn.MultiheadAttention(
+            embed_dim=self.bottleneck_channels,
+            num_heads=bottleneck_attn_heads,
+            dropout=bottleneck_attn_dropout,
+            batch_first=True,
+        )
+        self.bottleneck_attn_norm2 = nn.LayerNorm(self.bottleneck_channels)
+        self.bottleneck_ff = nn.Sequential(
+            nn.Linear(
+                self.bottleneck_channels,
+                self.bottleneck_channels * bottleneck_attn_ff_mult,
+            ),
+            nn.GELU(),
+            nn.Dropout(bottleneck_attn_dropout),
+            nn.Linear(
+                self.bottleneck_channels * bottleneck_attn_ff_mult,
+                self.bottleneck_channels,
+            ),
+            nn.Dropout(bottleneck_attn_dropout),
         )
 
         for idx in range(depth):
@@ -41,12 +79,23 @@ class UNet(nn.Module):
             upconv = nn.ConvTranspose2d(feat_in, feat_out, kernel_size=2, stride=2)
             self.upconv_list.append(upconv)
 
-            decoder = UNet._block(feat_in, feat_out, name=f"dec{depth-idx}")
+            decoder = self._block(feat_in, feat_out, name=f"dec{depth-idx}")
             self.decoder_list.append(decoder)
 
         self.conv = nn.Conv2d(
             in_channels=features, out_channels=out_channels, kernel_size=1
         )
+
+    def _apply_bottleneck_attention(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, height, width = x.shape
+        x_seq = x.flatten(2).transpose(1, 2)
+
+        x_norm = self.bottleneck_attn_norm1(x_seq)
+        x_attn, _ = self.bottleneck_attn(x_norm, x_norm, x_norm, need_weights=False)
+        x_seq = x_seq + x_attn
+        x_seq = x_seq + self.bottleneck_ff(self.bottleneck_attn_norm2(x_seq))
+
+        return x_seq.transpose(1, 2).reshape(batch_size, channels, height, width)
 
     def forward(self, x):
         encodings = []
@@ -57,6 +106,7 @@ class UNet(nn.Module):
                 x = self.pool_list[i](x)
 
         x = self.bottleneck(x)
+        x = self._apply_bottleneck_attention(x)
 
         for i in range(len(self.decoder_list)):
             x = self.upconv_list[i](x)
