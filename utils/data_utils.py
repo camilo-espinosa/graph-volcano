@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
 
 CLASS_TO_ID = {"VT": 1, "LP": 2, "TR": 3, "AV": 4, "IC": 5}
 VALID_CLASSES = tuple(CLASS_TO_ID.keys())
@@ -12,6 +13,114 @@ DEFAULT_AUGMENT_POLICIES = {
     "AV": (("shift", 0.50), ("shift_amp", 0.25), ("shift_noise", 0.25)),
     "IC": (("shift", 0.70), ("shift_amp", 0.20), ("shift_noise", 0.10)),
 }
+
+
+def patch_stacking_X(x: torch.Tensor, N: int = 256) -> torch.Tensor:
+    """
+    Convert waveform tensor to 2D patch image format expected by UNet.
+
+    Input:
+    - [S, T] or [B, S, T]
+
+    Output:
+    - [B, 1, N, N]
+
+    This mirrors the transform used in EXAMPLE_TRAIN.CustomTrace2DDataset.
+    """
+    if x.ndim == 2:
+        x = x.unsqueeze(0)
+    if x.ndim != 3:
+        raise ValueError(
+            f"patch_stacking_X expected [S,T] or [B,S,T], got shape {tuple(x.shape)}"
+        )
+
+    batch_out = []
+    for sample in x:
+        patches = sample.unfold(1, N, N)
+        patches = patches.permute(1, 0, 2)
+        sample_img = patches.reshape(-1, N).unsqueeze(0)
+        batch_out.append(sample_img)
+
+    return torch.stack(batch_out, dim=0)
+
+
+def patch_stacking_y(
+    y: torch.Tensor,
+    N: int = 256,
+    n_classes: int = 6,
+    n_stations: int = 8,
+) -> torch.Tensor:
+    """
+    Convert one-hot labels to 2D patch image format expected by UNet loss/eval.
+
+    Input:
+    - [C, T] or [B, C, T]
+
+    Output:
+    - [B, C, N, N]
+
+    This mirrors the transform used in EXAMPLE_TRAIN.CustomTrace2DDataset.
+    """
+    if y.ndim == 2:
+        y = y.unsqueeze(0)
+    if y.ndim != 3:
+        raise ValueError(
+            f"patch_stacking_y expected [C,T] or [B,C,T], got shape {tuple(y.shape)}"
+        )
+
+    if y.shape[1] != n_classes:
+        raise ValueError(
+            f"patch_stacking_y expected class dim={n_classes}, got {y.shape[1]}"
+        )
+
+    batch_out = []
+    for sample in y:
+        patches = sample.repeat(n_stations, 1, 1)
+        patches = patches.permute(1, 0, 2)
+        patches = patches.unfold(2, N, N)
+        patches = patches.permute(0, 2, 1, 3)
+        sample_img = patches.reshape(n_classes, -1, N)
+        batch_out.append(sample_img)
+
+    return torch.stack(batch_out, dim=0)
+
+
+def activation_unstacking(
+    img: torch.Tensor,
+    len_window: int = 8192,
+    N: int = 256,
+    n_classes: int = 6,
+    n_stations: int = 8,
+) -> torch.Tensor:
+    """
+    Map patch-domain activations [B,C,N,N] back to trace-domain [B,C,T].
+
+    This reproduces EXAMPLE_TRAIN.img_to_trace_y behavior.
+    """
+    if img.ndim != 4:
+        raise ValueError(
+            f"activation_unstacking expected [B,C,N,N], got shape {tuple(img.shape)}"
+        )
+
+    output = torch.zeros(
+        [len(img), n_classes, len_window],
+        dtype=img.dtype,
+        device=img.device,
+    )
+    for idx, patches in enumerate(img):
+        patches = patches.unfold(1, n_stations, n_stations)
+        patches = patches.permute(0, 3, 1, 2).reshape(
+            n_classes,
+            n_stations,
+            N * N // n_stations,
+        )
+        patches_y = patches.sum(dim=1)
+        max_val = torch.max(patches_y)
+        if max_val > 0:
+            patches_y = patches_y / max_val
+        output[idx] = patches_y
+
+    return output
 
 
 @dataclass(frozen=True)

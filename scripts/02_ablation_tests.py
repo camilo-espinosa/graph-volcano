@@ -33,6 +33,9 @@ from utils.train_utils import (
     ensure_fold_data_exists,
     train_one_ablation_fold,
 )
+from utils.script_common import resolve_project_path
+from utils.fold_io_utils import load_fold_summary
+from utils.metrics_report_utils import compute_per_class_summary
 
 # ----------------------- ABLATION CONFIG (CUSTOMIZE HERE) -----------------------
 GRAPH_LEVELS = [3, 4]
@@ -41,7 +44,7 @@ V5_FULL_KWARGS = {
     "graph_levels": GRAPH_LEVELS,
     "attention_pool_mode": "bottleneck_only",
     "use_bottleneck_attention": True,
-    "graph_norm_type": "graphnorm",
+    "graph_norm_type": "none",
     "node_feature_mode": "geometry",
     "graph_backend": "graphsage",
     "use_message_passing": True,
@@ -51,65 +54,39 @@ V5_FULL_KWARGS = {
     "init_features": 16,
     "depth": 5,
 }
-
 ABLATION_MODEL_KWARGS = {
-    "v5_full_with_level_2": {
+    # "ablation_5_no_norm": { #the real v5_full
+    #     **V5_FULL_KWARGS,
+    #     "graph_norm_type": "none",
+    # },
+    # "ablation_2_mlp_backend": {
+    #     **V5_FULL_KWARGS,
+    #     "graph_backend": "mlp",
+    # },
+    # "ablation_3_no_message_passing": {
+    #     **V5_FULL_KWARGS,
+    #     "use_message_passing": False,
+    # },
+    # "ablation_4_no_bottleneck_attention": {
+    #     **V5_FULL_KWARGS,
+    #     "use_bottleneck_attention": False,
+    # },
+    "ablation_11_no_node_features": {
         **V5_FULL_KWARGS,
-        "graph_levels":[2, 3, 4]
-    },
-    "v5_full_bigger_model": {
-        **V5_FULL_KWARGS,
-          "init_features": 24,
-    },
-    "v5_full_all_levels": {
-        **V5_FULL_KWARGS,
-        "attention_pool_mode": "all_levels",
-    },
-    "v5_full": {
-        **V5_FULL_KWARGS,
-    },
-    "ablation_2_mlp_backend": {
-        **V5_FULL_KWARGS,
-        "graph_backend": "mlp",
-    },
-    "ablation_3_no_message_passing": {
-        **V5_FULL_KWARGS,
-        "use_message_passing": False,
-    },
-    "ablation_4_no_bottleneck_attention": {
-        **V5_FULL_KWARGS,
-        "use_bottleneck_attention": False,
-    },
-    "ablation_5_no_norm": {
-        **V5_FULL_KWARGS,
-        "graph_norm_type": "none",
-    },
-    "ablation_6_batchnorm": {
-        **V5_FULL_KWARGS,
-        "graph_norm_type": "batchnorm",
-    },
-    "ablation_7_mean_virtual_node_pool": {
-        **V5_FULL_KWARGS,
-        "virtual_node_pool_mode": "mean",
-        "bottleneck_virtual_node_pool_mode": "mean",
-    },
-    "ablation_8_graph_only_bottleneck": {
-        **V5_FULL_KWARGS,
-        "graph_levels": [],
-    },
-    "ablation_9_no_skip_graph": {
-        **V5_FULL_KWARGS,
-        "use_skip_graph": False,
-    },
-    "ablation_10_learned_station_embedding_only": {
-        **V5_FULL_KWARGS,
-        "node_feature_mode": "learned_station_embedding",
-        "station_embedding_dim": 3,
-    },
+        "node_feature_mode": "none",
+    },    
+    # "only_graph_no_attention": {
+    #     **V5_FULL_KWARGS,
+    #     "graph_levels": [],
+    #     "use_bottleneck_attention": False,
+    #     "graph_norm_type": "none",
+    # },
 }
 
 
+
 batch_sizes = {
+    "ablation_11_no_node_features": 20,
     "ablation_2_mlp_backend": 20,
     "ablation_3_no_message_passing": 20,
     "ablation_4_no_bottleneck_attention": 14,
@@ -198,36 +175,6 @@ def select_ablations(raw_ablations: str | None) -> list[str]:
             )
         selected.append(name)
     return selected
-
-
-def resolve_project_path(path: Path) -> Path:
-    if path.is_absolute():
-        return path
-    return (PROJECT_ROOT / path).resolve()
-
-
-def load_fold_summary(ablation_root: Path, fold_id: int) -> dict | None:
-    fold_dir = ablation_root / f"fold_{fold_id:02d}"
-    candidates = [
-        fold_dir / "reports" / "fold_summary.json",
-        fold_dir / "fold_summary.json",
-    ]
-    for path in candidates:
-        if path.exists():
-            with path.open("r", encoding="utf-8") as f:
-                return json.load(f)
-    return None
-
-
-def compute_per_class_summary(
-    per_fold_values: list[list[float]],
-    class_names: list[str],
-) -> dict[str, dict[str, float]]:
-    per_class_summary: dict[str, dict[str, float]] = {}
-    for class_idx, class_name in enumerate(class_names):
-        values = [float(v[class_idx]) for v in per_fold_values]
-        per_class_summary[class_name] = compute_summary(values)
-    return per_class_summary
 
 
 def write_ablation_aggregate(
@@ -597,7 +544,7 @@ def run_aggregate_only_mode(
         fold_summaries = []
         missing_folds = []
         for fold_id in FOLDS:
-            fold_summary = load_fold_summary(ablation_root=ablation_root, fold_id=fold_id)
+            fold_summary = load_fold_summary(root=ablation_root, fold_id=fold_id)
             if fold_summary is None:
                 missing_folds.append(fold_id)
                 continue
@@ -657,7 +604,8 @@ def main() -> None:
 
     if args.mode == "aggregate-only":
         experiment_root = resolve_project_path(
-            args.experiment_root or (EXPERIMENTS_ROOT / "complete_experiment")
+            args.experiment_root or (EXPERIMENTS_ROOT / "complete_experiment"),
+            PROJECT_ROOT,
         )
         run_aggregate_only_mode(
             selected=selected,
@@ -666,7 +614,7 @@ def main() -> None:
         )
         return
 
-    experiment_root = resolve_project_path(args.experiment_root or EXPERIMENT_ROOT)
+    experiment_root = resolve_project_path(args.experiment_root or EXPERIMENT_ROOT, PROJECT_ROOT)
     experiment_root.mkdir(parents=True, exist_ok=True)
     run_train_mode(
         device=device,

@@ -110,6 +110,43 @@ def combined_dice_ce_loss(
     return total, dice_loss, ce
 
 
+def combined_dice_ce_loss_2d(
+    pred: torch.Tensor,
+    target_onehot: torch.Tensor,
+    class_weights: Optional[torch.Tensor],
+    dice_weight: float = 0.7,
+    ce_weight: float = 0.3,
+):
+    """Weighted class-wise Dice + CrossEntropy for 2D UNet logits [B,C,H,W]."""
+    if pred.ndim != 4:
+        raise ValueError(
+            f"Unexpected pred shape {tuple(pred.shape)}; expected [B,C,H,W]."
+        )
+    if target_onehot.ndim != 4:
+        raise ValueError(
+            f"Unexpected target shape {tuple(target_onehot.shape)}; expected [B,C,H,W]."
+        )
+
+    pred_probs = torch.softmax(pred, dim=1)
+    target_onehot = target_onehot.float()
+    pred_probs = pred_probs.float()
+
+    intersection = (pred_probs * target_onehot).sum(dim=(0, 2, 3))
+    pred_sum = pred_probs.sum(dim=(0, 2, 3))
+    target_sum = target_onehot.sum(dim=(0, 2, 3))
+    dice = (2.0 * intersection + 1e-6) / (pred_sum + target_sum + 1e-6)
+
+    target_idx = torch.argmax(target_onehot, dim=1).long()
+    ce = torch.nn.functional.cross_entropy(
+        pred,
+        target_idx,
+        weight=class_weights,
+    )
+    dice_loss = (1.0 - dice).mean()
+    total = dice_weight * dice_loss + ce_weight * ce
+    return total, dice_loss, ce
+
+
 def extract_descriptor_tensor(
     descriptor_payload,
     descriptor_names: Sequence[str],
@@ -319,31 +356,48 @@ def cm_eval(
     pred_label = []
     true_label = []
     n_classes = len(clases_list) + 1
-    for data in dataloader:
-        xb, target, _ = data
-        xb = xb.to(device)
+    was_training = model.training
+    model.eval()
+    with torch.inference_mode():
+        for data in dataloader:
+            xb, target, _ = data
+            xb = xb.to(device)
 
-        target_trace = data_utils.activation_unstacking(
-            target, len_window=len_window, N=im_size, n_classes=n_classes
-        )
-        true_label_temp = (
-            target_trace[:, 1:, :].sum(axis=2).max(axis=1).indices.numpy() + 1
-        )
-        true_label.extend(true_label_temp.tolist())
-
-        output = model(xb)
-        output_trace = data_utils.activation_unstacking(
-            output.detach().cpu(),
-            len_window=len_window,
-            N=im_size,
-            n_classes=n_classes,
-        )
-        for idx in range(len(output_trace)):
-            out_np = output_trace[idx].detach().cpu().numpy()
-            pred, _, _, _ = predicted_from_output(
-                out_np, clases_list, t_bg=t_bg, t_cl=t_cl
+            target_trace = data_utils.activation_unstacking(
+                target,
+                len_window=len_window,
+                N=im_size,
+                n_classes=n_classes,
             )
-            pred_label.append(pred)
+            true_label_temp = (
+                target_trace[:, 1:, :].sum(axis=2).max(axis=1).indices.numpy() + 1
+            )
+            true_label.extend(true_label_temp.tolist())
+
+            output = model(xb)
+            if output.ndim == 4:
+                output = torch.softmax(output, dim=1)
+            output = output.detach().cpu()
+            output_trace = data_utils.activation_unstacking(
+                output,
+                len_window=len_window,
+                N=im_size,
+                n_classes=n_classes,
+            )
+            for idx in range(len(output_trace)):
+                out_np = output_trace[idx].numpy()
+                pred, _, _, _ = predicted_from_output(
+                    out_np,
+                    clases_list,
+                    t_bg=t_bg,
+                    t_cl=t_cl,
+                )
+                pred_label.append(pred)
+
+            del xb, target, target_trace, output, output_trace
+
+    if was_training:
+        model.train()
 
     cm = confusion_matrix(true_label, pred_label, labels=[1, 2, 3, 4, 5])
     return cm
@@ -608,7 +662,13 @@ def compute_event_f1_iou(model, loader, device):
     """
     cm = cm_eval(model, loader, device)
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
-    mean_f1 = float(np.mean(f1_scores))
+    support = np.sum(cm, axis=1)
+    active_mask = support > 0
+    mean_f1 = (
+        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
+        if np.any(active_mask)
+        else 0.0
+    )
 
     iou_per_class = []
     for i in range(cm.shape[0]):
@@ -617,7 +677,11 @@ def compute_event_f1_iou(model, loader, device):
         fn = np.sum(cm[i, :]) - tp
         denom = tp + fp + fn
         iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
-    mean_iou = float(np.mean(iou_per_class))
+    mean_iou = (
+        float(np.mean([iou_per_class[i] for i, active in enumerate(active_mask) if active]))
+        if np.any(active_mask)
+        else 0.0
+    )
 
     return list(f1_scores), mean_f1, iou_per_class, mean_iou
 
@@ -948,13 +1012,23 @@ def compute_event_f1_iou_graphsage(
 
     cm = confusion_matrix(true_label, pred_label, labels=list(event_classes))
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
-    mean_f1 = float(np.mean(f1_scores))
+    support = np.sum(cm, axis=1)
+    active_mask = support > 0
+    mean_f1 = (
+        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
+        if np.any(active_mask)
+        else 0.0
+    )
 
     iou_per_class = [
         float(np.mean(iou_by_true_class[c])) if len(iou_by_true_class[c]) > 0 else 0.0
         for c in event_classes
     ]
-    mean_iou = float(np.mean(iou_scores)) if len(iou_scores) > 0 else 0.0
+    mean_iou = (
+        float(np.mean([iou_per_class[i] for i, active in enumerate(active_mask) if active]))
+        if np.any(active_mask)
+        else 0.0
+    )
 
     # Extra multiclass temporal IoU over all classes [BG, VT, LP, TR, AV, IC].
     iou_all_classes = []
@@ -1020,7 +1094,12 @@ class UNetPatchDataset(Dataset):
         y = torch.from_numpy(y_used)
 
         x_unet = data_utils.patch_stacking_X(x, N=256).squeeze(0)
-        y_onehot = data_utils.patch_stacking_y(y, N=256, n_classes=6, n_stations=8)
+        y_onehot = data_utils.patch_stacking_y(
+            y,
+            N=256,
+            n_classes=6,
+            n_stations=8,
+        ).squeeze(0)
         y_idx = torch.argmax(y_onehot, dim=0).long()
 
         if self.return_debug:

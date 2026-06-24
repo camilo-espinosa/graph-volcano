@@ -1,7 +1,13 @@
-stations_CAU = {}
+from __future__ import annotations
+
+from typing import Dict, Tuple
 
 
-stations = {  # station locations as latitude/longitude pairs
+LonLat = Tuple[float, float]
+StationMap = Dict[str, LonLat]
+
+
+STATIONS_BY_VOLCANO: Dict[str, StationMap] = {
     "CAU": {
         "PHU": (-72.15, -40.61),
         "FUT": (-72.31, -40.38),
@@ -41,9 +47,32 @@ stations = {  # station locations as latitude/longitude pairs
 }
 
 
-volcanoes = {  # crater locations as latitude/longitude pairs
+CRATER_BY_VOLCANO: Dict[str, LonLat] = {
     "NVCHVC": (-71.37667, -36.86333),
     "VCA": (-71.93, -39.42),
     "LDM": (-70.492, -36.058),
     "CAU": (-72.117, -40.590),
 }
+
+
+def get_station_coords(volcano_name: str) -> StationMap:
+    if volcano_name not in STATIONS_BY_VOLCANO:
+        known = sorted(STATIONS_BY_VOLCANO.keys())
+        raise KeyError(
+            f"Unknown volcano station metadata: {volcano_name}. Known: {known}"
+        )
+    return STATIONS_BY_VOLCANO[volcano_name]
+
+
+def get_crater_coords(volcano_name: str) -> LonLat:
+    if volcano_name not in CRATER_BY_VOLCANO:
+        known = sorted(CRATER_BY_VOLCANO.keys())
+        raise KeyError(
+            f"Unknown volcano crater metadata: {volcano_name}. Known: {known}"
+        )
+    return CRATER_BY_VOLCANO[volcano_name]
+
+
+# Backward-compatible aliases.
+stations = STATIONS_BY_VOLCANO
+volcanoes = CRATER_BY_VOLCANO

@@ -37,10 +37,11 @@ Output: [B, 6, T]  where 6 = number of classes (BG, VT, LP, TR, AV, IC)
 | `use_bottleneck_attention` | Toggle the MHSA block |
 | `bottleneck_attn_heads/dropout/ff_mult` | MHSA hyperparameters |
 | `graph_norm_type` | `"graphnorm"`, `"batchnorm"`, or `"none"` |
-| `node_feature_mode` | `"geometry"`, `"learned_station_embedding"`, or `"both"` |
+| `node_feature_mode` | `"geometry"`, `"learned_station_embedding"`, `"both"`, or `"none"` |
 | `n_stations`, `station_coords`, `crater_coords` | Station count and spatial layout |
 
 """
+
 from collections import OrderedDict
 from typing import List, Literal, Optional
 
@@ -102,7 +103,7 @@ class UNet_GraphSAGE(nn.Module):
     ----------------------------
     - use_bottleneck_attention: toggle bottleneck MHSA block.
     - graph_norm_type: one of {"graphnorm", "batchnorm", "none"}.
-    - node_feature_mode: one of {"geometry", "learned_station_embedding", "both"}.
+    - node_feature_mode: one of {"geometry", "learned_station_embedding", "both", "none"}.
     - graph_backend: one of {"graphsage", "mlp"}.
     - use_message_passing: if False, bypass GraphSAGE message passing and use
       virtual-node readout only.
@@ -129,7 +130,7 @@ class UNet_GraphSAGE(nn.Module):
         use_bottleneck_attention: bool = True,
         graph_norm_type: Literal["graphnorm", "batchnorm", "none"] = "graphnorm",
         node_feature_mode: Literal[
-            "geometry", "learned_station_embedding", "both"
+            "geometry", "learned_station_embedding", "both", "none"
         ] = "geometry",
         station_embedding_dim: int = 8,
         graph_backend: Literal["graphsage", "mlp"] = "graphsage",
@@ -141,6 +142,7 @@ class UNet_GraphSAGE(nn.Module):
         bottleneck_attn_heads: int = 4,
         bottleneck_attn_dropout: float = 0.0,
         bottleneck_attn_ff_mult: int = 2,
+        verbose: bool = False,
     ):
         super().__init__()
 
@@ -157,9 +159,14 @@ class UNet_GraphSAGE(nn.Module):
                 "graph_norm_type must be one of {'graphnorm', 'batchnorm', 'none'}. "
                 f"Got: {graph_norm_type}"
             )
-        if node_feature_mode not in {"geometry", "learned_station_embedding", "both"}:
+        if node_feature_mode not in {
+            "geometry",
+            "learned_station_embedding",
+            "both",
+            "none",
+        }:
             raise ValueError(
-                "node_feature_mode must be one of {'geometry', 'learned_station_embedding', 'both'}. "
+                "node_feature_mode must be one of {'geometry', 'learned_station_embedding', 'both', 'none'}. "
                 f"Got: {node_feature_mode}"
             )
         if graph_backend not in {"graphsage", "mlp"}:
@@ -190,6 +197,7 @@ class UNet_GraphSAGE(nn.Module):
         self.bottleneck_virtual_node_pool_mode = bottleneck_virtual_node_pool_mode
         self.use_skip_graph = bool(use_skip_graph)
         self.station_embedding_dim = int(station_embedding_dim)
+        self.verbose = bool(verbose)
         if self.station_embedding_dim <= 0 and self.node_feature_mode in {
             "learned_station_embedding",
             "both",
@@ -230,6 +238,9 @@ class UNet_GraphSAGE(nn.Module):
                 self.n_nodes,
                 self.station_embedding_dim,
             )
+        elif self.node_feature_mode == "none":
+            self.node_feat_channels = 0
+            self.station_id_embedding = None
         else:
             self.node_feat_channels = (
                 self.geom_feat_channels + self.station_embedding_dim
@@ -432,6 +443,14 @@ class UNet_GraphSAGE(nn.Module):
             emb = self.station_id_embedding(node_idx).to(dtype=dtype)
             emb_batch = emb.unsqueeze(0).expand(num_graphs, -1, -1)
             parts.append(emb_batch)
+        if not parts:
+            return torch.empty(
+                num_graphs,
+                self.n_nodes,
+                0,
+                device=device,
+                dtype=dtype,
+            )
         return torch.cat(parts, dim=2)
 
     def _compute_virtual_node_feature(
@@ -500,6 +519,33 @@ class UNet_GraphSAGE(nn.Module):
             }
         if crater_coords is None:
             crater_coords = (-71.37667, -36.86333)
+
+        provided_station_items = list(station_coords.items())
+        provided_count = len(provided_station_items)
+
+        # Keep forward graph shape fixed by self.n_stations, while adapting
+        # metadata availability by trimming/padding station coordinates.
+        station_items = list(provided_station_items)
+        if len(station_items) > self.n_stations:
+            station_items = station_items[: self.n_stations]
+        elif len(station_items) < self.n_stations:
+            missing = self.n_stations - len(station_items)
+            for idx in range(missing):
+                station_items.append((f"PAD_{idx:02d}", crater_coords))
+        station_coords = dict(station_items)
+
+        if self.verbose:
+            used_names = list(station_coords.keys())
+            print(
+                "[UNet_GraphSAGE] station geometry configured "
+                f"(provided={provided_count}, model_n_stations={self.n_stations}, "
+                f"used={len(used_names)})"
+            )
+            print(
+                "[UNet_GraphSAGE] crater lon/lat="
+                f"({float(crater_coords[0]):.5f}, {float(crater_coords[1]):.5f})"
+            )
+            print("[UNet_GraphSAGE] station order used: " + ", ".join(used_names))
 
         lat_mean = float(np.mean([c[1] for c in station_coords.values()]))
         km_per_deg_lon = 111.0 * np.cos(np.radians(lat_mean))
