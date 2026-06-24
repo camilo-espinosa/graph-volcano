@@ -545,10 +545,7 @@ class UNet_GraphSAGE(nn.Module):
                 "[UNet_GraphSAGE] crater lon/lat="
                 f"({float(crater_coords[0]):.5f}, {float(crater_coords[1]):.5f})"
             )
-            print(
-                "[UNet_GraphSAGE] station order used: "
-                + ", ".join(used_names)
-            )
+            print("[UNet_GraphSAGE] station order used: " + ", ".join(used_names))
 
         lat_mean = float(np.mean([c[1] for c in station_coords.values()]))
         km_per_deg_lon = 111.0 * np.cos(np.radians(lat_mean))
