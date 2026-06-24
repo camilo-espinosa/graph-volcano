@@ -1,8 +1,9 @@
 """
-5-fold ablation runner for UNet_GraphSAGE.
+5-fold ablation runner for UNet_MPNN and UNet_GraphSAGE.
 
 This script trains and evaluates selected ablations across stratified 5-fold CV:
 - Folds: 1..5
+- Currently configured for UNet_MPNN ablations (UNet_GraphSAGE configs commented out)
 
 Fold data is read from:
     data/prepared_data/NVCHVC/cv_5fold/fold_XX/{train_aug,val,test}.npz
@@ -36,6 +37,7 @@ from utils.train_utils import (
 from utils.script_common import resolve_project_path
 from utils.fold_io_utils import load_fold_summary
 from utils.metrics_report_utils import compute_per_class_summary
+from models.UNet_MPNN import MPNN_ABLATION_KWARGS
 
 # ----------------------- ABLATION CONFIG (CUSTOMIZE HERE) -----------------------
 GRAPH_LEVELS = [3, 4]
@@ -54,47 +56,71 @@ V5_FULL_KWARGS = {
     "init_features": 16,
     "depth": 5,
 }
+# ============================================================================
+# GRAPHSAGE ABLATIONS (commented out, kept for reference)
+# ============================================================================
+# ABLATION_MODEL_KWARGS = {
+#     # "ablation_5_no_norm": { #the real v5_full
+#     #     **V5_FULL_KWARGS,
+#     #     "graph_norm_type": "none",
+#     # },
+#     # "ablation_2_mlp_backend": {
+#     #     **V5_FULL_KWARGS,
+#     #     "graph_backend": "mlp",
+#     # },
+#     # "ablation_3_no_message_passing": {
+#     #     **V5_FULL_KWARGS,
+#     #     "use_message_passing": False,
+#     # },
+#     # "ablation_4_no_bottleneck_attention": {
+#     #     **V5_FULL_KWARGS,
+#     #     "use_bottleneck_attention": False,
+#     # },
+#     # "ablation_11_no_node_features": {
+#     #     **V5_FULL_KWARGS,
+#     #     "node_feature_mode": "none",
+#     # },
+#     # "only_graph_no_attention": {
+#     #     **V5_FULL_KWARGS,
+#     #     "graph_levels": [],
+#     #     "use_bottleneck_attention": False,
+#     #     "graph_norm_type": "none",
+#     # },
+# }
+
+# ============================================================================
+# MPNN ABLATIONS (active set)
+# ============================================================================
 ABLATION_MODEL_KWARGS = {
-    # "ablation_5_no_norm": { #the real v5_full
-    #     **V5_FULL_KWARGS,
-    #     "graph_norm_type": "none",
-    # },
-    # "ablation_2_mlp_backend": {
-    #     **V5_FULL_KWARGS,
-    #     "graph_backend": "mlp",
-    # },
-    # "ablation_3_no_message_passing": {
-    #     **V5_FULL_KWARGS,
-    #     "use_message_passing": False,
-    # },
-    # "ablation_4_no_bottleneck_attention": {
-    #     **V5_FULL_KWARGS,
-    #     "use_bottleneck_attention": False,
-    # },
-    "ablation_11_no_node_features": {
-        **V5_FULL_KWARGS,
-        "node_feature_mode": "none",
-    },    
-    # "only_graph_no_attention": {
-    #     **V5_FULL_KWARGS,
-    #     "graph_levels": [],
-    #     "use_bottleneck_attention": False,
-    #     "graph_norm_type": "none",
-    # },
+    name: {"_model_class": "UNet_MPNN", **kwargs}
+    for name, kwargs in MPNN_ABLATION_KWARGS.items()
 }
 
 
 
+# GraphSAGE batch sizes (commented out, for reference)
+# batch_sizes = {
+#     "ablation_11_no_node_features": 20,
+#     "ablation_2_mlp_backend": 20,
+#     "ablation_3_no_message_passing": 20,
+#     "ablation_4_no_bottleneck_attention": 14,
+#     "ablation_5_no_norm": 18,
+#     "ablation_6_batchnorm": 18,
+#     "ablation_7_mean_virtual_node_pool": 14,
+#     "ablation_8_graph_only_bottleneck": 24,
+#     "ablation_9_no_skip_graph": 18,
+# }
+
+# MPNN batch sizes
 batch_sizes = {
-    "ablation_11_no_node_features": 20,
-    "ablation_2_mlp_backend": 20,
-    "ablation_3_no_message_passing": 20,
-    "ablation_4_no_bottleneck_attention": 14,
-    "ablation_5_no_norm": 18,
-    "ablation_6_batchnorm": 18,
-    "ablation_7_mean_virtual_node_pool": 14,
-    "ablation_8_graph_only_bottleneck": 24,
-    "ablation_9_no_skip_graph": 18,
+    "edge_mpnn__bottleneck": 24,
+    "edge_mpnn__no_edge_feats": 24,
+    "edge_mpnn__encoder": 24,
+    "edge_mpnn__star_topology": 24,
+    "edge_mpnn__xcorr": 24,
+    "edge_mpnn__no_spatial_info": 24,
+    "edge_mpnn__rsam": 24,
+    "edge_mpnn__no_attention": 24,
 }
 # By default, run all listed ablations. Customize this list as needed.
 ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
@@ -102,7 +128,7 @@ ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
     "volcano": "NVCHVC",
-    "arch": "UNet_GraphSAGE",
+    "arch": "UNet_MPNN",  # Informational; actual arch per ablation
     "batch_size": 24,
     "epochs": 100,
     "early_stop_patience": 20,

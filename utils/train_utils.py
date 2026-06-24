@@ -16,6 +16,7 @@ from torch.utils.data import BatchSampler, Dataset
 
 from . import data_utils
 from models.UNet_GraphSAGE import UNet_GraphSAGE
+from models.UNet_MPNN import UNet_MPNN
 
 
 def dice_loss_2d(
@@ -1362,14 +1363,19 @@ def train_one_ablation_fold(
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False,)
     test_loader = DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False)
 
-    model = UNet_GraphSAGE(
+    # Extract model class if specified; default to UNet_GraphSAGE for backward compatibility
+    model_kwargs_copy = model_kwargs.copy()
+    model_class_name = model_kwargs_copy.pop("_model_class", "UNet_GraphSAGE")
+    model_class = UNet_MPNN if model_class_name == "UNet_MPNN" else UNet_GraphSAGE
+
+    model = model_class(
         in_channels=1,
         out_channels=6,
-        **model_kwargs,
+        **model_kwargs_copy,
     ).to(device)
 
     model_name = (
-        f"{config['arch']}_{ablation_name}_{config['volcano']}_fold_{fold_id:02d}"
+        f"{model_class_name}_{ablation_name}_{config['volcano']}_fold_{fold_id:02d}"
     )
 
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
