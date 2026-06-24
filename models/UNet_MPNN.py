@@ -864,11 +864,32 @@ MPNN_ABLATION_KWARGS = {
     # ),
     # THE key test: drop edge features architecturally (message MLP loses its
     # edge slice). Proves whether edge geometry matters.
+    # --- Tier 1: aggregation (most important, run first) ---
+    "edge_mpnn__aggr_max": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="delta_pos",
+        node_feature_mode="geometry",
+        graph_levels=[],
+        use_skip_graph=False,
+        use_bottleneck_attention=True,
+        graph_norm="none",
+        mpnn_aggr="max",
+    ),
+    "edge_mpnn__layers_4": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="delta_pos",
+        node_feature_mode="geometry",
+        graph_levels=[],
+        use_skip_graph=False,
+        use_bottleneck_attention=True,
+        graph_norm="none",
+        mpnn_layers=4,  # test deeper; watch for over-smoothing
+    ),
     "edge_mpnn__early_l2": dict(
         graph_topology="fully_connected",
         edge_feature_mode="delta_pos",
         node_feature_mode="geometry",
-        graph_levels=[2],           # level 2 only, no bottleneck graph
+        graph_levels=[2],  # level 2 only, no bottleneck graph
         use_skip_graph=False,
         use_bottleneck_attention=True,
         graph_norm="none",
@@ -877,7 +898,7 @@ MPNN_ABLATION_KWARGS = {
         graph_topology="fully_connected",
         edge_feature_mode="delta_pos",
         node_feature_mode="geometry",
-        graph_levels=[1],           # level 1 only, no bottleneck graph
+        graph_levels=[1],  # level 1 only, no bottleneck graph
         use_skip_graph=False,
         use_bottleneck_attention=True,
         graph_norm="none",
@@ -886,11 +907,11 @@ MPNN_ABLATION_KWARGS = {
         graph_topology="fully_connected",
         edge_feature_mode="delta_pos",
         node_feature_mode="geometry",
-        graph_levels=[2],           # early + bottleneck (bottleneck always present)
+        graph_levels=[2],  # early + bottleneck (bottleneck always present)
         use_skip_graph=False,
         use_bottleneck_attention=True,
         graph_norm="none",
-    ),    
+    ),
     "edge_mpnn__no_edge_feats": dict(
         graph_topology="fully_connected",
         edge_feature_mode="none",
