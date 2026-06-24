@@ -598,19 +598,18 @@ def main() -> None:
                 completed_keys.add(eval_key)
                 newly_completed += 1
 
-                if args.save_confusion_matrices:
-                    cm_dir = out_dir / "confusion_matrices" / model_key / f"fold_{fold_id:02d}"
-                    cm_dir.mkdir(parents=True, exist_ok=True)
-                    cm_path = cm_dir / f"cm_{target_name}_test80_best_f1.png"
-                    save_confusion_matrix_image(
-                        cm=cm,
-                        labels=CLASS_NAMES,
-                        out_path=cm_path,
-                        title=(
-                            f"Zero-shot CM | {model_key} | fold {fold_id:02d} | "
-                            f"target {target_name}"
-                        ),
-                    )
+                cm_dir = out_dir / "confusion_matrices" / model_key / f"fold_{fold_id:02d}"
+                cm_dir.mkdir(parents=True, exist_ok=True)
+                cm_path = cm_dir / f"cm_{target_name}_test80_best_f1.png"
+                save_confusion_matrix_image(
+                    cm=cm,
+                    labels=CLASS_NAMES,
+                    out_path=cm_path,
+                    title=(
+                        f"Zero-shot CM | {model_key} | fold {fold_id:02d} | "
+                        f"target {target_name}"
+                    ),
+                )
 
                 print(
                     f"  fold={fold_id:02d} target={target_name} "

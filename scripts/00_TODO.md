@@ -1,6 +1,23 @@
+**1.- entrenar MPNN ablations** (en el otro pc hay algunas)
+
+**1b.- probar con:**
+
+mpnn_aggr = max; invariant to station count → better cross-volcano transfer
+
+mpnn_layers = 2 and 4; rules out under-depth / over-smoothing
+
+mpnn_hidden_dim = 2× channel width; confirms edge-MLP isn't capacity-starved
+
+**2.- correr zero shot para nuevas ablations**
+
+**3.- antes de seguir, si MPNN es mejorq ue Unet para cross volcano, proseguimos con finetuning y continuous, si no hay que ver otra arquitectura o scope para el artículo**
+
 **4.- correr cross volcano finetuning para ablations**
+
 **5.- correr cross volcano finetuning para UNets**
+
 **6.- nuevo seg-to-target for object detection class**
+
 dataset class must now:
 
 For detection, you can simply add a conversion step:

@@ -113,14 +113,17 @@ ABLATION_MODEL_KWARGS = {
 
 # MPNN batch sizes
 batch_sizes = {
-    "edge_mpnn__bottleneck": 24,
-    "edge_mpnn__no_edge_feats": 24,
-    "edge_mpnn__encoder": 24,
-    "edge_mpnn__star_topology": 24,
-    "edge_mpnn__xcorr": 24,
-    "edge_mpnn__no_spatial_info": 24,
-    "edge_mpnn__rsam": 24,
-    "edge_mpnn__no_attention": 24,
+    "edge_mpnn__early_l2": 6,
+    "edge_mpnn__early_l1": 6,
+    "edge_mpnn__both_l2_bottleneck": 6,
+    "edge_mpnn__bottleneck": 12,
+    "edge_mpnn__no_edge_feats": 12,
+    "edge_mpnn__encoder": 12,
+    "edge_mpnn__star_topology": 12,
+    "edge_mpnn__xcorr": 12,
+    "edge_mpnn__no_spatial_info": 12,
+    "edge_mpnn__rsam": 12,
+    "edge_mpnn__no_attention": 12,
 }
 # By default, run all listed ablations. Customize this list as needed.
 ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
@@ -544,6 +547,19 @@ def run_train_mode(device: torch.device, selected: list[str], experiment_root: P
     print("=" * 80)
 
 
+def discover_ablations_from_folder(ablations_root: Path) -> list[str]:
+    """Discover all ablation folders in the ablations directory."""
+    if not ablations_root.exists():
+        return []
+    
+    ablations = []
+    for item in ablations_root.iterdir():
+        if item.is_dir():
+            ablations.append(item.name)
+    
+    return sorted(ablations)
+
+
 def run_aggregate_only_mode(
     selected: list[str],
     experiment_root: Path,
@@ -551,14 +567,28 @@ def run_aggregate_only_mode(
 ) -> None:
     print(f"Aggregate-only mode")
     print(f"Experiment root: {experiment_root}")
-    print(f"Ablations requested ({len(selected)}): {selected}")
-
+    
     leaderboard_rows = []
     ablations_root = experiment_root / "ablations"
     if not ablations_root.exists():
         raise FileNotFoundError(f"Ablations root not found: {ablations_root}")
+    
+    # Auto-discover ablations from folder if none exist in selected or if selected ablations not found
+    discovered_ablations = discover_ablations_from_folder(ablations_root)
+    
+    # Check if selected ablations exist in the folder
+    existing_selected = [a for a in selected if (ablations_root / a).exists()]
+    
+    if not existing_selected and discovered_ablations:
+        # If requested ablations don't exist but we found some, use discovered ones
+        print(f"Requested ablations not found. Auto-discovering from folder...")
+        ablations_to_process = discovered_ablations
+    else:
+        ablations_to_process = existing_selected if existing_selected else selected
+    
+    print(f"Ablations to process ({len(ablations_to_process)}): {ablations_to_process}")
 
-    for ablation_name in selected:
+    for ablation_name in ablations_to_process:
         ablation_root = ablations_root / ablation_name
         if not ablation_root.exists():
             print(f"[WARN] Skipping '{ablation_name}': folder not found at {ablation_root}")
