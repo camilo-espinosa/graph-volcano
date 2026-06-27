@@ -112,17 +112,21 @@ ABLATION_MODEL_KWARGS = {
 
 # MPNN batch sizes
 batch_sizes = {
-    "edge_mpnn__early_l2": 6,
-    "edge_mpnn__early_l1": 6,
-    "edge_mpnn__both_l2_bottleneck": 6,
-    "edge_mpnn__bottleneck": 12,
-    "edge_mpnn__no_edge_feats": 12,
-    "edge_mpnn__encoder": 12,
-    "edge_mpnn__star_topology": 12,
-    "edge_mpnn__xcorr": 12,
-    "edge_mpnn__no_spatial_info": 12,
-    "edge_mpnn__rsam": 12,
-    "edge_mpnn__no_attention": 12,
+    "pairwise_conv2d__l0": 10,
+    "edge_mpnn__early_l0": 8,
+    "edge_mpnn__aggr_max": 10,
+    "edge_mpnn__layers_4": 10,
+    "edge_mpnn__early_l2": 10,
+    "edge_mpnn__early_l1": 10,
+    "edge_mpnn__both_l2_bottleneck": 10,
+    "edge_mpnn__bottleneck": 10,
+    "edge_mpnn__no_edge_feats": 10,
+    "edge_mpnn__encoder": 10,
+    "edge_mpnn__star_topology": 10,
+    "edge_mpnn__xcorr": 10,
+    "edge_mpnn__no_spatial_info": 10,
+    "edge_mpnn__rsam": 10,
+    "edge_mpnn__no_attention": 10,
 }
 # By default, run all listed ablations. Customize this list as needed.
 ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
@@ -131,7 +135,7 @@ ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
 CONFIG = {
     "volcano": "NVCHVC",
     "arch": "UNet_MPNN",  # Informational; actual arch per ablation
-    "batch_size": 24,
+    "batch_size": 16,
     "epochs": 100,
     "early_stop_patience": 20,
     "lr": 1e-4,
