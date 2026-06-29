@@ -46,3 +46,7 @@ scripts/__pycache__/04_cross-volcano.cpython-313.pyc
 utils/__pycache__/edge_features.cpython-311.pyc
 utils/__pycache__/model_registry.cpython-311.pyc
 utils/__pycache__/train_utils.cpython-313.pyc
+scripts/__pycache__/01_prepare_data.cpython-311.pyc
+scripts/__pycache__/01b_prepare_cross-volcano_data.cpython-311.pyc
+scripts/__pycache__/02b_aggregate_ablation_results.cpython-311.pyc
+scripts/__pycache__/04_cross-volcano.cpython-311.pyc

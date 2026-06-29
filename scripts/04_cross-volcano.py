@@ -110,40 +110,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def discover_fold_dirs(data_root: Path) -> list[Path]:
-    fold_dirs = sorted([p for p in data_root.glob(FOLD_GLOB) if p.is_dir()])
-    if len(fold_dirs) == 0:
-        raise FileNotFoundError(f"No fold directories found under: {data_root}")
-
-    for fold_dir in fold_dirs:
-        for name in ["train.npz", "val.npz", "test.npz"]:
-            p = fold_dir / name
-            if not p.exists():
-                raise FileNotFoundError(f"Missing manifest file: {p}")
-    return fold_dirs
-
-
-def select_model_keys(raw_models: str | None, family: str) -> list[str]:
-    specs = {
-        k: v
-        for k, v in MODEL_SPECS.items()
-        if v.get("enabled", True) and (family == "all" or str(v["family"]) == family)
-    }
-    available = sorted(specs.keys())
-    selected = parse_csv_selection(raw_models, available, "models")
-    return selected
-
-
-def held_out_from_test_manifest(test_npz_path: Path) -> str:
-    with np.load(test_npz_path) as data:
-        if "held_out_volcano" in data:
-            return str(data["held_out_volcano"][0])
-    name = test_npz_path.parent.name
-    if "holdout_" in name:
-        return name.split("holdout_")[-1]
-    return "UNKNOWN"
-
-
 class GraphForwardWrapper(torch.nn.Module):
     """Inject xcorr/rsam kwargs on demand while preserving model signature expectations."""
 
@@ -301,66 +267,6 @@ def _evaluate_unet(
     )
 
 
-def build_row_fieldnames() -> list[str]:
-    fields = [
-        "model_key",
-        "family",
-        "fold",
-        "held_out_volcano",
-        "n_train",
-        "n_val",
-        "n_test",
-        "best_epoch",
-        "best_val_mean_f1",
-        "test_loss",
-        "test_mean_f1",
-        "test_mean_iou",
-        "elapsed_seconds",
-    ]
-    for cls in CLASS_NAMES:
-        fields.append(f"test_f1_{cls}")
-        fields.append(f"test_iou_{cls}")
-    return fields
-
-
-def write_summary(output_dir: Path, rows: list[dict]) -> None:
-    df = pd.DataFrame(rows)
-    df.to_csv(
-        output_dir / "cross_volcano_fold_metrics.csv",
-        index=False,
-        encoding="utf-8-sig",
-        sep=";",
-        decimal=",",
-    )
-
-    grouped = df.groupby(["model_key", "family", "held_out_volcano"], sort=True)
-    summary_rows = []
-    for (model_key, family, held_out), grp in grouped:
-        row = {
-            "model_key": str(model_key),
-            "family": str(family),
-            "held_out_volcano": str(held_out),
-            "n_folds": int(len(grp)),
-        }
-        for col in ["test_mean_f1", "test_mean_iou", "test_loss", "best_val_mean_f1"]:
-            stats = compute_summary(grp[col].astype(float).tolist())
-            row[f"{col}_mean"] = float(stats["mean"])
-            row[f"{col}_std"] = float(stats["std"])
-        summary_rows.append(row)
-
-    summary_df = pd.DataFrame(summary_rows).sort_values(
-        by=["held_out_volcano", "test_mean_f1_mean"],
-        ascending=[True, False],
-    )
-    summary_df.to_csv(
-        output_dir / "cross_volcano_summary.csv",
-        index=False,
-        encoding="utf-8-sig",
-        sep=";",
-        decimal=",",
-    )
-
-
 def main() -> None:
     args = parse_args()
 
@@ -373,8 +279,22 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fold_dirs = discover_fold_dirs(data_root)
-    selected_models = select_model_keys(args.models, args.family)
+    fold_dirs = sorted([p for p in data_root.glob(FOLD_GLOB) if p.is_dir()])
+    if len(fold_dirs) == 0:
+        raise FileNotFoundError(f"No fold directories found under: {data_root}")
+    for fold_dir in fold_dirs:
+        for name in ["train.npz", "val.npz", "test.npz"]:
+            p = fold_dir / name
+            if not p.exists():
+                raise FileNotFoundError(f"Missing manifest file: {p}")
+
+    specs = {
+        k: v
+        for k, v in MODEL_SPECS.items()
+        if v.get("enabled", True)
+        and (args.family == "all" or str(v["family"]) == args.family)
+    }
+    selected_models = parse_csv_selection(args.models, sorted(specs.keys()), "models")
 
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
@@ -418,7 +338,25 @@ def main() -> None:
     print(f"Models ({len(selected_models)}): {selected_models}")
     print("=" * 90)
 
-    fieldnames = build_row_fieldnames()
+    fieldnames = [
+        "model_key",
+        "family",
+        "fold",
+        "held_out_volcano",
+        "n_train",
+        "n_val",
+        "n_test",
+        "best_epoch",
+        "best_val_mean_f1",
+        "test_loss",
+        "test_mean_f1",
+        "test_mean_iou",
+        "elapsed_seconds",
+    ]
+    for cls in CLASS_NAMES:
+        fieldnames.append(f"test_f1_{cls}")
+        fieldnames.append(f"test_iou_{cls}")
+
     rows: list[dict[str, Any]] = []
 
     for model_key in selected_models:
@@ -437,7 +375,14 @@ def main() -> None:
             train_npz = fold_dir / "train.npz"
             val_npz = fold_dir / "val.npz"
             test_npz = fold_dir / "test.npz"
-            held_out = held_out_from_test_manifest(test_npz)
+            with np.load(test_npz) as data:
+                if "held_out_volcano" in data:
+                    held_out = str(data["held_out_volcano"][0])
+                else:
+                    name = test_npz.parent.name
+                    held_out = (
+                        name.split("holdout_")[-1] if "holdout_" in name else "UNKNOWN"
+                    )
 
             run_start = time.time()
             fold_out = output_dir / model_key / fold_dir.name
@@ -759,10 +704,58 @@ def main() -> None:
             cleanup_gpu_cache()
             gc.collect()
 
-    if len(rows) == 0:
-        raise RuntimeError("No folds were executed.")
+    all_fold_summaries = sorted(
+        output_dir.glob("*/fold_*_holdout_*/reports/fold_summary.json")
+    )
+    if len(all_fold_summaries) == 0:
+        raise RuntimeError(
+            "No fold summaries found under output directory. " "Nothing to aggregate."
+        )
 
-    write_summary(output_dir, rows)
+    all_rows: list[dict[str, Any]] = []
+    for summary_path in all_fold_summaries:
+        with summary_path.open("r", encoding="utf-8") as f:
+            all_rows.append(json.load(f))
+
+    df = pd.DataFrame(all_rows)
+    df.to_csv(
+        output_dir / "cross_volcano_fold_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+        sep=";",
+        decimal=",",
+    )
+
+    grouped = df.groupby(["model_key", "family", "held_out_volcano"], sort=True)
+    summary_rows = []
+    for (model_key, family, held_out), grp in grouped:
+        row = {
+            "model_key": str(model_key),
+            "family": str(family),
+            "held_out_volcano": str(held_out),
+            "n_folds": int(len(grp)),
+        }
+        for col in ["test_mean_f1", "test_mean_iou", "test_loss", "best_val_mean_f1"]:
+            stats = compute_summary(grp[col].astype(float).tolist())
+            row[f"{col}_mean"] = float(stats["mean"])
+            row[f"{col}_std"] = float(stats["std"])
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        by=["held_out_volcano", "test_mean_f1_mean"],
+        ascending=[True, False],
+    )
+    summary_df.to_csv(
+        output_dir / "cross_volcano_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+        sep=";",
+        decimal=",",
+    )
+
+    print(
+        f"Aggregated {len(all_rows)} fold summaries from {len(all_fold_summaries)} report files."
+    )
 
     print("=" * 90)
     print("Cross-volcano leave-one-out run complete")

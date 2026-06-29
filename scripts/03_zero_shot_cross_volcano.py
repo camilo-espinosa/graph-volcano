@@ -196,40 +196,6 @@ def load_unet_shape_and_loss(experiment_root: Path) -> tuple[int, int, float, fl
     return init_features, depth, dice_weight, ce_weight
 
 
-def discover_model_folders(ablations_root: Path) -> list[str]:
-    if not ablations_root.exists():
-        raise FileNotFoundError(f"Ablations root not found: {ablations_root}")
-    return sorted([p.name for p in ablations_root.iterdir() if p.is_dir()])
-
-
-def select_model_keys(
-    *,
-    models_csv: Optional[str],
-    ablations_csv: Optional[str],
-    family: str,
-    discovered_model_dirs: list[str],
-) -> list[str]:
-    if models_csv is not None and ablations_csv is not None:
-        raise ValueError("Use only one of --models or --ablations.")
-
-    selected_family = None if family == "all" else family
-    family_specs = list_model_specs(family=selected_family)
-    family_keys = list(family_specs.keys())
-
-    raw_selection = models_csv if models_csv is not None else ablations_csv
-    if raw_selection is not None:
-        return parse_csv_selection(raw_selection, family_keys, "model keys")
-
-    discovered_set = set(discovered_model_dirs)
-    selected = [key for key in family_keys if key in discovered_set]
-    unknown_dirs = sorted(discovered_set - set(MODEL_SPECS.keys()))
-    if len(unknown_dirs) > 0:
-        print(
-            "[WARN] Skipping model folders not present in registry: " f"{unknown_dirs}"
-        )
-    return selected
-
-
 def discover_loo_target_test_paths(cross_data_root: Path) -> dict[str, Path]:
     """Map held-out volcano name -> test.npz path from cross_volcano_loo folds."""
     if not cross_data_root.exists():
@@ -551,58 +517,6 @@ def load_checkpoint_into_model(
     cleanup_gpu_cache()
 
 
-def build_row_fieldnames() -> list[str]:
-    fieldnames = [
-        "model_key",
-        "model_display_name",
-        "family",
-        "fold",
-        "target_volcano",
-        "n_test",
-        "checkpoint",
-        "train_best_epoch",
-        "train_best_val_mean_f1",
-        "test_loss",
-        "test_mean_f1",
-        "test_mean_iou",
-        "test_mean_iou_all",
-        "n_active_classes",
-        "active_classes",
-    ]
-
-    for class_name in CLASS_NAMES:
-        fieldnames.append(f"test_f1_{class_name}")
-        fieldnames.append(f"test_iou_{class_name}")
-
-    for class_name in ALL_CLASS_NAMES:
-        fieldnames.append(f"test_iou_all_{class_name}")
-
-    return fieldnames
-
-
-def append_progress_rows(
-    out_dir: Path, row: dict[str, Any], fieldnames: list[str]
-) -> None:
-    append_row_csv(
-        out_dir / "zero_shot_fold_metrics.csv", row=row, fieldnames=fieldnames
-    )
-
-    target_name = str(row["target_volcano"])
-    append_row_csv(
-        out_dir / "by_target" / target_name / "fold_metrics.csv",
-        row=row,
-        fieldnames=fieldnames,
-    )
-
-    model_key = str(row["model_key"])
-    fold_id = int(row["fold"])
-    append_row_csv(
-        out_dir / "by_fold" / model_key / f"fold_{fold_id:02d}.csv",
-        row=row,
-        fieldnames=fieldnames,
-    )
-
-
 def write_aggregate_reports(out_dir: Path) -> None:
     fold_metrics_path = out_dir / "zero_shot_fold_metrics.csv"
     if not fold_metrics_path.exists():
@@ -764,13 +678,32 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ablations_root = experiment_root / "ablations"
-    discovered_model_dirs = discover_model_folders(ablations_root)
-    selected_models = select_model_keys(
-        models_csv=args.models,
-        ablations_csv=args.ablations,
-        family=args.family,
-        discovered_model_dirs=discovered_model_dirs,
+    if not ablations_root.exists():
+        raise FileNotFoundError(f"Ablations root not found: {ablations_root}")
+    discovered_model_dirs = sorted(
+        [p.name for p in ablations_root.iterdir() if p.is_dir()]
     )
+
+    if args.models is not None and args.ablations is not None:
+        raise ValueError("Use only one of --models or --ablations.")
+
+    selected_family = None if args.family == "all" else args.family
+    family_specs = list_model_specs(family=selected_family)
+    family_keys = list(family_specs.keys())
+
+    raw_selection = args.models if args.models is not None else args.ablations
+    if raw_selection is not None:
+        selected_models = parse_csv_selection(raw_selection, family_keys, "model keys")
+    else:
+        discovered_set = set(discovered_model_dirs)
+        selected_models = [key for key in family_keys if key in discovered_set]
+        unknown_dirs = sorted(discovered_set - set(MODEL_SPECS.keys()))
+        if len(unknown_dirs) > 0:
+            print(
+                "[WARN] Skipping model folders not present in registry: "
+                f"{unknown_dirs}"
+            )
+
     if len(selected_models) == 0:
         raise RuntimeError(
             "No models selected for evaluation. Check --family and available model folders."
@@ -851,7 +784,29 @@ def main() -> None:
     print(f"Device: {device}")
     print("=" * 80)
 
-    fieldnames = build_row_fieldnames()
+    fieldnames = [
+        "model_key",
+        "model_display_name",
+        "family",
+        "fold",
+        "target_volcano",
+        "n_test",
+        "checkpoint",
+        "train_best_epoch",
+        "train_best_val_mean_f1",
+        "test_loss",
+        "test_mean_f1",
+        "test_mean_iou",
+        "test_mean_iou_all",
+        "n_active_classes",
+        "active_classes",
+    ]
+    for class_name in CLASS_NAMES:
+        fieldnames.append(f"test_f1_{class_name}")
+        fieldnames.append(f"test_iou_{class_name}")
+    for class_name in ALL_CLASS_NAMES:
+        fieldnames.append(f"test_iou_all_{class_name}")
+
     completed_keys = load_completed_keys(
         out_dir / "zero_shot_fold_metrics.csv",
         id_columns=["model_key", "fold", "target_volcano"],
@@ -1054,7 +1009,21 @@ def main() -> None:
                 for idx, class_name in enumerate(ALL_CLASS_NAMES):
                     row[f"test_iou_all_{class_name}"] = float(iou_all_classes[idx])
 
-                append_progress_rows(out_dir=out_dir, row=row, fieldnames=fieldnames)
+                append_row_csv(
+                    out_dir / "zero_shot_fold_metrics.csv",
+                    row=row,
+                    fieldnames=fieldnames,
+                )
+                append_row_csv(
+                    out_dir / "by_target" / target_name / "fold_metrics.csv",
+                    row=row,
+                    fieldnames=fieldnames,
+                )
+                append_row_csv(
+                    out_dir / "by_fold" / model_key / f"fold_{fold_id:02d}.csv",
+                    row=row,
+                    fieldnames=fieldnames,
+                )
                 completed_keys.add(eval_key)
                 newly_completed += 1
 
