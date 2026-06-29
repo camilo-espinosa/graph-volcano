@@ -36,6 +36,7 @@ Constructor highlights
 | `node_feature_mode` | `"geometry"` or `"none"` (no spatial node info) |
 | `use_rsam_node_feat` | Append precomputed per-station RSAM as a node feature |
 | `mpnn_hidden_dim` / `mpnn_aggr` / `mpnn_layers` | MPNN edge-MLP width / aggregation / depth |
+| `pairwise_conv_levels` / `pairwise_conv_kernel` / `pairwise_conv_aggr` | Optional PairwiseConv2d on selected encoder depths |
 | `use_bottleneck_attention` | Toggle the bottleneck MHSA block |
 | `graph_norm` | `"none"` or `"batchnorm"` post-op normalization |
 """
@@ -154,6 +155,210 @@ class EdgeMPNN(nn.Module):
         return x
 
 
+class PairwiseConv2d(nn.Module):
+    """
+    Cross-station message passing using a shared Conv2d over directed station pairs.
+
+    For every ordered pair (i→j), stacks their feature sequences as two rows:
+        row 0 = source station i   [C, T]
+        row 1 = destination station j  [C, T]
+    and applies a shared Conv2d kernel of shape [2, K] — spanning both stations
+    (height) and K time samples (width).
+
+    Because the kernel is shared across all 56 directed pairs, and every station
+    appears as both source and destination, the kernel is forced to learn general
+    directional waveform relationships (moveout, polarity, coherence) rather than
+    station-specific or geometry-specific patterns. This makes it transferable
+    across volcanoes with different network geometries.
+
+    The pair outputs are aggregated back to per-station features by mean-pooling
+    over all pairs where each station is the destination (7 incoming pairs per
+    station for an 8-station network).
+
+    No edge geometry is used here — geometry enters only at the bottleneck
+    EdgeMPNN via edge_attr (Δpos).
+
+    Args:
+        in_channels  : C, feature channels per station per time step.
+        out_channels : feature channels of the conv output and final station update.
+        kernel_size  : temporal receptive field K in samples (must be odd).
+                       Rule of thumb: K / sample_rate = max_lag_seconds.
+                           K=9  at 100 Hz → 90 ms   (tight moveout)
+                           K=51 at 100 Hz → 510 ms  (full moveout range)
+        n_stations   : number of station nodes S (default 8 → 56 directed pairs).
+        aggr         : aggregation over incoming pair messages: 'mean' or 'sum'.
+
+    Input:
+        x_flat : [B*S, C, T]   standard flat station layout used throughout UNet_MPNN.
+        B      : batch size.
+        S      : number of stations (must equal n_stations).
+
+    Output:
+        [B*S, C, T]   residual-ready output; add to x_flat in the caller.
+
+    Note:
+        out_channels is set equal to in_channels so the output can be added
+        back as a residual without a projection. If you want out_channels != in_channels,
+        add a 1x1 conv projection on x_flat before the residual add in the caller.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 9,
+        n_stations: int = 8,
+        aggr: str = "mean",
+    ):
+        super().__init__()
+
+        if kernel_size % 2 == 0:
+            raise ValueError(
+                f"kernel_size must be odd for symmetric time padding. Got {kernel_size}."
+            )
+        if aggr not in {"mean", "sum"}:
+            raise ValueError(f"aggr must be 'mean' or 'sum'. Got '{aggr}'.")
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.n_stations = n_stations
+        self.aggr = aggr
+
+        # --- directed pairs (i→j), i ≠ j ---
+        # 56 pairs for 8 stations.
+        # row 0 = source i, row 1 = destination j.
+        # The shared kernel learns directional relationships:
+        #   "what does source look like relative to destination"
+        # without overfitting to specific station geometry, because every station
+        # appears as source and destination across the full pair set.
+        pairs = [(i, j) for i in range(n_stations) for j in range(n_stations) if i != j]
+        self.n_pairs = len(pairs)  # S * (S-1) = 56
+
+        src = torch.tensor([p[0] for p in pairs], dtype=torch.long)  # [n_pairs]
+        dst = torch.tensor([p[1] for p in pairs], dtype=torch.long)  # [n_pairs]
+        self.register_buffer("src_idx", src)
+        self.register_buffer("dst_idx", dst)
+
+        # For each destination station d, which pair indices have d as destination?
+        # Each station receives from exactly (n_stations - 1) = 7 pairs.
+        # Shape: [S, S-1]  — used to scatter pair outputs back to stations.
+        incoming = [
+            [idx for idx, (_, j) in enumerate(pairs) if j == d]
+            for d in range(n_stations)
+        ]
+        incoming_tensor = torch.tensor(incoming, dtype=torch.long)  # [S, S-1]
+        self.register_buffer("incoming_idx", incoming_tensor)
+        self.n_incoming = n_stations - 1  # = 7
+
+        # --- shared Conv2d ---
+        # Input per pair:  [C, 2, T]
+        #   channel dim C carries the feature maps
+        #   height 2 = [source row, destination row]
+        #   width  T = time samples
+        # Kernel: [out_channels, in_channels, 2, K]
+        #   height kernel = 2 → collapses the station dimension fully
+        #   width  kernel = K → local temporal receptive field
+        # Output per pair: [out_channels, 1, T] → squeezed to [out_channels, T]
+        self.conv = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=(2, kernel_size),
+            padding=(
+                0,
+                kernel_size // 2,
+            ),  # no padding on station dim; symmetric on time
+            bias=False,
+        )
+        # BatchNorm on out_channels; applied after reshaping to [B*n_pairs, out_channels, T]
+        self.norm = nn.BatchNorm1d(out_channels)
+        self.act = nn.ReLU(inplace=True)
+
+        # --- per-timestep update MLP ---
+        # Takes [x_i (in_channels) || aggregated_message (out_channels)]
+        # and projects back to out_channels.
+        # Applied as a 1x1 Conv1d so it operates independently at every time step
+        # without reshaping to [B*S*T, ...].
+        self.update_mlp = nn.Sequential(
+            nn.Conv1d(
+                in_channels + out_channels, out_channels, kernel_size=1, bias=False
+            ),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Projection for residual if channel widths differ
+        self.residual_proj = (
+            nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x_flat: torch.Tensor, B: int, S: int) -> torch.Tensor:
+        """
+        Args:
+            x_flat : [B*S, C, T]
+            B      : batch size
+            S      : number of stations (must equal self.n_stations)
+
+        Returns:
+            out : [B*S, out_channels, T]   — add to x_flat as residual in caller
+        """
+        assert (
+            S == self.n_stations
+        ), f"PairwiseConv2d expected S={self.n_stations} stations, got S={S}."
+
+        C, T = x_flat.shape[1], x_flat.shape[2]
+
+        # ── 1. reshape to [B, S, C, T] for station indexing ──────────────────
+        x = x_flat.reshape(B, S, C, T)
+
+        # ── 2. gather directed pairs ──────────────────────────────────────────
+        x_src = x[:, self.src_idx]  # [B, n_pairs, C, T]  — source rows
+        x_dst = x[:, self.dst_idx]  # [B, n_pairs, C, T]  — destination rows
+
+        # Stack along a new height=2 dimension:
+        #   dim 3 → [source, destination] rows
+        # Result: [B, n_pairs, C, 2, T]
+        x_pairs = torch.stack([x_src, x_dst], dim=3)
+
+        # Merge batch and pair dims for Conv2d: [B*n_pairs, C, 2, T]
+        x_pairs = x_pairs.reshape(B * self.n_pairs, C, 2, T)
+
+        # ── 3. shared Conv2d ──────────────────────────────────────────────────
+        # kernel [out_channels, C, 2, K] slides over height=2 and time=K
+        # output: [B*n_pairs, out_channels, 1, T]  (height collapses to 1)
+        pair_out = self.conv(x_pairs)  # [B*n_pairs, out_channels, 1, T]
+        pair_out = pair_out.squeeze(2)  # [B*n_pairs, out_channels, T]
+        pair_out = self.act(self.norm(pair_out))  # normalise + activate
+
+        # ── 4. scatter pair outputs back to destination stations ──────────────
+        # Reshape to [B, n_pairs, out_channels, T]
+        pair_out = pair_out.reshape(B, self.n_pairs, self.out_channels, T)
+
+        # incoming_idx: [S, S-1] — for each station, indices of its 7 incoming pairs
+        # Index into pair_out: [B, S, S-1, out_channels, T]
+        incoming_feats = pair_out[
+            :, self.incoming_idx
+        ]  # [B, S, n_incoming, out_channels, T]
+
+        if self.aggr == "mean":
+            aggregated = incoming_feats.mean(dim=2)  # [B, S, out_channels, T]
+        else:
+            aggregated = incoming_feats.sum(dim=2)  # [B, S, out_channels, T]
+
+        # ── 5. update MLP ─────────────────────────────────────────────────────
+        # Flatten back to [B*S, out_channels, T] for Conv1d (1x1 = per-timestep MLP)
+        aggregated = aggregated.reshape(B * S, self.out_channels, T)
+
+        # Concatenate station's own features with incoming aggregate along channel dim
+        update_in = torch.cat([x_flat, aggregated], dim=1)  # [B*S, C+out_channels, T]
+        updated = self.update_mlp(update_in)  # [B*S, out_channels, T]
+
+        # ── 6. residual add ───────────────────────────────────────────────────
+        return self.residual_proj(x_flat) + updated  # [B*S, out_channels, T]
+
+
 class UNet_MPNN(nn.Module):
     """
     1-D UNet with an edge-conditioned MPNN at the bottleneck (always) and at
@@ -182,12 +387,16 @@ class UNet_MPNN(nn.Module):
         mpnn_hidden_dim: Optional[int] = None,
         mpnn_aggr: Literal["mean", "add", "max"] = "mean",
         mpnn_layers: int = 2,
+        pairwise_conv_levels: Optional[List[int]] = None,
+        pairwise_conv_kernel: int = 9,
+        pairwise_conv_aggr: Literal["mean", "sum"] = "mean",
         xcorr_feat_dim: int = 2,
         use_bottleneck_attention: bool = True,
         bottleneck_attn_heads: int = 4,
         bottleneck_attn_dropout: float = 0.0,
         bottleneck_attn_ff_mult: int = 2,
         graph_norm: Literal["none", "batchnorm"] = "none",
+        volcano_geom_nodes: Optional[torch.Tensor] = None,
         verbose: bool = False,
     ):
         super().__init__()
@@ -232,6 +441,16 @@ class UNet_MPNN(nn.Module):
             )
         if mpnn_layers < 1:
             raise ValueError(f"mpnn_layers must be >= 1. Got: {mpnn_layers}")
+        if pairwise_conv_kernel % 2 == 0:
+            raise ValueError(
+                "pairwise_conv_kernel must be odd for symmetric time padding. "
+                f"Got: {pairwise_conv_kernel}"
+            )
+        if pairwise_conv_aggr not in {"mean", "sum"}:
+            raise ValueError(
+                "pairwise_conv_aggr must be one of {'mean', 'sum'}. "
+                f"Got: {pairwise_conv_aggr}"
+            )
         if edge_feature_mode == "delta_pos_xcorr" and xcorr_feat_dim < 1:
             raise ValueError(
                 "xcorr_feat_dim must be >= 1 when edge_feature_mode='delta_pos_xcorr'."
@@ -244,6 +463,8 @@ class UNet_MPNN(nn.Module):
         self.mpnn_aggr = mpnn_aggr
         self.mpnn_layers = int(mpnn_layers)
         self.bottleneck_mpnn_layers = max(3, self.mpnn_layers)
+        self.pairwise_conv_kernel = int(pairwise_conv_kernel)
+        self.pairwise_conv_aggr = pairwise_conv_aggr
         self.xcorr_feat_dim = int(xcorr_feat_dim)
         self.use_bottleneck_attention = bool(use_bottleneck_attention)
         self.graph_norm_type = graph_norm
@@ -273,6 +494,12 @@ class UNet_MPNN(nn.Module):
             [lvl for lvl in set(graph_levels) if 0 <= lvl < depth]
         )
 
+        if pairwise_conv_levels is None:
+            pairwise_conv_levels = []
+        self.pairwise_conv_levels = sorted(
+            [lvl for lvl in set(pairwise_conv_levels) if 0 <= lvl < depth]
+        )
+
         self.use_skip_graph = bool(use_skip_graph)
         if not self.use_skip_graph:
             self.skip_graph_levels = []
@@ -285,12 +512,24 @@ class UNet_MPNN(nn.Module):
 
         # ------------------------- geometry + topology -------------------------
         self._register_station_geometry(station_coords, crater_coords)
+        self._register_volcano_geometry_bank(volcano_geom_nodes)
 
         # ------------------------------ encoder --------------------------------
         self.encoder_list = nn.ModuleList()
         self.pool_list = nn.ModuleList()
         self.encoder_graph_op = nn.ModuleDict()
         self.encoder_graphnorm = nn.ModuleDict()
+        self.pairwise_conv = nn.ModuleDict()
+
+        for idx in self.pairwise_conv_levels:
+            feat_channels = init_features * (2**idx)
+            self.pairwise_conv[str(idx)] = PairwiseConv2d(
+                in_channels=feat_channels,
+                out_channels=feat_channels,
+                kernel_size=self.pairwise_conv_kernel,
+                n_stations=n_stations,
+                aggr=self.pairwise_conv_aggr,
+            )
 
         feat_in = in_channels
         for idx in range(depth):
@@ -537,8 +776,33 @@ class UNet_MPNN(nn.Module):
         num_graphs: int,
         device: torch.device,
         dtype: torch.dtype,
+        B: Optional[int] = None,
+        T_l: Optional[int] = None,
+        volcano_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Repeat static edge attrs to [num_graphs*num_edges, static_dim]."""
+        if (
+            self.volcano_edge_attr_static.numel() > 0
+            and volcano_idx is not None
+            and B is not None
+            and T_l is not None
+        ):
+            v_idx = volcano_idx.to(device=device, dtype=torch.long).view(B)
+            if int(v_idx.min().item()) < 0 or int(v_idx.max().item()) >= int(
+                self.volcano_edge_attr_static.shape[0]
+            ):
+                raise ValueError(
+                    "volcano_idx contains out-of-range values for volcano_edge_attr_static "
+                    f"(num_volcanoes={int(self.volcano_edge_attr_static.shape[0])})."
+                )
+            ea = self.volcano_edge_attr_static.to(device=device, dtype=dtype)[v_idx]
+            num_edges, dim = int(ea.shape[1]), int(ea.shape[2])
+            return (
+                ea.unsqueeze(1)
+                .expand(B, T_l, num_edges, dim)
+                .reshape(B * T_l * num_edges, dim)
+            )
+
         ea = self.edge_attr_base.to(device=device, dtype=dtype)
         num_edges, dim = ea.shape
         return (
@@ -581,6 +845,7 @@ class UNet_MPNN(nn.Module):
         B: int,
         T_l: int,
         edge_attr_dynamic: Optional[torch.Tensor],
+        volcano_idx: Optional[torch.Tensor],
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
@@ -589,7 +854,14 @@ class UNet_MPNN(nn.Module):
         parts = []
         if self.edge_attr_dim_static > 0:
             parts.append(
-                self._build_batched_edge_attr_static(num_graphs, device, dtype)
+                self._build_batched_edge_attr_static(
+                    num_graphs,
+                    device,
+                    dtype,
+                    B=B,
+                    T_l=T_l,
+                    volcano_idx=volcano_idx,
+                )
             )
         if self.edge_feature_mode == "delta_pos_xcorr":
             if edge_attr_dynamic is None:
@@ -611,17 +883,33 @@ class UNet_MPNN(nn.Module):
         B: int,
         T_l: int,
         rsam: Optional[torch.Tensor],
+        volcano_idx: Optional[torch.Tensor],
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
         parts = []
         if self.node_feature_mode == "geometry":
-            geom = self.geom_nodes.to(device=device, dtype=dtype)
-            parts.append(
-                geom.unsqueeze(0).expand(
+            if self.volcano_geom_nodes.numel() > 0 and volcano_idx is not None:
+                v_idx = volcano_idx.to(device=device, dtype=torch.long).view(B)
+                if int(v_idx.min().item()) < 0 or int(v_idx.max().item()) >= int(
+                    self.volcano_geom_nodes.shape[0]
+                ):
+                    raise ValueError(
+                        "volcano_idx contains out-of-range values for volcano_geom_nodes "
+                        f"(num_volcanoes={int(self.volcano_geom_nodes.shape[0])})."
+                    )
+                geom_bt = self.volcano_geom_nodes.to(device=device, dtype=dtype)[v_idx]
+                geom = (
+                    geom_bt.unsqueeze(1)
+                    .expand(B, T_l, self.n_nodes, self.geom_feat_channels)
+                    .reshape(num_graphs, self.n_nodes, self.geom_feat_channels)
+                )
+            else:
+                geom = self.geom_nodes.to(device=device, dtype=dtype)
+                geom = geom.unsqueeze(0).expand(
                     num_graphs, self.n_nodes, self.geom_feat_channels
                 )
-            )
+            parts.append(geom)
         if self.use_rsam_node_feat:
             if rsam is None:
                 rsam_nodes = torch.zeros(B, self.n_nodes, 1, device=device, dtype=dtype)
@@ -638,6 +926,74 @@ class UNet_MPNN(nn.Module):
         if not parts:
             return torch.empty(num_graphs, self.n_nodes, 0, device=device, dtype=dtype)
         return torch.cat(parts, dim=2)
+
+    def _register_volcano_geometry_bank(
+        self,
+        volcano_geom_nodes: Optional[torch.Tensor],
+    ) -> None:
+        if volcano_geom_nodes is None:
+            self.register_buffer(
+                "volcano_geom_nodes",
+                torch.empty(
+                    0, self.n_nodes, self.geom_feat_channels, dtype=torch.float32
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "volcano_edge_attr_static",
+                torch.empty(
+                    0,
+                    self.edge_index_base.shape[1],
+                    self.edge_attr_dim_static,
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            return
+
+        geom_bank = torch.as_tensor(volcano_geom_nodes, dtype=torch.float32)
+        if geom_bank.ndim != 3:
+            raise ValueError(
+                "volcano_geom_nodes must be a 3D tensor with shape "
+                f"(num_volcanoes, {self.n_nodes}, {self.geom_feat_channels})."
+            )
+        if (
+            geom_bank.shape[1] != self.n_nodes
+            or geom_bank.shape[2] != self.geom_feat_channels
+        ):
+            raise ValueError(
+                "volcano_geom_nodes has invalid shape. Expected (*, "
+                f"{self.n_nodes}, {self.geom_feat_channels}), got {tuple(geom_bank.shape)}"
+            )
+        self.register_buffer("volcano_geom_nodes", geom_bank, persistent=False)
+
+        if self.edge_attr_dim_static == 0:
+            self.register_buffer(
+                "volcano_edge_attr_static",
+                torch.empty(
+                    geom_bank.shape[0],
+                    self.edge_index_base.shape[1],
+                    0,
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            return
+
+        src = self.edge_index_base[0]
+        dst = self.edge_index_base[1]
+        xy = geom_bank[:, :, :2]
+        delta = xy[:, dst, :] - xy[:, src, :]
+        if self.edge_feature_mode == "delta_pos_dist":
+            dist = torch.linalg.norm(delta, dim=-1, keepdim=True)
+            edge_attr_bank = torch.cat([delta, dist], dim=-1)
+        else:
+            edge_attr_bank = delta
+        self.register_buffer(
+            "volcano_edge_attr_static",
+            edge_attr_bank.to(torch.float32),
+            persistent=False,
+        )
 
     # =============================== graph op ==================================
     def _apply_node_norm(
@@ -658,6 +1014,7 @@ class UNet_MPNN(nn.Module):
         graph_norm: Optional[nn.Module] = None,
         edge_attr_dynamic: Optional[torch.Tensor] = None,
         rsam: Optional[torch.Tensor] = None,
+        volcano_idx: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run the edge-conditioned MPNN over station features at one level.
@@ -680,7 +1037,15 @@ class UNet_MPNN(nn.Module):
         x_aug = torch.cat([x_bst, network_feature], dim=1)  # [B, n_nodes, C, T_l]
         x_nodes_in = x_aug.permute(0, 3, 1, 2).reshape(num_graphs, self.n_nodes, C)
 
-        node_feats = self._build_node_features(num_graphs, B, T_l, rsam, device, dtype)
+        node_feats = self._build_node_features(
+            num_graphs,
+            B,
+            T_l,
+            rsam,
+            volcano_idx,
+            device,
+            dtype,
+        )
         if node_feats.shape[-1] > 0:
             x_in = torch.cat([x_nodes_in, node_feats], dim=2)
         else:
@@ -691,7 +1056,13 @@ class UNet_MPNN(nn.Module):
 
         edge_index_batch = self._build_batched_edge_index(num_graphs)
         edge_attr = self._build_edge_attr(
-            num_graphs, B, T_l, edge_attr_dynamic, device, dtype
+            num_graphs,
+            B,
+            T_l,
+            edge_attr_dynamic,
+            volcano_idx,
+            device,
+            dtype,
         )
 
         x_out_nodes = graph_op(x_flat_nodes, edge_index_batch, edge_attr)
@@ -731,6 +1102,7 @@ class UNet_MPNN(nn.Module):
         x: torch.Tensor,
         edge_attr_dynamic: Optional[torch.Tensor] = None,
         rsam: Optional[torch.Tensor] = None,
+        volcano_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -766,12 +1138,20 @@ class UNet_MPNN(nn.Module):
                 raise ValueError(
                     f"rsam must be [B, S] = {(B, S)}. Got: {tuple(rsam.shape)}"
                 )
+        if volcano_idx is not None and tuple(volcano_idx.shape) not in {(B,), (B, 1)}:
+            raise ValueError(
+                f"volcano_idx must be [B] or [B,1] with B={B}. Got: {tuple(volcano_idx.shape)}"
+            )
 
         x_flat = x.reshape(B * S, 1, T)
 
         encodings: list = []
         for i in range(self.depth):
             x_flat = self.encoder_list[i](x_flat)
+
+            if str(i) in self.pairwise_conv:
+                x_flat = self.pairwise_conv[str(i)](x_flat, B, S)
+
             if str(i) in self.encoder_graph_op:
                 x_flat, _ = self._apply_mpnn(
                     self.encoder_graph_op[str(i)],
@@ -781,6 +1161,7 @@ class UNet_MPNN(nn.Module):
                     self.encoder_graphnorm[str(i)],
                     edge_attr_dynamic,
                     rsam,
+                    volcano_idx,
                 )
             encodings.append(x_flat)
             x_flat = self.pool_list[i](x_flat)
@@ -793,6 +1174,7 @@ class UNet_MPNN(nn.Module):
             self.graphnorm_bottleneck,
             edge_attr_dynamic,
             rsam,
+            volcano_idx,
         )
         if self.use_bottleneck_attention:
             x_dec = self._apply_bottleneck_attention(x_dec)
@@ -811,6 +1193,7 @@ class UNet_MPNN(nn.Module):
                     self.skip_graphnorm[str(enc_level)],
                     edge_attr_dynamic,
                     rsam,
+                    volcano_idx,
                 )
             else:
                 skip = self._virtual_node_init_readout(skip, B, S)
@@ -851,36 +1234,81 @@ class UNet_MPNN(nn.Module):
 # Single source of truth for the MPNN ablation sweep. `edge_mpnn__bottleneck`
 # is the default/baseline run.
 MPNN_ABLATION_KWARGS = {
-    # Dynamic cross-correlation edge features (requires offline edge_attr_dynamic).
-    # "edge_mpnn__xcorr": dict(
-    #     graph_topology="fully_connected",
-    #     edge_feature_mode="delta_pos_xcorr",
-    #     node_feature_mode="geometry",
-    #     xcorr_feat_dim=2,
-    #     graph_levels=[],
-    #     use_skip_graph=False,
-    #     use_bottleneck_attention=True,
-    #     graph_norm="none",
-    # ),    
-    # "edge_mpnn__both_l2_bottleneck": dict(
-    #     graph_topology="fully_connected",
-    #     edge_feature_mode="delta_pos",
-    #     node_feature_mode="geometry",
-    #     graph_levels=[2],  # early + bottleneck (bottleneck always present)
-    #     use_skip_graph=False,
-    #     use_bottleneck_attention=True,
-    #     graph_norm="none",
-    # ),
-    # # Topology ablation: star graph (no station-station edges).
-    # "edge_mpnn__star_topology": dict(
-    #     graph_topology="star",
-    #     edge_feature_mode="delta_pos",
-    #     node_feature_mode="geometry",
-    #     graph_levels=[],
-    #     use_skip_graph=False,
-    #     use_bottleneck_attention=True,
-    #     graph_norm="none",
-    # ),       
+    "pairwise_conv2d__l0": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="delta_pos",
+        node_feature_mode="geometry",
+        graph_levels=[],
+        pairwise_conv_levels=[0],
+        pairwise_conv_kernel=9,
+        use_skip_graph=False,
+        use_bottleneck_attention=True,
+        graph_norm="none",
+    ),
+    # graph in the first layer of the encoder.
+    "edge_mpnn__early_l0": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="delta_pos",
+        node_feature_mode="geometry",
+        graph_levels=[0],
+        use_skip_graph=False,
+        use_bottleneck_attention=True,
+        graph_norm="none",
+    ),
+    # Re-isolate the bottleneck attention in the MPNN context.
+    "edge_mpnn__no_attention": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="delta_pos",
+        node_feature_mode="geometry",
+        graph_levels=[],
+        use_skip_graph=False,
+        use_bottleneck_attention=False,
+        graph_norm="none",
+    ),
+    # Append precomputed per-station RSAM as a node feature (run on the winner).
+    "edge_mpnn__rsam": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="delta_pos",
+        node_feature_mode="geometry",
+        use_rsam_node_feat=True,
+        graph_levels=[],
+        use_skip_graph=False,
+        use_bottleneck_attention=True,
+        graph_norm="none",
+    ),
+    # Control: no spatial node info anywhere (pairs with edge none for a true
+    # no-geometry run).
+    "edge_mpnn__no_spatial_info": dict(
+        graph_topology="fully_connected",
+        edge_feature_mode="none",
+        node_feature_mode="none",
+        graph_levels=[],
+        use_skip_graph=False,
+        use_bottleneck_attention=True,
+        graph_norm="none",
+    ),
+    #     # Topology ablation: star graph (no station-station edges).
+    #     "edge_mpnn__star_topology": dict(
+    #         graph_topology="star",
+    #         edge_feature_mode="delta_pos",
+    #         node_feature_mode="geometry",
+    #         graph_levels=[],
+    #         use_skip_graph=False,
+    #         use_bottleneck_attention=True,
+    #         graph_norm="none",
+    #     ),
+    #     # Dynamic cross-correlation edge features (requires offline edge_attr_dynamic).
+    #     "edge_mpnn__xcorr": dict(
+    #         graph_topology="fully_connected",
+    #         edge_feature_mode="delta_pos_xcorr",
+    #         node_feature_mode="geometry",
+    #         xcorr_feat_dim=2,
+    #         graph_levels=[],
+    #         use_skip_graph=False,
+    #         use_bottleneck_attention=True,
+    #         graph_norm="none",
+    #     ),
+    ################### ya corridos
     # Defaults: fully_connected, delta_pos edges, bottleneck-only MPNN,
     # skip-graph off, bottleneck attention on, no graph norm. Run first.
     # "edge_mpnn__bottleneck": dict(
@@ -894,7 +1322,16 @@ MPNN_ABLATION_KWARGS = {
     # ),
     # THE key test: drop edge features architecturally (message MLP loses its
     # edge slice). Proves whether edge geometry matters.
-    # --- Tier 1: aggregation (most important, run first) ---
+    # "edge_mpnn__no_edge_feats": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="none",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),
+    # # --- Tier 1: aggregation (most important, run first) ---
     # "edge_mpnn__aggr_max": dict(
     #     graph_topology="fully_connected",
     #     edge_feature_mode="delta_pos",
@@ -915,66 +1352,32 @@ MPNN_ABLATION_KWARGS = {
     #     graph_norm="none",
     #     mpnn_layers=4,  # test deeper; watch for over-smoothing
     # ),
-    # "edge_mpnn__early_l2": dict(
-    #     graph_topology="fully_connected",
-    #     edge_feature_mode="delta_pos",
-    #     node_feature_mode="geometry",
-    #     graph_levels=[2],  # level 2 only, no bottleneck graph
-    #     use_skip_graph=False,
-    #     use_bottleneck_attention=True,
-    #     graph_norm="none",
-    # ),
-    # "edge_mpnn__early_l1": dict(
-    #     graph_topology="fully_connected",
-    #     edge_feature_mode="delta_pos",
-    #     node_feature_mode="geometry",
-    #     graph_levels=[1],  # level 1 only, no bottleneck graph
-    #     use_skip_graph=False,
-    #     use_bottleneck_attention=True,
-    #     graph_norm="none",
-    # ),
- 
-    # "edge_mpnn__no_edge_feats": dict(
-    #     graph_topology="fully_connected",
-    #     edge_feature_mode="none",
-    #     node_feature_mode="geometry",
-    #     graph_levels=[],
-    #     use_skip_graph=False,
-    #     use_bottleneck_attention=True,
-    #     graph_norm="none",
-    # ),
-
-
-    # Control: no spatial node info anywhere (pairs with edge none for a true
-    # no-geometry run).
-    "edge_mpnn__no_spatial_info": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="none",
-        node_feature_mode="none",
-        graph_levels=[],
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
-    # # Append precomputed per-station RSAM as a node feature (run on the winner).
-    # "edge_mpnn__rsam": dict(
-    #     graph_topology="fully_connected",
-    #     edge_feature_mode="delta_pos",
-    #     node_feature_mode="geometry",
-    #     use_rsam_node_feat=True,
-    #     graph_levels=[],
-    #     use_skip_graph=False,
-    #     use_bottleneck_attention=True,
-    #     graph_norm="none",
-    # ),
-    # # Re-isolate the bottleneck attention in the MPNN context.
-    # "edge_mpnn__no_attention": dict(
-    #     graph_topology="fully_connected",
-    #     edge_feature_mode="delta_pos",
-    #     node_feature_mode="geometry",
-    #     graph_levels=[],
-    #     use_skip_graph=False,
-    #     use_bottleneck_attention=False,
-    #     graph_norm="none",
-    # ),
+    #     "edge_mpnn__early_l2": dict(
+    #         graph_topology="fully_connected",
+    #         edge_feature_mode="delta_pos",
+    #         node_feature_mode="geometry",
+    #         graph_levels=[2],  # level 2 only, no bottleneck graph
+    #         use_skip_graph=False,
+    #         use_bottleneck_attention=True,
+    #         graph_norm="none",
+    #     ),
+    #     # Shallow encoder MPNN + bottleneck. Only run if bottleneck ties baseline.
+    #     "edge_mpnn__early_l1": dict(
+    #         graph_topology="fully_connected",
+    #         edge_feature_mode="delta_pos",
+    #         node_feature_mode="geometry",
+    #         graph_levels=[1],  # level 1 only, no bottleneck graph
+    #         use_skip_graph=False,
+    #         use_bottleneck_attention=True,
+    #         graph_norm="none",
+    #     ),
+    #     "edge_mpnn__both_l2_bottleneck": dict(
+    #         graph_topology="fully_connected",
+    #         edge_feature_mode="delta_pos",
+    #         node_feature_mode="geometry",
+    #         graph_levels=[2],  # early + bottleneck (bottleneck always present)
+    #         use_skip_graph=False,
+    #         use_bottleneck_attention=True,
+    #         graph_norm="none",
+    #     ),
 }

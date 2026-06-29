@@ -4,19 +4,21 @@ from typing import Optional
 import torch
 
 from models.PhaseNet import PhaseNet
-from models.UNet import UNet
-from models.UNet_GraphSAGE import (
-    UNet_GraphSAGE,
-    UNet_GraphSAGE_Ablation2_MLPBackend,
-    UNet_GraphSAGE_Ablation3_NoMessagePassing,
-    UNet_GraphSAGE_Ablation7_MeanVirtualNodePooling,
-    UNet_GraphSAGE_Ablation9_NoSkipGraph,
-)
+from utils.model_registry import build_model_from_spec, get_model_spec
 
 
 def build_model(arch: str, n_classes: int = 6, **model_kwargs):
-    if arch == "UNet":
-        return UNet(in_channels=1, out_channels=n_classes, init_features=16, depth=5)
+    legacy_arch_map = {
+        "UNet": "unet",
+        "UNetBottleneckAttention": "unet_bottleneck_attention",
+        "UNet_GraphSAGE": "v5_full",
+        "UNet_GraphSAGE_Ablation2_MLPBackend": "ablation_2_mlp_backend",
+        "UNet_GraphSAGE_Ablation3_NoMessagePassing": "ablation_3_no_message_passing",
+        "UNet_GraphSAGE_Ablation7_MeanVirtualNodePooling": "ablation_7_mean_virtual_node_pool",
+        "UNet_GraphSAGE_Ablation9_NoSkipGraph": "ablation_9_no_skip_graph",
+    }
+    arch = legacy_arch_map.get(arch, arch)
+
     if arch == "PhaseNet":
         return PhaseNet(
             in_channels=8,
@@ -27,45 +29,12 @@ def build_model(arch: str, n_classes: int = 6, **model_kwargs):
             norm="std",
             filters_root=32,
         )
-    if arch == "UNet_GraphSAGE":
-        return UNet_GraphSAGE(
-            in_channels=1,
-            out_channels=n_classes,
-            init_features=16,
-            depth=5,
-        )
-    if arch == "UNet_GraphSAGE_Ablation2_MLPBackend":
-        return UNet_GraphSAGE_Ablation2_MLPBackend(
-            in_channels=1,
-            out_channels=n_classes,
-            init_features=16,
-            depth=5,
-            **model_kwargs,
-        )
-    if arch == "UNet_GraphSAGE_Ablation3_NoMessagePassing":
-        return UNet_GraphSAGE_Ablation3_NoMessagePassing(
-            in_channels=1,
-            out_channels=n_classes,
-            init_features=16,
-            depth=5,
-            **model_kwargs,
-        )
-    if arch == "UNet_GraphSAGE_Ablation7_MeanVirtualNodePooling":
-        return UNet_GraphSAGE_Ablation7_MeanVirtualNodePooling(
-            in_channels=1,
-            out_channels=n_classes,
-            init_features=16,
-            depth=5,
-            **model_kwargs,
-        )
-    if arch == "UNet_GraphSAGE_Ablation9_NoSkipGraph":
-        return UNet_GraphSAGE_Ablation9_NoSkipGraph(
-            in_channels=1,
-            out_channels=n_classes,
-            init_features=16,
-            depth=5,
-            **model_kwargs,
-        )
+    try:
+        get_model_spec(arch)
+    except KeyError:
+        pass
+    else:
+        return build_model_from_spec(arch, n_classes=n_classes, **model_kwargs)
 
     # Backward-compatible aliases from older model naming.
     if arch in {
@@ -75,6 +44,8 @@ def build_model(arch: str, n_classes: int = 6, **model_kwargs):
         "UNet_GraphSAGE_v5",
         "UNet_GraphSAGE_v6",
     }:
+        from models.UNet_GraphSAGE import UNet_GraphSAGE
+
         return UNet_GraphSAGE(
             in_channels=1,
             out_channels=n_classes,
@@ -83,7 +54,7 @@ def build_model(arch: str, n_classes: int = 6, **model_kwargs):
             **model_kwargs,
         )
     raise ValueError(
-        f"Unsupported arch '{arch}'. Allowed: 'UNet', 'PhaseNet', 'UNet_GraphSAGE', 'UNet_GraphSAGE_Ablation2_MLPBackend', 'UNet_GraphSAGE_Ablation3_NoMessagePassing', 'UNet_GraphSAGE_Ablation7_MeanVirtualNodePooling', 'UNet_GraphSAGE_Ablation9_NoSkipGraph', and legacy aliases 'UNet_GraphSAGE_v2'..'UNet_GraphSAGE_v6'."
+        f"Unsupported arch '{arch}'. Use a registered model key, a legacy GraphSAGE alias, or PhaseNet."
     )
 
 
