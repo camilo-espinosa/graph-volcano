@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data import BatchSampler, Dataset
 
 from . import data_utils
+from .station_info import get_default_volcano_to_index, infer_volcano_name_from_path
+from utils.model_registry import get_model_spec
 from models.UNet_GraphSAGE import UNet_GraphSAGE
 from models.UNet_MPNN import UNet_MPNN
 
@@ -679,7 +681,11 @@ def compute_event_f1_iou(model, loader, device):
         denom = tp + fp + fn
         iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
     mean_iou = (
-        float(np.mean([iou_per_class[i] for i, active in enumerate(active_mask) if active]))
+        float(
+            np.mean(
+                [iou_per_class[i] for i, active in enumerate(active_mask) if active]
+            )
+        )
         if np.any(active_mask)
         else 0.0
     )
@@ -825,8 +831,20 @@ def compute_event_f1_iou_graphsage(
             y_label = y_label.to(device).long()
 
             descriptor_payload = None
+            volcano_idx_b = None
             if len(batch) > 3:
-                descriptor_payload = batch[3]
+                extra_1 = batch[3]
+                if isinstance(extra_1, dict):
+                    descriptor_payload = extra_1
+                elif torch.is_tensor(extra_1) and extra_1.ndim <= 1:
+                    volcano_idx_b = extra_1
+                else:
+                    descriptor_payload = extra_1
+
+            if len(batch) > 4:
+                extra_2 = batch[4]
+                if torch.is_tensor(extra_2) and extra_2.ndim <= 1:
+                    volcano_idx_b = extra_2
 
             if getattr(model, "use_envelope", False):
                 envelope_b = _extract_envelope_tensor(descriptor_payload, xb)
@@ -856,6 +874,8 @@ def compute_event_f1_iou_graphsage(
                 forward_kwargs["envelope"] = envelope_b
             if descriptors_b is not None:
                 forward_kwargs["descriptors"] = descriptors_b
+            if volcano_idx_b is not None:
+                forward_kwargs["volcano_idx"] = volcano_idx_b.to(device).long()
 
             output = model(xb, **forward_kwargs)
 
@@ -965,7 +985,9 @@ def compute_event_f1_iou_graphsage(
             for c in range(6):
                 pred_mask = pred_max_idx_np == c
                 true_mask = true_max_idx_np == c
-                temporal_intersections[c] += int(np.logical_and(pred_mask, true_mask).sum())
+                temporal_intersections[c] += int(
+                    np.logical_and(pred_mask, true_mask).sum()
+                )
                 temporal_unions[c] += int(np.logical_or(pred_mask, true_mask).sum())
             true_bg_mask = (true_max_idx == 0).float()
             pred_bg_mask = (pred_max_idx == 0).float()
@@ -1026,7 +1048,11 @@ def compute_event_f1_iou_graphsage(
         for c in event_classes
     ]
     mean_iou = (
-        float(np.mean([iou_per_class[i] for i, active in enumerate(active_mask) if active]))
+        float(
+            np.mean(
+                [iou_per_class[i] for i, active in enumerate(active_mask) if active]
+            )
+        )
         if np.any(active_mask)
         else 0.0
     )
@@ -1143,19 +1169,36 @@ class GraphSAGEDataset(Dataset):
         self,
         npz_path: Path,
         descriptor_names: Sequence[str] | str | None = None,
+        return_volcano_idx: bool = False,
+        volcano_name_to_idx: Optional[dict[str, int]] = None,
     ):
         with np.load(npz_path) as data:
             self.filepaths = data["filepaths"].copy()
             self.descriptor_paths = (
-                data["descriptor_paths"].copy()
-                if "descriptor_paths" in data
-                else None
+                data["descriptor_paths"].copy() if "descriptor_paths" in data else None
             )
             self.labels = data["labels"].copy()
             self.label_ids = data["label_ids"].astype(np.int64, copy=True)
 
         self.descriptor_names = self._normalize_descriptor_names(descriptor_names)
         self.use_descriptors = len(self.descriptor_names) > 0
+        self.return_volcano_idx = bool(return_volcano_idx)
+        self.volcano_name_to_idx = (
+            dict(volcano_name_to_idx)
+            if volcano_name_to_idx is not None
+            else get_default_volcano_to_index()
+        )
+
+        if self.return_volcano_idx:
+            self.sample_volcano_idx = np.asarray(
+                [
+                    int(self.volcano_name_to_idx[infer_volcano_name_from_path(str(fp))])
+                    for fp in self.filepaths
+                ],
+                dtype=np.int64,
+            )
+        else:
+            self.sample_volcano_idx = None
 
         if self.use_descriptors and self.descriptor_paths is None:
             self.descriptor_paths = self._infer_descriptor_paths(npz_path)
@@ -1251,10 +1294,148 @@ class GraphSAGEDataset(Dataset):
         descriptors = (
             self._load_selected_descriptors(idx) if self.use_descriptors else None
         )
+        volcano_idx = (
+            torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
+            if self.return_volcano_idx
+            else None
+        )
+
+        if self.use_descriptors and self.return_volcano_idx:
+            return x, y_onehot, y_label, descriptors, volcano_idx
 
         if self.use_descriptors:
             return x, y_onehot, y_label, descriptors
 
+        if self.return_volcano_idx:
+            return x, y_onehot, y_label, volcano_idx
+
+        return x, y_onehot, y_label
+
+
+class CrossVolcanoLOODataset(Dataset):
+    """
+    Dataset for leave-one-out cross-volcano protocol manifests.
+
+    Expected manifest fields:
+    - filepaths
+    - labels
+    - label_ids
+    Optional:
+    - volcano_idx
+    - descriptor_paths
+    """
+
+    AVAILABLE_DESCRIPTORS = GraphSAGEDataset.AVAILABLE_DESCRIPTORS
+
+    def __init__(
+        self,
+        npz_path: Path,
+        descriptor_names: Sequence[str] | str | None = None,
+        return_volcano_idx: bool = True,
+        volcano_name_to_idx: Optional[dict[str, int]] = None,
+    ):
+        with np.load(npz_path) as data:
+            self.filepaths = data["filepaths"].copy()
+            self.labels = data["labels"].copy()
+            self.label_ids = data["label_ids"].astype(np.int64, copy=True)
+            self.descriptor_paths = (
+                data["descriptor_paths"].copy() if "descriptor_paths" in data else None
+            )
+            self.manifest_volcano_idx = (
+                data["volcano_idx"].astype(np.int64, copy=True)
+                if "volcano_idx" in data
+                else None
+            )
+
+        self.descriptor_names = GraphSAGEDataset._normalize_descriptor_names(
+            descriptor_names
+        )
+        self.use_descriptors = len(self.descriptor_names) > 0
+        self.return_volcano_idx = bool(return_volcano_idx)
+        self.volcano_name_to_idx = (
+            dict(volcano_name_to_idx)
+            if volcano_name_to_idx is not None
+            else get_default_volcano_to_index()
+        )
+
+        if self.manifest_volcano_idx is not None:
+            self.sample_volcano_idx = self.manifest_volcano_idx
+        else:
+            self.sample_volcano_idx = np.asarray(
+                [
+                    int(self.volcano_name_to_idx[infer_volcano_name_from_path(str(fp))])
+                    for fp in self.filepaths
+                ],
+                dtype=np.int64,
+            )
+
+        if self.use_descriptors and self.descriptor_paths is None:
+            self.descriptor_paths = self._infer_descriptor_paths()
+
+    def _infer_descriptor_paths(self) -> np.ndarray:
+        project_root = Path(__file__).resolve().parents[1]
+        descriptors_root = project_root / "data" / "prepared_data" / "descriptors"
+        inferred: list[str] = []
+        for fp in self.filepaths:
+            src = Path(str(fp))
+            try:
+                volcano_name = infer_volcano_name_from_path(src)
+            except KeyError:
+                inferred.append("")
+                continue
+
+            parts = src.parts
+            if volcano_name in parts:
+                idx = parts.index(volcano_name)
+                rel = Path(*parts[idx + 1 :]).with_suffix(".npz")
+            else:
+                rel = Path(src.name).with_suffix(".npz")
+
+            desc_path = descriptors_root / volcano_name / rel
+            inferred.append(str(desc_path.as_posix()))
+        return np.asarray(inferred)
+
+    def _load_selected_descriptors(self, idx: int) -> dict[str, torch.Tensor]:
+        desc_path = Path(str(self.descriptor_paths[idx]))
+        if not desc_path.exists():
+            raise FileNotFoundError(
+                f"Descriptor file not found for sample index {idx}: {desc_path}"
+            )
+
+        with np.load(desc_path, mmap_mode="r") as desc_npz:
+            desc_dict = {
+                name: torch.from_numpy(np.array(desc_npz[name], dtype=np.float32))
+                for name in self.descriptor_names
+            }
+        return desc_dict
+
+    def __len__(self):
+        return len(self.filepaths)
+
+    def __getitem__(self, idx):
+        arr = np.load(self.filepaths[idx], mmap_mode="r")
+        arr = np.array(arr, dtype=np.float32)
+        x_raw = arr[:8, :]
+        y_raw = arr[8:, :]
+
+        x = torch.from_numpy(x_raw)
+        y_onehot = torch.from_numpy(y_raw)
+        y_label = torch.tensor(int(self.label_ids[idx]), dtype=torch.long)
+        descriptors = (
+            self._load_selected_descriptors(idx) if self.use_descriptors else None
+        )
+        volcano_idx = (
+            torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
+            if self.return_volcano_idx
+            else None
+        )
+
+        if self.use_descriptors and self.return_volcano_idx:
+            return x, y_onehot, y_label, descriptors, volcano_idx
+        if self.use_descriptors:
+            return x, y_onehot, y_label, descriptors
+        if self.return_volcano_idx:
+            return x, y_onehot, y_label, volcano_idx
         return x, y_onehot, y_label
 
 
@@ -1360,13 +1541,24 @@ def train_one_ablation_fold(
         train_ds.label_ids, batch_size=config["batch_size"]
     )
     train_loader = DataLoader(train_ds, batch_sampler=balanced_batch_sampler)
-    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False,)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config["batch_size"],
+        shuffle=False,
+    )
     test_loader = DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False)
 
-    # Extract model class if specified; default to UNet_GraphSAGE for backward compatibility
+    # Extract the model class if one is provided by the registry.
     model_kwargs_copy = model_kwargs.copy()
-    model_class_name = model_kwargs_copy.pop("_model_class", "UNet_GraphSAGE")
-    model_class = UNet_MPNN if model_class_name == "UNet_MPNN" else UNet_GraphSAGE
+    model_class = model_kwargs_copy.pop("_model_cls", None)
+    if model_class is None:
+        model_class_name = model_kwargs_copy.pop("_model_class", "UNet_GraphSAGE")
+        model_class = UNet_MPNN if model_class_name == "UNet_MPNN" else UNet_GraphSAGE
+    else:
+        model_class_name = getattr(model_class, "__name__", str(model_class))
+
+    model_kwargs_copy.pop("in_channels", None)
+    model_kwargs_copy.pop("out_channels", None)
 
     model = model_class(
         in_channels=1,
@@ -1658,6 +1850,343 @@ def train_one_ablation_fold(
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
         "test_iou_per_class": [float(x) for x in test_iou_per_class],
         "test_iou_all_classes": [float(x) for x in test_iou_all_classes],
+        "fold_elapsed_seconds": fold_elapsed_sec,
+    }
+
+    with (reports_dir / "fold_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(fold_summary, f, indent=2)
+
+    del train_ds, val_ds, test_ds
+    del train_loader, val_loader, test_loader
+    del optimizer, scheduler, model, ckpt
+    cleanup_gpu_cache()
+
+    return fold_summary
+
+
+def evaluate_unet_model(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    len_window: int,
+    im_size: int,
+    config: dict,
+) -> tuple[list[float], float, list[float], float, float, np.ndarray]:
+    model.eval()
+
+    total_loss = 0.0
+    n_batches = 0
+    with torch.no_grad():
+        for xb, y_onehot, _y_idx in dataloader:
+            xb = xb.to(device)
+            y_onehot = y_onehot.to(device)
+            out = model(xb)
+            loss, _, _ = combined_dice_ce_loss_2d(
+                out,
+                y_onehot,
+                class_weights=None,
+                dice_weight=config["dice_weight"],
+                ce_weight=config["ce_weight"],
+            )
+            total_loss += float(loss.item())
+            n_batches += 1
+            del xb, y_onehot, out, loss
+
+    mean_loss = float(total_loss / n_batches) if n_batches > 0 else 0.0
+
+    cm = cm_eval(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        len_window=len_window,
+        im_size=im_size,
+        clases_list={1.0: "VT", 2.0: "LP", 3.0: "TR", 4.0: "AV", 5.0: "IC"},
+        t_bg=0,
+        t_cl=0,
+    )
+    f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
+    f1_scores = [float(x) for x in f1_scores]
+    mean_f1 = float(np.mean(f1_scores)) if len(f1_scores) > 0 else 0.0
+    iou_per_class, mean_iou = compute_iou_from_cm(cm)
+
+    return f1_scores, mean_f1, iou_per_class, mean_iou, mean_loss, cm
+
+
+def train_one_unet_fold(
+    model_key: str,
+    fold_id: int,
+    fold_data_dir: Path,
+    fold_out_dir: Path,
+    device: torch.device,
+    config: dict,
+) -> dict:
+    checkpoints_dir = fold_out_dir / "checkpoints"
+    reports_dir = fold_out_dir / "reports"
+    cm_dir = fold_out_dir / "confusion_matrices"
+    for p in (checkpoints_dir, reports_dir, cm_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    train_ds = UNetPatchDataset(fold_data_dir / "train_aug.npz")
+    val_ds = UNetPatchDataset(fold_data_dir / "val.npz")
+    test_ds = UNetPatchDataset(fold_data_dir / "test.npz")
+
+    balanced_batch_sampler = BalancedBatchSampler(
+        train_ds.label_ids,
+        batch_size=config["batch_size"],
+    )
+    train_loader = DataLoader(train_ds, batch_sampler=balanced_batch_sampler)
+    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False)
+
+    spec = get_model_spec(model_key)
+    model = spec["model_cls"](**spec["model_kwargs"]).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, int(config["epochs"] / 4)),
+        eta_min=config["lr_final"],
+    )
+
+    best_train_loss = float("inf")
+    best_val_loss = float("inf")
+    best_mean_f1 = float("-inf")
+    best_epoch = -1
+    epochs_without_improvement = 0
+
+    metrics_rows = []
+    fold_start = time.time()
+
+    print("=" * 80)
+    print(
+        f"Training {spec['display_name']} | fold={fold_id:02d} | "
+        f"train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}"
+    )
+    print(f"Output folder: {fold_out_dir}")
+    print("=" * 80)
+
+    for epoch in range(config["epochs"]):
+        model.train()
+        train_loss = 0.0
+
+        for batch_idx, (xb, y_onehot, _y_idx) in enumerate(train_loader):
+            xb = xb.to(device)
+            y_onehot = y_onehot.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            out = model(xb)
+            loss, dice_component, ce_component = combined_dice_ce_loss_2d(
+                out,
+                y_onehot,
+                class_weights=None,
+                dice_weight=config["dice_weight"],
+                ce_weight=config["ce_weight"],
+            )
+            loss.backward()
+            optimizer.step()
+
+            train_loss += float(loss.item())
+
+            if batch_idx % 100 == 0:
+                print(
+                    f"  Epoch {epoch:03d} batch {batch_idx:04d}/{len(train_loader)} | "
+                    f"loss={loss.item():.4f} dice={dice_component.item():.4f} ce={ce_component.item():.4f}"
+                )
+
+            del xb, y_onehot, out, loss, dice_component, ce_component
+
+        scheduler.step()
+
+        (
+            val_f1_per_class,
+            val_mean_f1,
+            val_iou_per_class,
+            val_mean_iou,
+            val_loss,
+            val_cm,
+        ) = evaluate_unet_model(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            len_window=config["len_window"],
+            im_size=config["im_size"],
+            config=config,
+        )
+
+        is_best_mean_f1_epoch = float(val_mean_f1) > float(best_mean_f1)
+        if is_best_mean_f1_epoch:
+            best_mean_f1 = float(val_mean_f1)
+            best_epoch = int(epoch)
+            epochs_without_improvement = 0
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": float(val_loss),
+                    "f1score": float(val_mean_f1),
+                },
+                checkpoints_dir / "best_f1.pt",
+            )
+        else:
+            epochs_without_improvement += 1
+
+        if float(train_loss) < float(best_train_loss):
+            best_train_loss = float(train_loss)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": float(val_loss),
+                    "f1score": float(val_mean_f1),
+                },
+                checkpoints_dir / "best_train_loss.pt",
+            )
+
+        if float(val_loss) < float(best_val_loss):
+            best_val_loss = float(val_loss)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": float(val_loss),
+                    "f1score": float(val_mean_f1),
+                },
+                checkpoints_dir / "best_val_loss.pt",
+            )
+
+        save_confusion_matrix_image(
+            cm=val_cm,
+            labels=["VT", "LP", "TR", "AV", "IC"],
+            out_path=cm_dir / f"confusion_matrix_epoch_{epoch:03d}.png",
+            title=(
+                f"Confusion Matrix - {spec['display_name']} "
+                f"fold {fold_id:02d} - epoch {epoch:03d}"
+            ),
+        )
+
+        current_lr = float(optimizer.param_groups[0]["lr"])
+        metrics_rows.append(
+            [
+                current_lr,
+                int(epoch),
+                float(train_loss),
+                float(val_loss),
+                float(val_f1_per_class[0]),
+                float(val_f1_per_class[1]),
+                float(val_f1_per_class[2]),
+                float(val_f1_per_class[3]),
+                float(val_f1_per_class[4]),
+                float(val_mean_f1),
+                float(val_iou_per_class[0]),
+                float(val_iou_per_class[1]),
+                float(val_iou_per_class[2]),
+                float(val_iou_per_class[3]),
+                float(val_iou_per_class[4]),
+                float(val_mean_iou),
+            ]
+        )
+        metrics_df = pd.DataFrame(
+            metrics_rows,
+            columns=[
+                "lr",
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "VT_f1",
+                "LP_f1",
+                "TR_f1",
+                "AV_f1",
+                "IC_f1",
+                "mean_f1",
+                "VT_iou",
+                "LP_iou",
+                "TR_iou",
+                "AV_iou",
+                "IC_iou",
+                "mean_iou",
+            ],
+        )
+        metrics_df.to_csv(
+            reports_dir / "training_metrics.csv",
+            index=False,
+            encoding="utf-8-sig",
+            sep=";",
+            decimal=",",
+        )
+
+        print(
+            f"EPOCH {epoch:03d} | train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"mean_f1={val_mean_f1:.4f} mean_iou={val_mean_iou:.4f} "
+            f"best_epoch={best_epoch if best_epoch >= 0 else 'NA'} "
+            f"no_improve={epochs_without_improvement}/{config['early_stop_patience']}"
+        )
+
+        del val_cm
+        cleanup_gpu_cache()
+
+        if epochs_without_improvement >= int(config["early_stop_patience"]):
+            print(
+                f"Early stopping at epoch {epoch:03d}: no mean_f1 improvement for "
+                f"{config['early_stop_patience']} consecutive epochs."
+            )
+            break
+
+    best_f1_ckpt = checkpoints_dir / "best_f1.pt"
+    if not best_f1_ckpt.exists():
+        raise RuntimeError(
+            f"best_f1 checkpoint not found for fold output: {best_f1_ckpt}"
+        )
+
+    ckpt = torch.load(best_f1_ckpt, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    (
+        test_f1_per_class,
+        test_mean_f1,
+        test_iou_per_class,
+        test_mean_iou,
+        test_loss,
+        test_cm,
+    ) = evaluate_unet_model(
+        model=model,
+        dataloader=test_loader,
+        device=device,
+        len_window=config["len_window"],
+        im_size=config["im_size"],
+        config=config,
+    )
+
+    save_confusion_matrix_image(
+        cm=test_cm,
+        labels=["VT", "LP", "TR", "AV", "IC"],
+        out_path=cm_dir / "confusion_matrix_test_best_f1.png",
+        title=(
+            f"Test Confusion Matrix - {spec['display_name']} "
+            f"fold {fold_id:02d} - best_f1"
+        ),
+    )
+
+    fold_elapsed_sec = float(time.time() - fold_start)
+    fold_summary = {
+        "model": spec["display_name"],
+        "model_key": model_key,
+        "fold": int(fold_id),
+        "n_train": int(len(train_ds)),
+        "n_val": int(len(val_ds)),
+        "n_test": int(len(test_ds)),
+        "best_epoch": int(best_epoch),
+        "best_train_loss": float(best_train_loss),
+        "best_val_loss": float(best_val_loss),
+        "best_val_mean_f1": float(best_mean_f1),
+        "test_loss": float(test_loss),
+        "test_mean_f1": float(test_mean_f1),
+        "test_mean_iou": float(test_mean_iou),
+        "test_f1_per_class": [float(x) for x in test_f1_per_class],
+        "test_iou_per_class": [float(x) for x in test_iou_per_class],
         "fold_elapsed_seconds": fold_elapsed_sec,
     }
 

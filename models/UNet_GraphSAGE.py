@@ -139,6 +139,7 @@ class UNet_GraphSAGE(nn.Module):
         bottleneck_virtual_node_pool_mode: Optional[Literal["learned", "mean"]] = None,
         use_skip_graph: bool = True,
         skip_graph_levels: Optional[List[int]] = None,
+        volcano_geom_nodes: Optional[torch.Tensor] = None,
         bottleneck_attn_heads: int = 4,
         bottleneck_attn_dropout: float = 0.0,
         bottleneck_attn_ff_mult: int = 2,
@@ -263,6 +264,7 @@ class UNet_GraphSAGE(nn.Module):
         )
 
         self._register_station_geometry(station_coords, crater_coords)
+        self._register_volcano_geometry_bank(volcano_geom_nodes)
 
         _skip_layers = (
             graphsage_layers if skip_graphsage_layers is None else skip_graphsage_layers
@@ -432,11 +434,35 @@ class UNet_GraphSAGE(nn.Module):
         num_graphs: int,
         device: torch.device,
         dtype: torch.dtype,
+        B: Optional[int] = None,
+        T_l: Optional[int] = None,
+        volcano_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         parts = []
         if self.node_feature_mode in {"geometry", "both"}:
-            geom_batch = self.geom_nodes.to(device=device, dtype=dtype)
-            geom_batch = geom_batch.unsqueeze(0).expand(num_graphs, -1, -1)
+            if (
+                self.volcano_geom_nodes.numel() > 0
+                and volcano_idx is not None
+                and B is not None
+                and T_l is not None
+            ):
+                v_idx = volcano_idx.to(device=device, dtype=torch.long).view(B)
+                if int(v_idx.min().item()) < 0 or int(v_idx.max().item()) >= int(
+                    self.volcano_geom_nodes.shape[0]
+                ):
+                    raise ValueError(
+                        "volcano_idx contains out-of-range values for volcano_geom_nodes "
+                        f"(num_volcanoes={int(self.volcano_geom_nodes.shape[0])})."
+                    )
+                geom_bt = self.volcano_geom_nodes.to(device=device, dtype=dtype)[v_idx]
+                geom_batch = (
+                    geom_bt.unsqueeze(1)
+                    .expand(B, T_l, self.n_nodes, self.geom_feat_channels)
+                    .reshape(num_graphs, self.n_nodes, self.geom_feat_channels)
+                )
+            else:
+                geom_batch = self.geom_nodes.to(device=device, dtype=dtype)
+                geom_batch = geom_batch.unsqueeze(0).expand(num_graphs, -1, -1)
             parts.append(geom_batch)
         if self.node_feature_mode in {"learned_station_embedding", "both"}:
             node_idx = torch.arange(self.n_nodes, device=device, dtype=torch.long)
@@ -452,6 +478,37 @@ class UNet_GraphSAGE(nn.Module):
                 dtype=dtype,
             )
         return torch.cat(parts, dim=2)
+
+    def _register_volcano_geometry_bank(
+        self,
+        volcano_geom_nodes: Optional[torch.Tensor],
+    ) -> None:
+        if volcano_geom_nodes is None:
+            self.register_buffer(
+                "volcano_geom_nodes",
+                torch.empty(
+                    0, self.n_nodes, self.geom_feat_channels, dtype=torch.float32
+                ),
+                persistent=False,
+            )
+            return
+
+        geom_bank = torch.as_tensor(volcano_geom_nodes, dtype=torch.float32)
+        expected_shape = ("num_volcanoes", self.n_nodes, self.geom_feat_channels)
+        if geom_bank.ndim != 3:
+            raise ValueError(
+                "volcano_geom_nodes must be a 3D tensor with shape "
+                f"{expected_shape}. Got ndim={geom_bank.ndim}."
+            )
+        if (
+            geom_bank.shape[1] != self.n_nodes
+            or geom_bank.shape[2] != self.geom_feat_channels
+        ):
+            raise ValueError(
+                "volcano_geom_nodes has invalid shape. Expected (*, "
+                f"{self.n_nodes}, {self.geom_feat_channels}), got {tuple(geom_bank.shape)}"
+            )
+        self.register_buffer("volcano_geom_nodes", geom_bank, persistent=False)
 
     def _compute_virtual_node_feature(
         self,
@@ -611,6 +668,7 @@ class UNet_GraphSAGE(nn.Module):
         S: int,
         graphnorm: Optional[nn.Module] = None,
         station_pool: Optional[StationAttentionPool] = None,
+        volcano_idx: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Apply configurable graph operation to station features.
@@ -677,6 +735,9 @@ class UNet_GraphSAGE(nn.Module):
             num_graphs,
             device=x_nodes_in.device,
             dtype=x_nodes_in.dtype,
+            B=B,
+            T_l=T_l,
+            volcano_idx=volcano_idx,
         )
         x_with_node_feats = torch.cat([x_nodes_in, node_feats], dim=2)
         x_flat_nodes = x_with_node_feats.reshape(
@@ -734,6 +795,7 @@ class UNet_GraphSAGE(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        volcano_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -763,6 +825,7 @@ class UNet_GraphSAGE(nn.Module):
                     S,
                     self.encoder_graphnorm[str(i)],
                     encoder_station_pool,
+                    volcano_idx,
                 )
 
             encodings.append(x_flat)
@@ -775,6 +838,7 @@ class UNet_GraphSAGE(nn.Module):
             S,
             self.graphnorm_bottleneck,
             self.station_pool_bottleneck,
+            volcano_idx,
         )
         if self.use_bottleneck_attention:
             x_dec = self._apply_bottleneck_attention(x_dec)
@@ -797,6 +861,7 @@ class UNet_GraphSAGE(nn.Module):
                     S,
                     self.skip_graphnorm[str(enc_level)],
                     skip_station_pool,
+                    volcano_idx,
                 )
             else:
                 skip = self._virtual_node_init_readout(

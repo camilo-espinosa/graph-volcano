@@ -5,6 +5,9 @@ This script trains and evaluates selected ablations across stratified 5-fold CV:
 - Folds: 1..5
 - Currently configured for UNet_MPNN ablations (UNet_GraphSAGE configs commented out)
 
+Run:
+    python scripts/02_ablation_tests.py
+
 Fold data is read from:
     data/prepared_data/NVCHVC/cv_5fold/fold_XX/{train_aug,val,test}.npz
 
@@ -32,104 +35,15 @@ from utils.train_utils import (
     cleanup_gpu_cache,
     compute_summary,
     ensure_fold_data_exists,
+    train_one_unet_fold,
     train_one_ablation_fold,
 )
+from utils.model_registry import MODEL_SPECS, get_model_spec, list_model_specs
 from utils.script_common import resolve_project_path
 from utils.fold_io_utils import load_fold_summary
 from utils.metrics_report_utils import compute_per_class_summary
-from models.UNet_MPNN import MPNN_ABLATION_KWARGS
 
-# ----------------------- ABLATION CONFIG (CUSTOMIZE HERE) -----------------------
-GRAPH_LEVELS = [3, 4]
-
-V5_FULL_KWARGS = {
-    "graph_levels": GRAPH_LEVELS,
-    "attention_pool_mode": "bottleneck_only",
-    "use_bottleneck_attention": True,
-    "graph_norm_type": "none",
-    "node_feature_mode": "geometry",
-    "graph_backend": "graphsage",
-    "use_message_passing": True,
-    "virtual_node_pool_mode": "learned",
-    "bottleneck_virtual_node_pool_mode": "learned",
-    "use_skip_graph": True,
-    "init_features": 16,
-    "depth": 5,
-}
-# ============================================================================
-# GRAPHSAGE ABLATIONS (commented out, kept for reference)
-# ============================================================================
-# ABLATION_MODEL_KWARGS = {
-#     # "ablation_5_no_norm": { #the real v5_full
-#     #     **V5_FULL_KWARGS,
-#     #     "graph_norm_type": "none",
-#     # },
-#     # "ablation_2_mlp_backend": {
-#     #     **V5_FULL_KWARGS,
-#     #     "graph_backend": "mlp",
-#     # },
-#     # "ablation_3_no_message_passing": {
-#     #     **V5_FULL_KWARGS,
-#     #     "use_message_passing": False,
-#     # },
-#     # "ablation_4_no_bottleneck_attention": {
-#     #     **V5_FULL_KWARGS,
-#     #     "use_bottleneck_attention": False,
-#     # },
-#     # "ablation_11_no_node_features": {
-#     #     **V5_FULL_KWARGS,
-#     #     "node_feature_mode": "none",
-#     # },
-#     # "only_graph_no_attention": {
-#     #     **V5_FULL_KWARGS,
-#     #     "graph_levels": [],
-#     #     "use_bottleneck_attention": False,
-#     #     "graph_norm_type": "none",
-#     # },
-# }
-
-# ============================================================================
-# MPNN ABLATIONS (active set)
-# ============================================================================
-ABLATION_MODEL_KWARGS = {
-    name: {"_model_class": "UNet_MPNN", **kwargs}
-    for name, kwargs in MPNN_ABLATION_KWARGS.items()
-}
-
-
-# GraphSAGE batch sizes (commented out, for reference)
-# batch_sizes = {
-#     "ablation_11_no_node_features": 20,
-#     "ablation_2_mlp_backend": 20,
-#     "ablation_3_no_message_passing": 20,
-#     "ablation_4_no_bottleneck_attention": 14,
-#     "ablation_5_no_norm": 18,
-#     "ablation_6_batchnorm": 18,
-#     "ablation_7_mean_virtual_node_pool": 14,
-#     "ablation_8_graph_only_bottleneck": 24,
-#     "ablation_9_no_skip_graph": 18,
-# }
-
-# MPNN batch sizes
-batch_sizes = {
-    "pairwise_conv2d__l0": 10,
-    "edge_mpnn__early_l0": 8,
-    "edge_mpnn__aggr_max": 10,
-    "edge_mpnn__layers_4": 10,
-    "edge_mpnn__early_l2": 10,
-    "edge_mpnn__early_l1": 10,
-    "edge_mpnn__both_l2_bottleneck": 10,
-    "edge_mpnn__bottleneck": 10,
-    "edge_mpnn__no_edge_feats": 10,
-    "edge_mpnn__encoder": 10,
-    "edge_mpnn__star_topology": 10,
-    "edge_mpnn__xcorr": 10,
-    "edge_mpnn__no_spatial_info": 10,
-    "edge_mpnn__rsam": 10,
-    "edge_mpnn__no_attention": 10,
-}
-# By default, run all listed ablations. Customize this list as needed.
-ABLATIONS_TO_RUN = list(ABLATION_MODEL_KWARGS.keys())
+MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
 
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
@@ -161,13 +75,19 @@ CLASS_NAMES = ["VT", "LP", "TR", "AV", "IC"]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run ablation training or aggregate already generated fold results."
+        description="Run training or aggregate already generated fold results for all model families."
     )
     parser.add_argument(
         "--mode",
         choices=["train", "aggregate-only"],
         default="train",
         help="Execution mode. Use 'aggregate-only' to skip training and only build summaries.",
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        default=None,
+        help="Comma-separated model keys to process. Defaults to all registry entries.",
     )
     parser.add_argument(
         "--experiment-root",
@@ -183,27 +103,31 @@ def parse_args() -> argparse.Namespace:
         "--ablations",
         type=str,
         default=None,
-        help="Comma-separated ablation names to process. Defaults to all configured ablations.",
+        help="Backward-compatible alias for --models.",
     )
     parser.add_argument(
         "--require-all-folds",
         action="store_true",
-        help="Fail if any fold summary is missing for a selected ablation.",
+        help="Fail if any fold summary is missing for a selected model.",
     )
     return parser.parse_args()
 
 
-def select_ablations(raw_ablations: str | None) -> list[str]:
-    if raw_ablations is None:
-        candidate_names = list(ABLATIONS_TO_RUN)
+def select_model_keys(raw_models: str | None, raw_ablations: str | None) -> list[str]:
+    if raw_models is not None and raw_ablations is not None:
+        raise ValueError("Use only one of --models or --ablations.")
+
+    raw_selection = raw_models if raw_models is not None else raw_ablations
+    if raw_selection is None:
+        candidate_names = list(MODEL_KEYS_TO_RUN)
     else:
-        candidate_names = [x.strip() for x in raw_ablations.split(",") if x.strip()]
+        candidate_names = [x.strip() for x in raw_selection.split(",") if x.strip()]
 
     selected = []
     for name in candidate_names:
-        if name not in ABLATION_MODEL_KWARGS:
+        if name not in MODEL_SPECS:
             raise ValueError(
-                f"Unknown ablation '{name}'. Available: {sorted(ABLATION_MODEL_KWARGS.keys())}"
+                f"Unknown model key '{name}'. Available: {sorted(MODEL_SPECS.keys())}"
             )
         selected.append(name)
     return selected
@@ -226,7 +150,11 @@ def write_ablation_aggregate(
     val_f1_values = [float(x["best_val_mean_f1"]) for x in fold_summaries]
     test_f1_values = [float(x["test_mean_f1"]) for x in fold_summaries]
     test_iou_values = [float(x["test_mean_iou"]) for x in fold_summaries]
-    test_iou_all_values = [float(x["test_mean_iou_all"]) for x in fold_summaries]
+    test_iou_all_values = [
+        float(x["test_mean_iou_all"])
+        for x in fold_summaries
+        if "test_mean_iou_all" in x and x["test_mean_iou_all"] is not None
+    ]
     best_epoch_values = [int(x["best_epoch"]) for x in fold_summaries]
     test_f1_per_class_values = [
         [float(v) for v in x["test_f1_per_class"]] for x in fold_summaries
@@ -262,10 +190,11 @@ def write_ablation_aggregate(
         "val_mean_f1": compute_summary(val_f1_values),
         "test_mean_f1": compute_summary(test_f1_values),
         "test_mean_iou": compute_summary(test_iou_values),
-        "test_mean_iou_all": compute_summary(test_iou_all_values),
         "test_f1_per_class": test_f1_per_class_summary,
         "test_iou_per_class": test_iou_per_class_summary,
     }
+    if len(test_iou_all_values) > 0:
+        ablation_summary["test_mean_iou_all"] = compute_summary(test_iou_all_values)
 
     with (aggregate_dir / "cv5fold_summary.json").open("w", encoding="utf-8") as f:
         json.dump(ablation_summary, f, indent=2)
@@ -353,9 +282,14 @@ def write_ablation_aggregate(
         "test_mean_f1_std": float(ablation_summary["test_mean_f1"]["std"]),
         "test_mean_iou_mean": float(ablation_summary["test_mean_iou"]["mean"]),
         "test_mean_iou_std": float(ablation_summary["test_mean_iou"]["std"]),
-        "test_mean_iou_all_mean": float(ablation_summary["test_mean_iou_all"]["mean"]),
-        "test_mean_iou_all_std": float(ablation_summary["test_mean_iou_all"]["std"]),
     }
+    if "test_mean_iou_all" in ablation_summary:
+        leaderboard_row["test_mean_iou_all_mean"] = float(
+            ablation_summary["test_mean_iou_all"]["mean"]
+        )
+        leaderboard_row["test_mean_iou_all_std"] = float(
+            ablation_summary["test_mean_iou_all"]["std"]
+        )
 
     for class_name in CLASS_NAMES:
         leaderboard_row[f"test_f1_{class_name}_mean"] = float(
@@ -468,6 +402,7 @@ def run_train_mode(
     experiment_root: Path,
     experiment_name: str,
 ) -> None:
+    selected_specs = {name: get_model_spec(name) for name in selected}
     run_manifest = {
         "experiment_name": experiment_name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -476,9 +411,16 @@ def run_train_mode(
         "results_root": str(experiment_root),
         "device": str(device),
         "config": CONFIG,
-        "ablations_to_run": selected,
-        "ablation_model_kwargs": {
-            name: ABLATION_MODEL_KWARGS[name] for name in selected
+        "models_to_run": selected,
+        "model_specs": {
+            name: {
+                "display_name": spec["display_name"],
+                "family": spec["family"],
+                "trainer_kind": spec["trainer_kind"],
+                "batch_size": spec["batch_size"],
+                "model_kwargs": spec["model_kwargs"],
+            }
+            for name, spec in selected_specs.items()
         },
         "folds": [{"fold": int(f)} for f in FOLDS],
     }
@@ -499,37 +441,53 @@ def run_train_mode(
 
     print(f"Experiment root: {experiment_root}")
     print(f"Device: {device}")
-    print(f"Ablations to run ({len(selected)}): {selected}")
+    print(f"Models to run ({len(selected)}): {selected}")
 
     leaderboard_rows = []
 
-    for ablation_name in selected:
-        CONFIG["batch_size"] = int(batch_sizes.get(ablation_name, CONFIG["batch_size"]))
-        ablation_root = experiment_root / "ablations" / ablation_name
-        aggregate_dir = ablation_root / "aggregate"
+    for model_key in selected:
+        spec = selected_specs[model_key]
+        model_root = experiment_root / "ablations" / model_key
+        aggregate_dir = model_root / "aggregate"
         aggregate_dir.mkdir(parents=True, exist_ok=True)
+
+        model_config = dict(CONFIG)
+        model_config["batch_size"] = int(spec["batch_size"] or CONFIG["batch_size"])
 
         fold_summaries = []
         for fold_id in FOLDS:
             fold_data_dir = DATA_ROOT / f"fold_{fold_id:02d}"
             ensure_fold_data_exists(fold_data_dir)
 
-            fold_out_dir = ablation_root / f"fold_{fold_id:02d}"
-            fold_summary = train_one_ablation_fold(
-                ablation_name=ablation_name,
-                model_kwargs=ABLATION_MODEL_KWARGS[ablation_name],
-                fold_id=fold_id,
-                fold_data_dir=fold_data_dir,
-                fold_out_dir=fold_out_dir,
-                device=device,
-                config=CONFIG,
-            )
+            fold_out_dir = model_root / f"fold_{fold_id:02d}"
+            if spec["trainer_kind"] == "unet_2d":
+                fold_summary = train_one_unet_fold(
+                    model_key=model_key,
+                    fold_id=fold_id,
+                    fold_data_dir=fold_data_dir,
+                    fold_out_dir=fold_out_dir,
+                    device=device,
+                    config=model_config,
+                )
+            else:
+                fold_summary = train_one_ablation_fold(
+                    ablation_name=model_key,
+                    model_kwargs={
+                        "_model_cls": spec["model_cls"],
+                        **spec["model_kwargs"],
+                    },
+                    fold_id=fold_id,
+                    fold_data_dir=fold_data_dir,
+                    fold_out_dir=fold_out_dir,
+                    device=device,
+                    config=model_config,
+                )
             fold_summaries.append(fold_summary)
 
         leaderboard_rows.append(
             write_ablation_aggregate(
                 aggregate_dir=aggregate_dir,
-                ablation_name=ablation_name,
+                ablation_name=model_key,
                 fold_summaries=fold_summaries,
             )
         )
@@ -553,7 +511,7 @@ def run_train_mode(
         )
 
     print("=" * 80)
-    print("Ablation 5-fold run complete")
+    print("Model-family 5-fold run complete")
     print(f"Experiment folder: {experiment_root}")
     print(
         f"Leaderboard: {experiment_root / 'comparisons' / 'ablation_leaderboard.csv'}"
@@ -678,7 +636,7 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
-    selected = select_ablations(args.ablations)
+    selected = select_model_keys(args.models, args.ablations)
 
     if args.mode == "aggregate-only":
         experiment_root = resolve_project_path(

@@ -1,6 +1,6 @@
 # Graph Volcano
 
-This repository contains the code used for the volcano-seismic experiments in the article. It includes data preparation, 5-fold training, zero-shot cross-volcano evaluation, ablation studies, and fine-tuning pipelines for UNet and UNet_GraphSAGE models.
+This repository contains the code used for the volcano-seismic experiments in the article. It includes NVCHVC data preparation, leave-one-out cross-volcano data generation, multi-family model training, and zero-shot/fine-tuning evaluation pipelines.
 
 ## Repository Layout
 
@@ -12,11 +12,11 @@ This repository contains the code used for the volcano-seismic experiments in th
 
 ## Main Scripts
 
-- `scripts/01_prepare_data.py` - prepares fold manifests and dataset metadata.
-- `scripts/02_ablation_tests.py` - runs 5-fold ablation training for UNet_GraphSAGE.
-- `scripts/03_unet_5fold.py` - runs 5-fold training for the baseline UNet.
-- `scripts/04_zero_shot_cross_volcano.py` - evaluates ablation checkpoints on cross-volcano test data.
-- `scripts/05_zero_shot_unet_cross_volcano.py` - evaluates UNet checkpoints on cross-volcano test data.
+- `scripts/01_prepare_data.py` - prepares NVCHVC 5-fold manifests.
+- `scripts/01b_prepare_cross-volcano_data.py` - builds leave-one-out cross-volcano manifests under `data/prepared_data/cross_volcano_loo/`.
+- `scripts/02_ablation_tests.py` - runs 5-fold ablation training.
+- `scripts/03_zero_shot_cross_volcano.py` - zero-shot evaluation of checkpoints on full held-out volcano test sets from `cross_volcano_loo`.
+- `scripts/04_cross-volcano.py` - leave-one-out train/val/test protocol over target volcanoes.
 - `scripts/06_ablations_finetune_cross_volcano.py` - fine-tunes ablation checkpoints on cross-volcano data.
 - `scripts/07_finetune_unets_cross_volcano.py` - placeholder for UNet fine-tuning on cross-volcano data.
 - `scripts/08_ablations_continuous.py` - placeholder for continuous ablation experiments.
@@ -42,6 +42,7 @@ pip install -r requirements.txt
 
 ```bash
 python scripts/01_prepare_data.py
+python scripts/01b_prepare_cross-volcano_data.py
 ```
 
 ### 2. Train ablations
@@ -50,17 +51,16 @@ python scripts/01_prepare_data.py
 python scripts/02_ablation_tests.py --mode train
 ```
 
-### 3. Train the baseline UNet
+### 3. Run zero-shot cross-volcano evaluation
 
 ```bash
-python scripts/03_unet_5fold.py
+python scripts/03_zero_shot_cross_volcano.py
 ```
 
-### 4. Run zero-shot evaluation
+### 4. Run leave-one-out cross-volcano training/evaluation
 
 ```bash
-python scripts/04_zero_shot_cross_volcano.py
-python scripts/05_zero_shot_unet_cross_volcano.py
+python scripts/04_cross-volcano.py
 ```
 
 ### 5. Fine-tune ablations on cross-volcano data

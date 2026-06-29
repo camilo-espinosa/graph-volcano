@@ -40,3 +40,9 @@ scripts/__pycache__/05_zero_shot_unet_cross_volcano.cpython-311.pyc
 scripts/__pycache__/04_zero_shot_cross_volcano.cpython-311.pyc
 scripts/__pycache__/03_unet_5fold.cpython-311.pyc
 models/__pycache__/UNet_MPNN.cpython-311.pyc
+scripts/__pycache__/01b_prepare_cross-volcano_data.cpython-313.pyc
+scripts/__pycache__/03_zero_shot_cross_volcano.cpython-311.pyc
+scripts/__pycache__/04_cross-volcano.cpython-313.pyc
+utils/__pycache__/edge_features.cpython-311.pyc
+utils/__pycache__/model_registry.cpython-311.pyc
+utils/__pycache__/train_utils.cpython-313.pyc
