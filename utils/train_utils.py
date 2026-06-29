@@ -851,11 +851,21 @@ def compute_event_f1_iou_graphsage(
             else:
                 descriptors_b = None
 
+            # Edge dynamic features for edge_mpnn__xcorr ablation.
+            edge_attr_dynamic_b = None
+            if descriptor_payload is not None and "edge_attr_dynamic" in descriptor_payload:
+                ead = descriptor_payload["edge_attr_dynamic"]
+                if not torch.is_tensor(ead):
+                    ead = torch.as_tensor(ead)
+                edge_attr_dynamic_b = ead.to(device=xb.device, dtype=xb.dtype)
+
             forward_kwargs = {}
             if envelope_b is not None:
                 forward_kwargs["envelope"] = envelope_b
             if descriptors_b is not None:
                 forward_kwargs["descriptors"] = descriptors_b
+            if edge_attr_dynamic_b is not None:
+                forward_kwargs["edge_attr_dynamic"] = edge_attr_dynamic_b
 
             output = model(xb, **forward_kwargs)
 
@@ -1143,6 +1153,7 @@ class GraphSAGEDataset(Dataset):
         self,
         npz_path: Path,
         descriptor_names: Sequence[str] | str | None = None,
+        edge_data_npz: Optional[Path] = None,
     ):
         with np.load(npz_path) as data:
             self.filepaths = data["filepaths"].copy()
@@ -1159,6 +1170,25 @@ class GraphSAGEDataset(Dataset):
 
         if self.use_descriptors and self.descriptor_paths is None:
             self.descriptor_paths = self._infer_descriptor_paths(npz_path)
+
+        # Precomputed cross-correlation edge features for edge_mpnn__xcorr.
+        self._edge_attr_dynamic: Optional[np.ndarray] = None
+        if edge_data_npz is not None:
+            edge_data_npz = Path(edge_data_npz)
+            if not edge_data_npz.exists():
+                raise FileNotFoundError(
+                    f"Edge data file not found: {edge_data_npz}. "
+                    "Run scripts/01b_edge_data.py first."
+                )
+            with np.load(edge_data_npz) as ed:
+                self._edge_attr_dynamic = ed["edge_attr_dynamic"].astype(
+                    np.float32, copy=True
+                )
+            if len(self._edge_attr_dynamic) != len(self.filepaths):
+                raise ValueError(
+                    f"Edge data length {len(self._edge_attr_dynamic)} does not match "
+                    f"manifest length {len(self.filepaths)} for {edge_data_npz}."
+                )
 
     @classmethod
     def _normalize_descriptor_names(
@@ -1248,11 +1278,16 @@ class GraphSAGEDataset(Dataset):
         # Get class indices: [C=6, T=8192] -> [T=8192]
         y_idx = torch.argmax(y_onehot, dim=0).long()  # [T]
         y_label = torch.tensor(int(self.label_ids[idx]), dtype=torch.long)
-        descriptors = (
-            self._load_selected_descriptors(idx) if self.use_descriptors else None
+        descriptors: dict = (
+            self._load_selected_descriptors(idx) if self.use_descriptors else {}
         )
 
-        if self.use_descriptors:
+        if self._edge_attr_dynamic is not None:
+            descriptors["edge_attr_dynamic"] = torch.from_numpy(
+                self._edge_attr_dynamic[idx].copy()
+            )
+
+        if self.use_descriptors or self._edge_attr_dynamic is not None:
             return x, y_onehot, y_label, descriptors
 
         return x, y_onehot, y_label
@@ -1352,9 +1387,26 @@ def train_one_ablation_fold(
     for p in (checkpoints_dir, reports_dir, cm_dir, val_plot_dir):
         p.mkdir(parents=True, exist_ok=True)
 
-    train_ds = GraphSAGEDataset(fold_data_dir / "train_aug.npz")
-    val_ds = GraphSAGEDataset(fold_data_dir / "val.npz")
-    test_ds = GraphSAGEDataset(fold_data_dir / "test.npz")
+    # edge_feature_mode="delta_pos_xcorr" requires precomputed edge data (01b_edge_data.py).
+    _needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
+
+    def _edge_npz(split_name: str) -> Optional[Path]:
+        if not _needs_xcorr:
+            return None
+        return fold_data_dir / "edge_data" / split_name
+
+    train_ds = GraphSAGEDataset(
+        fold_data_dir / "train_aug.npz",
+        edge_data_npz=_edge_npz("train_aug.npz"),
+    )
+    val_ds = GraphSAGEDataset(
+        fold_data_dir / "val.npz",
+        edge_data_npz=_edge_npz("val.npz"),
+    )
+    test_ds = GraphSAGEDataset(
+        fold_data_dir / "test.npz",
+        edge_data_npz=_edge_npz("test.npz"),
+    )
 
     balanced_batch_sampler = BalancedBatchSampler(
         train_ds.label_ids, batch_size=config["batch_size"]
@@ -1406,12 +1458,20 @@ def train_one_ablation_fold(
         model.train()
         train_loss = 0.0
 
-        for batch_idx, (xb, y_onehot, _y_label) in enumerate(train_loader):
-            xb = xb.to(device)
-            y_onehot = y_onehot.to(device)
+        for batch_idx, batch in enumerate(train_loader):
+            xb = batch[0].to(device)
+            y_onehot = batch[1].to(device)
+            _train_payload = batch[3] if len(batch) > 3 else None
+
+            _train_edge_attr = None
+            if _train_payload is not None and "edge_attr_dynamic" in _train_payload:
+                ead = _train_payload["edge_attr_dynamic"]
+                if not torch.is_tensor(ead):
+                    ead = torch.as_tensor(ead)
+                _train_edge_attr = ead.to(device=device, dtype=xb.dtype)
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(xb)
+            out = model(xb, edge_attr_dynamic=_train_edge_attr)
             loss, dice_component, ce_component = combined_dice_ce_loss(
                 out,
                 y_onehot,
@@ -1429,7 +1489,7 @@ def train_one_ablation_fold(
                     f"loss={loss.item():.4f} dice={dice_component.item():.4f} ce={ce_component.item():.4f}"
                 )
 
-            del xb, y_onehot, out, loss, dice_component, ce_component
+            del xb, y_onehot, out, loss, dice_component, ce_component, _train_payload, _train_edge_attr
 
         scheduler.step()
 

@@ -44,8 +44,16 @@ def pairwise_xcorr_features(
     max_lag_seconds: float | None = None,
 ) -> np.ndarray:
     """
-    Compute {lag_seconds, peak_coherence} for every ordered station pair via FFT
-    cross-correlation. Run OFFLINE.
+    Compute two physically interpretable features for every ordered station pair
+    via FFT cross-correlation. Run OFFLINE.
+
+    Feature layout (axis=-1):
+      [0] peak_lag_seconds  — time shift that maximises cross-correlation;
+                              encodes moveout / relative arrival delay.
+      [1] peak_coherence    — normalised CC value at that lag (clamped to [-1,1]);
+                              encodes waveform similarity / signal quality.
+
+    These two values map directly to `xcorr_feat_dim=2` in `edge_mpnn__xcorr`.
 
     Args:
         waveforms: [S, T] single-window multistation waveforms (one event).
@@ -53,8 +61,8 @@ def pairwise_xcorr_features(
         max_lag_seconds: optional clamp on the searched lag window.
 
     Returns:
-        [n_station_pairs, 2] array of (lag_seconds, peak_coherence), ordered to
-        match station_pair_index(S).
+        [n_station_pairs, 2] array of (peak_lag_seconds, peak_coherence),
+        ordered to match station_pair_index(S).
     """
     if waveforms.ndim != 2:
         raise ValueError(f"waveforms must be [S, T]. Got shape: {waveforms.shape}")
@@ -149,6 +157,10 @@ def cache_edge_features(
 ) -> None:
     """
     Precompute and cache edge_attr_dynamic (+ optional rsam) to an .npz file.
+
+    edge_attr_dynamic[:, :, 0] = peak_lag_seconds  (moveout / arrival delay)
+    edge_attr_dynamic[:, :, 1] = peak_coherence    (waveform similarity)
+    rsam is a node feature (mean absolute amplitude), stored separately.
 
     Loadable later with:
         data = np.load(out_path)

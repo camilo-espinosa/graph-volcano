@@ -851,6 +851,36 @@ class UNet_MPNN(nn.Module):
 # Single source of truth for the MPNN ablation sweep. `edge_mpnn__bottleneck`
 # is the default/baseline run.
 MPNN_ABLATION_KWARGS = {
+    # Dynamic cross-correlation edge features (requires offline edge_attr_dynamic).
+    # "edge_mpnn__xcorr": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos_xcorr",
+    #     node_feature_mode="geometry",
+    #     xcorr_feat_dim=2,
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),    
+    # "edge_mpnn__both_l2_bottleneck": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[2],  # early + bottleneck (bottleneck always present)
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),
+    # # Topology ablation: star graph (no station-station edges).
+    # "edge_mpnn__star_topology": dict(
+    #     graph_topology="star",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),       
     # Defaults: fully_connected, delta_pos edges, bottleneck-only MPNN,
     # skip-graph off, bottleneck attention on, no graph norm. Run first.
     # "edge_mpnn__bottleneck": dict(
@@ -865,93 +895,56 @@ MPNN_ABLATION_KWARGS = {
     # THE key test: drop edge features architecturally (message MLP loses its
     # edge slice). Proves whether edge geometry matters.
     # --- Tier 1: aggregation (most important, run first) ---
-    "edge_mpnn__aggr_max": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        graph_levels=[],
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-        mpnn_aggr="max",
-    ),
-    "edge_mpnn__layers_4": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        graph_levels=[],
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-        mpnn_layers=4,  # test deeper; watch for over-smoothing
-    ),
-    "edge_mpnn__early_l2": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        graph_levels=[2],  # level 2 only, no bottleneck graph
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
-    "edge_mpnn__early_l1": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        graph_levels=[1],  # level 1 only, no bottleneck graph
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
-    "edge_mpnn__both_l2_bottleneck": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        graph_levels=[2],  # early + bottleneck (bottleneck always present)
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
-    "edge_mpnn__no_edge_feats": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="none",
-        node_feature_mode="geometry",
-        graph_levels=[],
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
-    # Shallow encoder MPNN + bottleneck. Only run if bottleneck ties baseline.
-    "edge_mpnn__encoder": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        graph_levels=[1],
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
-    # Topology ablation: star graph (no station-station edges).
-    "edge_mpnn__star_topology": dict(
-        graph_topology="star",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        graph_levels=[],
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
-    # Dynamic cross-correlation edge features (requires offline edge_attr_dynamic).
-    "edge_mpnn__xcorr": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos_xcorr",
-        node_feature_mode="geometry",
-        xcorr_feat_dim=2,
-        graph_levels=[],
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
+    # "edge_mpnn__aggr_max": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    #     mpnn_aggr="max",
+    # ),
+    # "edge_mpnn__layers_4": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    #     mpnn_layers=4,  # test deeper; watch for over-smoothing
+    # ),
+    # "edge_mpnn__early_l2": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[2],  # level 2 only, no bottleneck graph
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),
+    # "edge_mpnn__early_l1": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[1],  # level 1 only, no bottleneck graph
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),
+ 
+    # "edge_mpnn__no_edge_feats": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="none",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),
+
+
     # Control: no spatial node info anywhere (pairs with edge none for a true
     # no-geometry run).
     "edge_mpnn__no_spatial_info": dict(
@@ -963,25 +956,25 @@ MPNN_ABLATION_KWARGS = {
         use_bottleneck_attention=True,
         graph_norm="none",
     ),
-    # Append precomputed per-station RSAM as a node feature (run on the winner).
-    "edge_mpnn__rsam": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        use_rsam_node_feat=True,
-        graph_levels=[],
-        use_skip_graph=False,
-        use_bottleneck_attention=True,
-        graph_norm="none",
-    ),
-    # Re-isolate the bottleneck attention in the MPNN context.
-    "edge_mpnn__no_attention": dict(
-        graph_topology="fully_connected",
-        edge_feature_mode="delta_pos",
-        node_feature_mode="geometry",
-        graph_levels=[],
-        use_skip_graph=False,
-        use_bottleneck_attention=False,
-        graph_norm="none",
-    ),
+    # # Append precomputed per-station RSAM as a node feature (run on the winner).
+    # "edge_mpnn__rsam": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     use_rsam_node_feat=True,
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=True,
+    #     graph_norm="none",
+    # ),
+    # # Re-isolate the bottleneck attention in the MPNN context.
+    # "edge_mpnn__no_attention": dict(
+    #     graph_topology="fully_connected",
+    #     edge_feature_mode="delta_pos",
+    #     node_feature_mode="geometry",
+    #     graph_levels=[],
+    #     use_skip_graph=False,
+    #     use_bottleneck_attention=False,
+    #     graph_norm="none",
+    # ),
 }
