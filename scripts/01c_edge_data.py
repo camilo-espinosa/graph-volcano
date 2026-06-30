@@ -1,5 +1,5 @@
 """
-01b_edge_data.py — Offline cross-correlation edge feature precomputation.
+01c_edge_data.py — Offline cross-correlation edge feature precomputation.
 
 Computes edge_attr_dynamic [N, n_station_pairs, 2] for every split manifest used in:
   - NVCHVC 5-fold CV (train, train_aug, val, test per fold)
@@ -17,7 +17,7 @@ it is stored here for convenience since it is free to compute alongside xcorr.
 
 Output files mirror the manifest directory layout under an edge_data/ subfolder:
   data/prepared_data/NVCHVC/cv_5fold/fold_XX/edge_data/{train,train_aug,val,test}.npz
-  data/prepared_data/cross_volcano/<VOLCANO>/edge_data/{test_80,train_XXpct,...}.npz
+  data/prepared_data/cross_volcano/<VOLCANO>/edge_data/{test,train_XXpct,...}.npz
 
 Each output .npz contains:
   edge_attr_dynamic : [N, n_station_pairs, 2]   float32  (edge feature for MPNN)
@@ -27,10 +27,10 @@ where n_station_pairs = S*(S-1) = 56 for S=8 fully-connected stations
 (ordered as station_pair_index(8) from utils/edge_features.py).
 
 Run:
-  python scripts/01b_edge_data.py
-  python scripts/01b_edge_data.py --force        # recompute even if file exists
-  python scripts/01b_edge_data.py --chunk 256    # batch size for waveform loading
-  python scripts/01b_edge_data.py --max-lag 5.0  # max cross-correlation lag (seconds)
+  python scripts/01c_edge_data.py
+  python scripts/01c_edge_data.py --force        # recompute even if file exists
+  python scripts/01c_edge_data.py --chunk 256    # batch size for waveform loading
+  python scripts/01c_edge_data.py --max-lag 5.0  # max cross-correlation lag (seconds)
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ N_STATIONS = 8
 SAMPLING_RATE = 100.0  # Hz
 
 FOLD_SPLITS = ["train.npz", "train_aug.npz", "val.npz", "test.npz"]
-CROSS_SPLITS_REQUIRED = ["test_80.npz"]  # at minimum
+CROSS_SPLITS_REQUIRED = ["test.npz"]  # at minimum
 
 
 # ---------------------------------------------------------------------------
