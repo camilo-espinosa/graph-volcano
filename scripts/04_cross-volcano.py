@@ -110,6 +110,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _validate_volcano_idx(
+    volcano_idx: torch.Tensor, held_out: str, volcano_name_to_idx: dict[str, int]
+) -> None:
+    """Verify that volcano_idx matches expected held-out volcano."""
+    expected_idx = volcano_name_to_idx[held_out]
+    if volcano_idx is not None:
+        unique_indices = set(volcano_idx.cpu().numpy().flatten().tolist())
+        if expected_idx not in unique_indices:
+            raise ValueError(
+                f"ERROR: Expected volcano index {expected_idx} ({held_out}) in batch, "
+                f"but got: {unique_indices}"
+            )
+
+
+def _log_geometry_check(
+    model: torch.nn.Module, held_out: str, volcano_idx: int
+) -> None:
+    """Log geometry bank info to verify per-sample indexing."""
+    geom_bank = getattr(model, "volcano_geom_nodes", None)
+    if geom_bank is not None and geom_bank.numel() > 0:
+        geom_shape = geom_bank.shape
+        sample_geom = geom_bank[volcano_idx : volcano_idx + 1]
+        geom_sum = float(sample_geom.abs().sum().item())
+        print(
+            f"      [GEOM] Held_out={held_out} (idx={volcano_idx}) | "
+            f"Bank shape={geom_shape} | Sample geometry L1 norm={geom_sum:.6f}"
+        )
+
+
 class GraphForwardWrapper(torch.nn.Module):
     """Inject RSAM kwargs on demand while preserving model signature expectations."""
 
@@ -232,7 +261,13 @@ def _evaluate_unet(
         t_cl=0,
     )
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
-
+    support = np.sum(cm, axis=1)
+    active_mask = support > 0
+    mean_f1 = (
+        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
+        if np.any(active_mask)
+        else 0.0
+    )
     iou_per_class = []
     for c in range(len(CLASS_NAMES)):
         tp = float(cm[c, c])
@@ -240,12 +275,20 @@ def _evaluate_unet(
         fn = float(cm[c, :].sum() - tp)
         denom = tp + fp + fn
         iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
-
+    mean_iou = (
+        float(
+            np.mean(
+                [iou_per_class[i] for i, active in enumerate(active_mask) if active]
+            )
+        )
+        if np.any(active_mask)
+        else 0.0
+    )
     return (
         [float(x) for x in f1_scores],
-        float(np.mean(f1_scores)) if len(f1_scores) > 0 else 0.0,
+        mean_f1,
         [float(x) for x in iou_per_class],
-        float(np.mean(iou_per_class)) if len(iou_per_class) > 0 else 0.0,
+        mean_iou,
         mean_loss,
         cm,
     )
@@ -278,7 +321,7 @@ def main() -> None:
         if v.get("enabled", True)
         and (args.family == "all" or str(v["family"]) == args.family)
     }
-    selected_models = parse_csv_selection(args.models, sorted(specs.keys()), "models")
+    selected_models = parse_csv_selection(args.models, list(specs.keys()), "models")
 
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
@@ -289,6 +332,39 @@ def main() -> None:
     volcano_geom_bank, volcano_name_to_idx, volcano_order = build_volcano_geometry_bank(
         n_stations=8
     )
+
+    # Validate volcano geometry bank structure
+    print(f"[GEOMETRY] Volcano geometry bank shape: {volcano_geom_bank.shape}")
+    print(f"[GEOMETRY] Volcanoes in order: {volcano_order}")
+    print(f"[GEOMETRY] Volcano name -> index mapping: {volcano_name_to_idx}")
+    if volcano_geom_bank.shape[0] != len(volcano_order):
+        raise ValueError(
+            f"Geometry bank size ({volcano_geom_bank.shape[0]}) does not match "
+            f"volcano_order length ({len(volcano_order)})"
+        )
+
+    # Verify that geometries actually differ between volcanoes
+    print(
+        f"[GEOMETRY] OK Geometry bank validated: {volcano_geom_bank.shape[0]} volcanoes, "
+        f"{volcano_geom_bank.shape[1]} nodes, {volcano_geom_bank.shape[2]} features each"
+    )
+    geom_checksums = []
+    for v_idx, v_name in enumerate(volcano_order):
+        geom_array = volcano_geom_bank[v_idx]
+        if isinstance(geom_array, np.ndarray):
+            geom_norm = float(np.abs(geom_array).sum())
+        else:
+            geom_norm = float(geom_array.abs().sum().item())
+        geom_checksums.append(geom_norm)
+        print(f"        {v_idx}: {v_name:8s} L1 norm = {geom_norm:.6f}")
+
+    # Check that geometries are actually distinct
+    if len(set(geom_checksums)) != len(geom_checksums):
+        print("[GEOMETRY] WARNING: Some volcanoes have identical geometry norms!")
+    else:
+        print(
+            f"[GEOMETRY] OK All {len(volcano_order)} volcanoes have distinct geometries"
+        )
 
     run_manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -368,6 +444,15 @@ def main() -> None:
                         name.split("holdout_")[-1] if "holdout_" in name else "UNKNOWN"
                     )
 
+            # Determine training volcanoes
+            training_volcanoes = [v for v in volcano_order if v != held_out]
+            print(
+                f"  [FOLD {fold_idx}] Testing on: {held_out} | Training on: {', '.join(training_volcanoes)}"
+            )
+            print(
+                f"    [VOLCANO_IDX] Held out volcano '{held_out}' = index {volcano_name_to_idx[held_out]}"
+            )
+
             run_start = time.time()
             fold_out = output_dir / model_key / fold_dir.name
             ckpt_dir = fold_out / "checkpoints"
@@ -390,6 +475,10 @@ def main() -> None:
                 train_ds = UNetPatchDataset(train_npz)
                 val_ds = UNetPatchDataset(val_npz)
                 test_ds = UNetPatchDataset(test_npz)
+
+                print(
+                    f"    [DATA] Train: {len(train_ds)} patches | Val: {len(val_ds)} patches | Test: {len(test_ds)} patches"
+                )
 
                 train_sampler = BalancedBatchSampler(
                     train_ds.label_ids, batch_size=batch_size
@@ -416,6 +505,39 @@ def main() -> None:
                 model_num_desc = int(getattr(model, "num_descriptors", 0))
                 needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
 
+                # Log graph model configuration
+                log_parts = []
+
+                # Family-specific backend info
+                if model_kwargs.get("graph_backend"):
+                    log_parts.append(
+                        f"Graph backend: {model_kwargs.get('graph_backend')}"
+                    )
+                elif model_kwargs.get("graph_topology"):
+                    log_parts.append(
+                        f"Graph topology: {model_kwargs.get('graph_topology')}"
+                    )
+
+                if model_kwargs.get("use_message_passing"):
+                    log_parts.append("Message passing: ON")
+                if model_kwargs.get("use_bottleneck_attention"):
+                    log_parts.append("Bottleneck attention: ON")
+                if needs_xcorr:
+                    log_parts.append(
+                        f"Edge features: xcorr (dim={model_kwargs.get('xcorr_feat_dim', 'N/A')})"
+                    )
+                elif model_kwargs.get("edge_feature_mode"):
+                    log_parts.append(
+                        f"Edge features: {model_kwargs.get('edge_feature_mode')}"
+                    )
+                if model_num_desc > 0:
+                    log_parts.append(
+                        f"Descriptors: {model_num_desc} ({', '.join(descriptor_names) if descriptor_names else 'N/A'})"
+                    )
+                if model_kwargs.get("use_rsam_node_feat"):
+                    log_parts.append("RSAM node features: ON")
+                print(f"    [CONFIG] {' | '.join(log_parts)}")
+
                 def _edge_npz(npz_path: Path) -> Path:
                     return npz_path.parent / "edge_data" / npz_path.name
 
@@ -441,6 +563,10 @@ def main() -> None:
                     volcano_name_to_idx=volcano_name_to_idx,
                 )
 
+                print(
+                    f"    [DATA] Train: {len(train_ds)} events | Val: {len(val_ds)} events | Test: {len(test_ds)} events"
+                )
+
                 train_sampler = BalancedBatchSampler(
                     train_ds.label_ids, batch_size=batch_size
                 )
@@ -452,6 +578,10 @@ def main() -> None:
                     model,
                     needs_rsam=bool(model_kwargs.get("use_rsam_node_feat", False)),
                 ).to(device)
+
+                # Validate geometry indexing
+                expected_volcano_idx = volcano_name_to_idx[held_out]
+                _log_geometry_check(model, held_out, expected_volcano_idx)
 
             optimizer = optim.Adam(
                 [p for p in wrapper.parameters() if p.requires_grad],
@@ -469,12 +599,67 @@ def main() -> None:
 
             metrics_rows = []
 
+            print(
+                f"    [TRAINING] Starting {int(args.epochs)} epochs | lr={float(args.lr):.2e} -> {float(args.lr_final):.2e}"
+            )
+
             for epoch in range(int(args.epochs)):
                 wrapper.train()
                 train_loss = 0.0
 
+                # On first epoch, validate per-batch volcano indices for graph models
+                if epoch == 0 and family != "unet":
+                    sample_batch = next(iter(train_loader))
+                    batch_volcano_idx = (
+                        sample_batch[4] if len(sample_batch) > 4 else None
+                    )
+                    if batch_volcano_idx is not None:
+                        unique_in_batch = set(
+                            batch_volcano_idx.cpu().numpy().flatten().tolist()
+                        )
+                        held_out_idx = volcano_name_to_idx[held_out]
+
+                        # Training batches should NOT contain held_out volcano
+                        if held_out_idx in unique_in_batch:
+                            raise ValueError(
+                                f"ERROR: Training batch should exclude held_out volcano {held_out} "
+                                f"(idx={held_out_idx}), but found it in batch indices: {unique_in_batch}"
+                            )
+
+                        print(
+                            f"      [BATCH_IDX] First training batch volcano indices: {sorted(unique_in_batch)} OK (excluded {held_out})"
+                        )
+
+                        # Log actual geometry values being used per sample - show samples from different volcanoes
+                        print(
+                            f"      [SAMPLE_GEOM] Verifying per-sample geometry usage (training volcanoes):"
+                        )
+                        batch_size = batch_volcano_idx.shape[0]
+                        sample_indices_to_log = [
+                            0,
+                            min(1, batch_size - 1),
+                            batch_size - 1,
+                        ]
+                        sample_indices_to_log = sorted(set(sample_indices_to_log))
+
+                        for sample_idx in sample_indices_to_log:
+                            vol_idx = int(batch_volcano_idx[sample_idx].item())
+                            vol_name = volcano_order[vol_idx]
+                            sample_geom = volcano_geom_bank[vol_idx]  # shape: [9, 3]
+                            if isinstance(sample_geom, np.ndarray):
+                                geom_norm = float(np.abs(sample_geom).sum())
+                                first_node = sample_geom[0]
+                            else:
+                                geom_norm = float(sample_geom.abs().sum().item())
+                                first_node = sample_geom[0].detach().cpu().numpy()
+                            print(
+                                f"          sample {sample_idx}: volcano_idx={vol_idx} ({vol_name:8s}) | "
+                                f"node[0]=[{first_node[0]:7.3f}, {first_node[1]:7.3f}, {first_node[2]:7.3f}] | "
+                                f"total_norm={geom_norm:.6f}"
+                            )
+
                 if family == "unet":
-                    for xb, y_onehot, _ in train_loader:
+                    for batch_idx, (xb, y_onehot, _) in enumerate(train_loader, 1):
                         xb = xb.to(device)
                         y_onehot = y_onehot.to(device)
 
@@ -491,8 +676,16 @@ def main() -> None:
                         optimizer.step()
                         train_loss += float(loss.item())
                         del xb, y_onehot, out, loss
+
+                        if (
+                            batch_idx % max(1, len(train_loader) // 3) == 0
+                            or batch_idx == 1
+                        ):
+                            print(
+                                f"      epoch={epoch+1:3d} batch={batch_idx:3d}/{len(train_loader):3d}"
+                            )
                 else:
-                    for batch in train_loader:
+                    for batch_idx, batch in enumerate(train_loader, 1):
                         xb, y_onehot, forward_kwargs = _extract_graph_batch(
                             batch, device, model
                         )
@@ -510,6 +703,14 @@ def main() -> None:
                         optimizer.step()
                         train_loss += float(loss.item())
                         del xb, y_onehot, out, loss
+
+                        if (
+                            batch_idx % max(1, len(train_loader) // 3) == 0
+                            or batch_idx == 1
+                        ):
+                            print(
+                                f"      epoch={epoch+1:3d} batch={batch_idx:3d}/{len(train_loader):3d}"
+                            )
 
                 scheduler.step()
 
@@ -571,8 +772,15 @@ def main() -> None:
                         },
                         ckpt_dir / "best_f1.pt",
                     )
+                    print(f"      ✓ epoch={epoch+1:3d} val_f1={val_mean_f1:.4f} [BEST]")
                 else:
                     no_improve += 1
+                    if (epoch + 1) % max(
+                        1, int(args.epochs) // 5
+                    ) == 0 or no_improve >= int(args.early_stop_patience) - 3:
+                        print(
+                            f"      · epoch={epoch+1:3d} val_f1={val_mean_f1:.4f} (no improve: {no_improve}/{args.early_stop_patience})"
+                        )
 
                 metrics_rows.append(
                     {
@@ -686,6 +894,7 @@ def main() -> None:
                 f"best_epoch={best_epoch} val_f1={best_val_mean_f1:.4f} "
                 f"test_f1={test_mean_f1:.4f} test_iou={test_mean_iou:.4f}"
             )
+            print(f"    -> Saved to: {fold_out}")
 
             del train_loader, val_loader, test_loader
             del train_ds, val_ds, test_ds

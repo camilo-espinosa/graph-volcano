@@ -57,12 +57,13 @@ N_STATIONS = 8
 SAMPLING_RATE = 100.0  # Hz
 
 FOLD_SPLITS = ["train.npz", "train_aug.npz", "val.npz", "test.npz"]
-CROSS_SPLITS_REQUIRED = ["test_80.npz"]  # at minimum
+CROSS_SPLITS_REQUIRED = ["test.npz"]  # at minimum
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _load_waveforms_from_manifest(npz_path: Path) -> np.ndarray:
     """
@@ -133,7 +134,9 @@ def _compute_and_save(
         return False
 
     if not manifest_path.exists():
-        print(f"  [warn] Manifest not found, skipping: {manifest_path.relative_to(PROJECT_ROOT)}")
+        print(
+            f"  [warn] Manifest not found, skipping: {manifest_path.relative_to(PROJECT_ROOT)}"
+        )
         return False
 
     t0 = time.perf_counter()
@@ -160,6 +163,7 @@ def _compute_and_save(
 # ---------------------------------------------------------------------------
 # Dataset-specific discovery helpers
 # ---------------------------------------------------------------------------
+
 
 def _iter_nvchvc_manifests(
     prepared_root: Path,
@@ -204,6 +208,7 @@ def _iter_cross_volcano_manifests(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Precompute cross-correlation edge features for all dataset splits.",
@@ -245,7 +250,7 @@ def main() -> None:
     args = parse_args()
 
     prepared_root = PROJECT_ROOT / "data" / "prepared_data"
-    cross_root = prepared_root / "cross_volcano"
+    cross_root = prepared_root / "cross_volcano_loo"
 
     max_lag: float | None = args.max_lag if args.max_lag > 0 else None
 
@@ -267,7 +272,9 @@ def main() -> None:
     if not args.no_cross:
         cross_pairs = _iter_cross_volcano_manifests(cross_root)
         n_volcanoes = len({p[0].parent for p in cross_pairs})
-        print(f"Cross-volcano:    {len(cross_pairs)} manifests across {n_volcanoes} source volcano(s)")
+        print(
+            f"Cross-volcano:    {len(cross_pairs)} manifests across {n_volcanoes} source volcano(s)"
+        )
         all_pairs.extend(cross_pairs)
 
     if not all_pairs:
@@ -291,9 +298,7 @@ def main() -> None:
         else:
             skipped += 1
 
-    print(
-        f"\nDone.  computed={computed}  skipped={skipped}  total={len(all_pairs)}"
-    )
+    print(f"\nDone.  computed={computed}  skipped={skipped}  total={len(all_pairs)}")
 
 
 if __name__ == "__main__":
