@@ -589,21 +589,6 @@ def build_model_from_spec(model_key: str, n_classes: int = 6, **overrides):
     return model_cls(**kwargs)
 
 
-def family_mapping(family: str) -> dict[str, dict[str, Any]]:
-    specs = list_model_specs(family=family)
-    return {
-        key: {
-            "display_name": spec["display_name"],
-            "model_cls": spec["model_cls"],
-            "model_kwargs": deepcopy(spec["model_kwargs"]),
-            "batch_size": spec["batch_size"],
-            "trainer_kind": spec["trainer_kind"],
-            "family": spec["family"],
-        }
-        for key, spec in specs.items()
-    }
-
-
 MODEL_SPECS = {
     key: {
         "display_name": spec["display_name"],
@@ -617,7 +602,3 @@ MODEL_SPECS = {
     }
     for key, spec in MODEL_REGISTRY.items()
 }
-
-MPNN_ABLATION_KWARGS = family_mapping("mpnn")
-GRAPHSAGE_ABLATION_KWARGS = family_mapping("graphsage")
-UNET_MODEL_SPECS = family_mapping("unet")

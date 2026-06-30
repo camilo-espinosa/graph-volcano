@@ -35,7 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.edge_features import batch_xcorr_features, compute_rsam
+from utils.edge_features import compute_rsam
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
 from utils.script_common import parse_csv_selection, resolve_project_path
@@ -111,39 +111,23 @@ def parse_args() -> argparse.Namespace:
 
 
 class GraphForwardWrapper(torch.nn.Module):
-    """Inject xcorr/rsam kwargs on demand while preserving model signature expectations."""
+    """Inject RSAM kwargs on demand while preserving model signature expectations."""
 
     def __init__(
         self,
         base_model: torch.nn.Module,
-        needs_xcorr: bool,
         needs_rsam: bool,
-        sampling_rate: float = 100.0,
-        max_lag_seconds: float = 5.0,
     ):
         super().__init__()
         self.base_model = base_model
-        self.needs_xcorr = bool(needs_xcorr)
         self.needs_rsam = bool(needs_rsam)
-        self.sampling_rate = float(sampling_rate)
-        self.max_lag_seconds = float(max_lag_seconds)
 
         self.use_envelope = getattr(base_model, "use_envelope", False)
         self.num_descriptors = int(getattr(base_model, "num_descriptors", 0))
 
     def forward(self, x: torch.Tensor, **kwargs):
-        if self.needs_xcorr or self.needs_rsam:
+        if self.needs_rsam:
             waveforms_np = x.detach().cpu().numpy()
-            if self.needs_xcorr:
-                edge_attr_dynamic_np = batch_xcorr_features(
-                    waveforms_np,
-                    sampling_rate=self.sampling_rate,
-                    max_lag_seconds=self.max_lag_seconds,
-                )
-                kwargs["edge_attr_dynamic"] = torch.from_numpy(edge_attr_dynamic_np).to(
-                    device=x.device,
-                    dtype=x.dtype,
-                )
             if self.needs_rsam:
                 rsam_np = compute_rsam(waveforms_np)
                 kwargs["rsam"] = torch.from_numpy(rsam_np).to(
@@ -430,22 +414,29 @@ def main() -> None:
 
                 descriptor_names = getattr(model, "descriptor_names", None)
                 model_num_desc = int(getattr(model, "num_descriptors", 0))
+                needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
+
+                def _edge_npz(npz_path: Path) -> Path:
+                    return npz_path.parent / "edge_data" / npz_path.name
 
                 train_ds = CrossVolcanoLOODataset(
                     train_npz,
                     descriptor_names=descriptor_names if model_num_desc > 0 else None,
+                    edge_data_npz=_edge_npz(train_npz) if needs_xcorr else None,
                     return_volcano_idx=True,
                     volcano_name_to_idx=volcano_name_to_idx,
                 )
                 val_ds = CrossVolcanoLOODataset(
                     val_npz,
                     descriptor_names=descriptor_names if model_num_desc > 0 else None,
+                    edge_data_npz=_edge_npz(val_npz) if needs_xcorr else None,
                     return_volcano_idx=True,
                     volcano_name_to_idx=volcano_name_to_idx,
                 )
                 test_ds = CrossVolcanoLOODataset(
                     test_npz,
                     descriptor_names=descriptor_names if model_num_desc > 0 else None,
+                    edge_data_npz=_edge_npz(test_npz) if needs_xcorr else None,
                     return_volcano_idx=True,
                     volcano_name_to_idx=volcano_name_to_idx,
                 )
@@ -459,8 +450,6 @@ def main() -> None:
 
                 wrapper = GraphForwardWrapper(
                     model,
-                    needs_xcorr=model_kwargs.get("edge_feature_mode")
-                    == "delta_pos_xcorr",
                     needs_rsam=bool(model_kwargs.get("use_rsam_node_feat", False)),
                 ).to(device)
 

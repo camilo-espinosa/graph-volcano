@@ -1358,6 +1358,7 @@ class CrossVolcanoLOODataset(Dataset):
         self,
         npz_path: Path,
         descriptor_names: Sequence[str] | str | None = None,
+        edge_data_npz: Optional[Path] = None,
         return_volcano_idx: bool = True,
         volcano_name_to_idx: Optional[dict[str, int]] = None,
     ):
@@ -1398,6 +1399,25 @@ class CrossVolcanoLOODataset(Dataset):
 
         if self.use_descriptors and self.descriptor_paths is None:
             self.descriptor_paths = self._infer_descriptor_paths()
+
+        # Optional precomputed dynamic edge features for xcorr ablations.
+        self._edge_attr_dynamic: Optional[np.ndarray] = None
+        if edge_data_npz is not None:
+            edge_data_npz = Path(edge_data_npz)
+            if not edge_data_npz.exists():
+                raise FileNotFoundError(
+                    f"Edge data file not found: {edge_data_npz}. "
+                    "Run scripts/01b_edge_data.py first."
+                )
+            with np.load(edge_data_npz) as ed:
+                self._edge_attr_dynamic = ed["edge_attr_dynamic"].astype(
+                    np.float32, copy=True
+                )
+            if len(self._edge_attr_dynamic) != len(self.filepaths):
+                raise ValueError(
+                    f"Edge data length {len(self._edge_attr_dynamic)} does not match "
+                    f"manifest length {len(self.filepaths)} for {edge_data_npz}."
+                )
 
     def _infer_descriptor_paths(self) -> np.ndarray:
         project_root = Path(__file__).resolve().parents[1]
@@ -1448,18 +1468,24 @@ class CrossVolcanoLOODataset(Dataset):
         x = torch.from_numpy(x_raw)
         y_onehot = torch.from_numpy(y_raw)
         y_label = torch.tensor(int(self.label_ids[idx]), dtype=torch.long)
-        descriptors = (
-            self._load_selected_descriptors(idx) if self.use_descriptors else None
+        descriptors: dict = (
+            self._load_selected_descriptors(idx) if self.use_descriptors else {}
         )
+        if self._edge_attr_dynamic is not None:
+            descriptors["edge_attr_dynamic"] = torch.from_numpy(
+                self._edge_attr_dynamic[idx].copy()
+            )
         volcano_idx = (
             torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
             if self.return_volcano_idx
             else None
         )
 
-        if self.use_descriptors and self.return_volcano_idx:
+        has_payload = self.use_descriptors or self._edge_attr_dynamic is not None
+
+        if has_payload and self.return_volcano_idx:
             return x, y_onehot, y_label, descriptors, volcano_idx
-        if self.use_descriptors:
+        if has_payload:
             return x, y_onehot, y_label, descriptors
         if self.return_volcano_idx:
             return x, y_onehot, y_label, volcano_idx

@@ -34,7 +34,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.edge_features import batch_xcorr_features, compute_rsam
+from utils.edge_features import compute_rsam
 from utils.fold_io_utils import (
     append_row_csv,
     checkpoint_path_for_fold,
@@ -236,23 +236,17 @@ def discover_loo_target_test_paths(cross_data_root: Path) -> dict[str, Path]:
 
 
 class GraphEvalForwardWrapper(torch.nn.Module):
-    """Inject optional dynamic MPNN features at inference time."""
+    """Inject optional RSAM node feature at inference time."""
 
     def __init__(
         self,
         base_model: torch.nn.Module,
         *,
-        needs_xcorr: bool,
         needs_rsam: bool,
-        sampling_rate: float = 100.0,
-        max_lag_seconds: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.base_model = base_model
-        self.needs_xcorr = bool(needs_xcorr)
         self.needs_rsam = bool(needs_rsam)
-        self.sampling_rate = float(sampling_rate)
-        self.max_lag_seconds = max_lag_seconds
 
         # compute_event_f1_iou_graphsage checks these with getattr on the model.
         self.use_envelope = getattr(base_model, "use_envelope", False)
@@ -261,19 +255,8 @@ class GraphEvalForwardWrapper(torch.nn.Module):
     def forward(self, x: torch.Tensor, **kwargs):
         waveforms_np = None
 
-        if self.needs_xcorr or self.needs_rsam:
+        if self.needs_rsam:
             waveforms_np = x.detach().cpu().numpy()
-
-        if self.needs_xcorr:
-            edge_attr_dynamic_np = batch_xcorr_features(
-                waveforms_np,
-                sampling_rate=self.sampling_rate,
-                max_lag_seconds=self.max_lag_seconds,
-            )
-            kwargs["edge_attr_dynamic"] = torch.from_numpy(edge_attr_dynamic_np).to(
-                device=x.device,
-                dtype=x.dtype,
-            )
 
         if self.needs_rsam:
             rsam_np = compute_rsam(waveforms_np)
@@ -303,6 +286,19 @@ def evaluate_graph_checkpoint_on_target(
     int,
     list[int],
 ]:
+    needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
+    edge_data_npz = test_npz_path.parent / "edge_data" / test_npz_path.name
+
+    if needs_xcorr and not edge_data_npz.exists():
+        msg = (
+            "Model requires precomputed dynamic edge features "
+            "(edge_feature_mode='delta_pos_xcorr'), but edge data file was not found: "
+            f"{edge_data_npz}. Run scripts/01b_edge_data.py first."
+        )
+        if strict_required_features:
+            raise RuntimeError(msg)
+        raise ValueError(msg)
+
     descriptor_names = getattr(model, "descriptor_names", None)
     model_num_descriptors = int(getattr(model, "num_descriptors", 0))
     use_envelope = bool(getattr(model, "use_envelope", False))
@@ -319,6 +315,7 @@ def evaluate_graph_checkpoint_on_target(
     ds = GraphSAGEDataset(
         test_npz_path,
         descriptor_names=descriptor_names if model_num_descriptors > 0 else None,
+        edge_data_npz=edge_data_npz if needs_xcorr else None,
     )
 
     if (model_num_descriptors > 0 or use_envelope) and not ds.use_descriptors:
@@ -341,7 +338,6 @@ def evaluate_graph_checkpoint_on_target(
 
     wrapper = GraphEvalForwardWrapper(
         model,
-        needs_xcorr=model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr",
         needs_rsam=bool(model_kwargs.get("use_rsam_node_feat", False)),
     ).to(device)
 

@@ -1,8 +1,18 @@
 """
 5-fold ablation runner for UNet_MPNN and UNet_GraphSAGE.
 
-Run:
+How to run:
+    # Run script defaults (see MODEL_KEYS_TO_RUN below)
     python scripts/02_ablation_tests.py
+
+    # Run all ablations currently defined in the registry
+    python scripts/02_ablation_tests.py --models all
+
+    # Run one specific ablation
+    python scripts/02_ablation_tests.py --models <model_key>
+
+    # Run multiple specific ablations
+    python scripts/02_ablation_tests.py --models <model_key_1>,<model_key_2>
 
 This script trains and evaluates selected ablations across stratified 5-fold CV:
 - Folds: 1..5
@@ -36,10 +46,11 @@ from utils.train_utils import (
     train_one_unet_fold,
     train_one_ablation_fold,
 )
-from utils.model_registry import MODEL_SPECS, get_model_spec, list_model_specs
+from utils.model_registry import MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
 
-MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
+# Default run set. Override with --models if needed.
+MODEL_KEYS_TO_RUN = ["edge_mpnn__rsam"]
 
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
@@ -76,7 +87,10 @@ def parse_args() -> argparse.Namespace:
         "--models",
         type=str,
         default=None,
-        help="Comma-separated model keys to process. Defaults to all registry entries.",
+        help=(
+            "Comma-separated model keys to process. "
+            "Default: edge_mpnn__rsam"
+        ),
     )
     parser.add_argument(
         "--experiment-root",
@@ -94,7 +108,10 @@ def select_model_keys(raw_models: str | None) -> list[str]:
     if raw_models is None:
         candidate_names = list(MODEL_KEYS_TO_RUN)
     else:
-        candidate_names = [x.strip() for x in raw_models.split(",") if x.strip()]
+        if raw_models.strip().lower() == "all":
+            candidate_names = list(MODEL_SPECS.keys())
+        else:
+            candidate_names = [x.strip() for x in raw_models.split(",") if x.strip()]
 
     selected = []
     for name in candidate_names:
