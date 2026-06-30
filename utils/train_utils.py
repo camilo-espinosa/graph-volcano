@@ -871,7 +871,10 @@ def compute_event_f1_iou_graphsage(
 
             # Edge dynamic features for edge_mpnn__xcorr ablation.
             edge_attr_dynamic_b = None
-            if descriptor_payload is not None and "edge_attr_dynamic" in descriptor_payload:
+            if (
+                descriptor_payload is not None
+                and "edge_attr_dynamic" in descriptor_payload
+            ):
                 ead = descriptor_payload["edge_attr_dynamic"]
                 if not torch.is_tensor(ead):
                     ead = torch.as_tensor(ead)
@@ -1177,6 +1180,7 @@ class GraphSAGEDataset(Dataset):
         self,
         npz_path: Path,
         descriptor_names: Sequence[str] | str | None = None,
+        edge_data_npz: Optional[Path] = None,
         return_volcano_idx: bool = False,
         volcano_name_to_idx: Optional[dict[str, int]] = None,
     ):
@@ -1699,7 +1703,16 @@ def train_one_ablation_fold(
                     f"loss={loss.item():.4f} dice={dice_component.item():.4f} ce={ce_component.item():.4f}"
                 )
 
-            del xb, y_onehot, out, loss, dice_component, ce_component, _train_payload, _train_edge_attr
+            del (
+                xb,
+                y_onehot,
+                out,
+                loss,
+                dice_component,
+                ce_component,
+                _train_payload,
+                _train_edge_attr,
+            )
 
         scheduler.step()
 
