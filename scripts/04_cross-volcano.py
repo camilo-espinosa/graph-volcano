@@ -38,7 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.edge_features import compute_rsam
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
-MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
+# MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
 
 
 from utils.script_common import parse_csv_selection, resolve_project_path
