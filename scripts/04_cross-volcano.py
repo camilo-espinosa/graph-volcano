@@ -38,7 +38,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.edge_features import compute_rsam
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
-# MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
+
+MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
 
 
 from utils.script_common import parse_csv_selection, resolve_project_path
@@ -162,7 +163,9 @@ def _log_warn(log_path: Path, message: str) -> None:
 
 def _log_vram(log_path: Path, *, tag: str, device: torch.device) -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
-        _append_contract_log(log_path, f"[VRAM] {tag} device={device} (cuda_unavailable)")
+        _append_contract_log(
+            log_path, f"[VRAM] {tag} device={device} (cuda_unavailable)"
+        )
         return
 
     allocated_mb = torch.cuda.memory_allocated(device=device) / (1024**2)
@@ -423,9 +426,13 @@ def _log_split_contract_check(
             f"[{model_key}][{split_name}] Missing volcano_idx in graph batch forward kwargs."
         )
 
-    unique_indices = sorted(set(batch_volcano_idx.detach().cpu().numpy().flatten().tolist()))
+    unique_indices = sorted(
+        set(batch_volcano_idx.detach().cpu().numpy().flatten().tolist())
+    )
     idx_to_name = {v: k for k, v in volcano_name_to_idx.items()}
-    unique_names = sorted([idx_to_name.get(int(i), f"UNK_{int(i)}") for i in unique_indices])
+    unique_names = sorted(
+        [idx_to_name.get(int(i), f"UNK_{int(i)}") for i in unique_indices]
+    )
     _log_req(
         log_path,
         (
