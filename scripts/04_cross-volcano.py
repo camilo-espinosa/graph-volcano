@@ -39,6 +39,7 @@ from utils.edge_features import compute_rsam
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
 
+MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
 
 from utils.script_common import parse_csv_selection, resolve_project_path
 from utils.station_info import build_volcano_geometry_bank, infer_volcano_name_from_path
