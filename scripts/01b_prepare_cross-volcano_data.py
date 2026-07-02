@@ -22,6 +22,7 @@ from utils.data_utils import (
     save_manifest,
     _stratified_train_val_split_from_train,
 )
+from utils.station_info import get_default_volcano_order
 
 DATA_ROOT = PROJECT_ROOT / "data"
 PREPARED_ROOT = DATA_ROOT / "prepared_data"
@@ -31,7 +32,8 @@ TARGET_PER_CLASS = 1500
 VAL_FRACTION_WITHIN_TRAIN = 0.15
 
 HOLDOUT_VOLCANOES = ("VCA", "CAU", "LDM")
-ALL_VOLCANOES = ("NVCHVC", "CAU", "LDM", "VCA")
+# Use canonical volcano order shared across geometry bank and datasets.
+ALL_VOLCANOES = tuple(get_default_volcano_order())
 
 AUGMENT_POLICIES = {
     "AV": (("shift", 0.50), ("shift_amp", 0.25), ("shift_noise", 0.25)),

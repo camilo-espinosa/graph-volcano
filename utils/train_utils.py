@@ -885,6 +885,8 @@ def compute_event_f1_iou_graphsage(
                 forward_kwargs["envelope"] = envelope_b
             if descriptors_b is not None:
                 forward_kwargs["descriptors"] = descriptors_b
+            if edge_attr_dynamic_b is not None:
+                forward_kwargs["edge_attr_dynamic"] = edge_attr_dynamic_b
             if volcano_idx_b is not None:
                 forward_kwargs["volcano_idx"] = volcano_idx_b.to(device).long()
 
