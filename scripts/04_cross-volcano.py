@@ -38,7 +38,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.edge_features import compute_rsam
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
-# MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
 
 
 from utils.script_common import parse_csv_selection, resolve_project_path
@@ -111,124 +110,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-confusion-matrices", action="store_true")
     return parser.parse_args()
-
-
-def _validate_volcano_idx(
-    volcano_idx: torch.Tensor, held_out: str, volcano_name_to_idx: dict[str, int]
-) -> None:
-    """Verify that volcano_idx matches expected held-out volcano."""
-    expected_idx = volcano_name_to_idx[held_out]
-    if volcano_idx is not None:
-        unique_indices = set(volcano_idx.cpu().numpy().flatten().tolist())
-        if expected_idx not in unique_indices:
-            raise ValueError(
-                f"ERROR: Expected volcano index {expected_idx} ({held_out}) in batch, "
-                f"but got: {unique_indices}"
-            )
-
-
-def _log_geometry_check(
-    model: torch.nn.Module, held_out: str, volcano_idx: int
-) -> None:
-    """Log geometry bank info to verify per-sample indexing."""
-    geom_bank = getattr(model, "volcano_geom_nodes", None)
-    if geom_bank is not None and geom_bank.numel() > 0:
-        geom_shape = geom_bank.shape
-        sample_geom = geom_bank[volcano_idx : volcano_idx + 1]
-        geom_sum = float(sample_geom.abs().sum().item())
-        print(
-            f"      [GEOM] Held_out={held_out} (idx={volcano_idx}) | "
-            f"Bank shape={geom_shape} | Sample geometry L1 norm={geom_sum:.6f}"
-        )
-
-
-def _append_contract_log(log_path: Path, message: str) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(message + "\n")
-
-
-def _log_req(log_path: Path, message: str) -> None:
-    tagged = f"[REQCHK] {message}"
-    print(tagged)
-    _append_contract_log(log_path, tagged)
-
-
-def _log_warn(log_path: Path, message: str) -> None:
-    tagged = f"[REQWARN] {message}"
-    print(tagged)
-    _append_contract_log(log_path, tagged)
-
-
-def _log_vram(log_path: Path, *, tag: str, device: torch.device) -> None:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        _append_contract_log(log_path, f"[VRAM] {tag} device={device} (cuda_unavailable)")
-        return
-
-    allocated_mb = torch.cuda.memory_allocated(device=device) / (1024**2)
-    reserved_mb = torch.cuda.memory_reserved(device=device) / (1024**2)
-    peak_allocated_mb = torch.cuda.max_memory_allocated(device=device) / (1024**2)
-    peak_reserved_mb = torch.cuda.max_memory_reserved(device=device) / (1024**2)
-    _append_contract_log(
-        log_path,
-        (
-            f"[VRAM] {tag} device={device} "
-            f"alloc_mb={allocated_mb:.2f} reserved_mb={reserved_mb:.2f} "
-            f"peak_alloc_mb={peak_allocated_mb:.2f} peak_reserved_mb={peak_reserved_mb:.2f}"
-        ),
-    )
-
-
-def _backward_with_diagnostics(
-    loss: torch.Tensor,
-    *,
-    log_path: Path,
-    device: torch.device,
-    model_key: str,
-    fold_idx: int,
-    epoch_idx: int,
-    batch_idx: int,
-    family: str,
-    batch_size: int,
-) -> None:
-    try:
-        loss.backward()
-    except RuntimeError as exc:
-        err = str(exc)
-        err_lower = err.lower()
-        likely_vram = (
-            "out of memory" in err_lower
-            or "cudnn_status_execution_failed" in err_lower
-            or "cuda" in err_lower
-        )
-
-        _log_vram(
-            log_path,
-            tag=(
-                "failure "
-                f"model={model_key} family={family} fold={fold_idx} "
-                f"epoch={epoch_idx + 1} batch={batch_idx} "
-                f"batch_size={batch_size}"
-            ),
-            device=device,
-        )
-        _log_warn(
-            log_path,
-            (
-                "backward_exception "
-                f"model={model_key} fold={fold_idx} epoch={epoch_idx + 1} "
-                f"batch={batch_idx} family={family} "
-                f"likely_vram={int(likely_vram)} error={err}"
-            ),
-        )
-
-        if likely_vram:
-            raise RuntimeError(
-                f"{err}\n"
-                "Likely CUDA/VRAM pressure during backward. "
-                f"Try a smaller batch size (current={batch_size}), e.g. --batch-size {max(1, batch_size // 2)}."
-            ) from exc
-        raise
 
 
 class GraphForwardWrapper(torch.nn.Module):
@@ -323,19 +204,10 @@ def _extract_graph_batch(
     return xb, y_onehot, forward_kwargs
 
 
-def _extract_volcano_idx_from_batch(batch):
-    if len(batch) > 4 and torch.is_tensor(batch[4]):
-        return batch[4]
-    if len(batch) > 3 and torch.is_tensor(batch[3]):
-        return batch[3]
-    return None
-
-
 def _canonicalize_dataset_volcano_indices(
     dataset,
     *,
     volcano_name_to_idx: dict[str, int],
-    log_path: Path,
     model_key: str,
     split_name: str,
 ) -> None:
@@ -354,13 +226,6 @@ def _canonicalize_dataset_volcano_indices(
     current = getattr(dataset, "sample_volcano_idx", None)
     if current is None:
         dataset.sample_volcano_idx = inferred
-        _log_req(
-            log_path,
-            (
-                f"model={model_key} split={split_name} canonicalized volcano_idx from filepaths "
-                f"(no prior sample_volcano_idx)"
-            ),
-        )
         return
 
     current_arr = np.asarray(current, dtype=np.int64)
@@ -372,140 +237,7 @@ def _canonicalize_dataset_volcano_indices(
 
     if not np.array_equal(current_arr, inferred):
         dataset.sample_volcano_idx = inferred
-        mismatch_count = int(np.sum(current_arr != inferred))
-        _log_warn(
-            log_path,
-            (
-                f"model={model_key} split={split_name} remapped volcano_idx to canonical mapping "
-                f"(mismatch_count={mismatch_count}/{len(inferred)})"
-            ),
-        )
-    else:
-        _log_req(
-            log_path,
-            f"model={model_key} split={split_name} volcano_idx already canonical",
-        )
-
-
-def _log_split_contract_check(
-    *,
-    log_path: Path,
-    split_name: str,
-    model_key: str,
-    family: str,
-    held_out: str,
-    model: torch.nn.Module,
-    wrapper: torch.nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    volcano_name_to_idx: dict[str, int],
-    volcano_order: tuple[str, ...],
-    volcano_geom_bank,
-    needs_xcorr: bool,
-) -> None:
-    sample_batch = next(iter(loader))
-    xb, _y_onehot, forward_kwargs = _extract_graph_batch(sample_batch, device, model)
-    batch_volcano_idx = forward_kwargs.get("volcano_idx", None)
-    held_out_idx = int(volcano_name_to_idx[held_out])
-
-    _log_req(
-        log_path,
-        (
-            f"model={model_key} family={family} split={split_name} "
-            f"forward_keys={sorted(forward_kwargs.keys())} "
-            f"needs_rsam={bool(getattr(wrapper, 'needs_rsam', False))} "
-            f"needs_xcorr={bool(needs_xcorr)}"
-        ),
-    )
-
-    if batch_volcano_idx is None:
-        raise ValueError(
-            f"[{model_key}][{split_name}] Missing volcano_idx in graph batch forward kwargs."
-        )
-
-    unique_indices = sorted(set(batch_volcano_idx.detach().cpu().numpy().flatten().tolist()))
-    idx_to_name = {v: k for k, v in volcano_name_to_idx.items()}
-    unique_names = sorted([idx_to_name.get(int(i), f"UNK_{int(i)}") for i in unique_indices])
-    _log_req(
-        log_path,
-        (
-            f"model={model_key} split={split_name} "
-            f"batch_volcano_idx={unique_indices} batch_volcano_names={unique_names}"
-        ),
-    )
-
-    if split_name == "train":
-        if held_out in unique_names:
-            raise ValueError(
-                f"[{model_key}][train] held_out volcano '{held_out}' leaked into training batch: "
-                f"idx={unique_indices}, names={unique_names}."
-            )
-    elif split_name == "test":
-        if held_out not in unique_names:
-            raise ValueError(
-                f"[{model_key}][test] held_out volcano '{held_out}' not found in test batch: "
-                f"idx={unique_indices}, names={unique_names}."
-            )
-    else:
-        # Validation in this protocol may come from training volcanoes only.
-        if held_out in unique_names:
-            _log_warn(
-                log_path,
-                (
-                    f"model={model_key} split=val includes held_out_idx={held_out_idx}; "
-                    "this is allowed but should match your fold construction intent"
-                ),
-            )
-        else:
-            _log_req(
-                log_path,
-                f"model={model_key} split=val excludes held_out_idx={held_out_idx} (expected for train-volcano validation)",
-            )
-
-    if needs_xcorr:
-        if "edge_attr_dynamic" not in forward_kwargs:
-            raise ValueError(
-                f"[{model_key}][{split_name}] edge_attr_dynamic missing for xcorr model."
-            )
-        ead = forward_kwargs["edge_attr_dynamic"]
-        expected_shape = (
-            int(xb.shape[0]),
-            int(getattr(model, "n_station_pairs", -1)),
-            int(getattr(model, "xcorr_feat_dim", -1)),
-        )
-        if tuple(ead.shape) != expected_shape:
-            raise ValueError(
-                f"[{model_key}][{split_name}] edge_attr_dynamic shape mismatch. "
-                f"Expected {expected_shape}, got {tuple(ead.shape)}."
-            )
-        _log_req(
-            log_path,
-            f"model={model_key} split={split_name} edge_attr_dynamic_shape={tuple(ead.shape)}",
-        )
-
-    sample_indices_to_log = [0, min(1, int(batch_volcano_idx.shape[0]) - 1)]
-    sample_indices_to_log = sorted(set(i for i in sample_indices_to_log if i >= 0))
-    for sample_idx in sample_indices_to_log:
-        vol_idx = int(batch_volcano_idx[sample_idx].item())
-        vol_name = volcano_order[vol_idx]
-        sample_geom = volcano_geom_bank[vol_idx]
-        if isinstance(sample_geom, np.ndarray):
-            geom_norm = float(np.abs(sample_geom).sum())
-            first_node = sample_geom[0]
-        else:
-            geom_norm = float(sample_geom.abs().sum().item())
-            first_node = sample_geom[0].detach().cpu().numpy()
-        _log_req(
-            log_path,
-            (
-                f"model={model_key} split={split_name} sample={sample_idx} "
-                f"volcano_idx={vol_idx} volcano={vol_name} "
-                f"geom_node0=[{first_node[0]:.3f},{first_node[1]:.3f},{first_node[2]:.3f}] "
-                f"geom_l1={geom_norm:.6f}"
-            ),
-        )
-
-    del xb, _y_onehot
+    del current_arr, inferred
 
 
 def _evaluate_unet(
@@ -591,10 +323,6 @@ def main() -> None:
         else (experiment_root / DEFAULT_OUTPUT_NAME)
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    contract_log_path = output_dir / "input_contract_checks.log"
-    with contract_log_path.open("w", encoding="utf-8") as f:
-        f.write("# Input contract checks\n")
-        f.write(f"created_at={datetime.now().isoformat(timespec='seconds')}\n")
 
     fold_dirs = sorted([p for p in data_root.glob(FOLD_GLOB) if p.is_dir()])
     if len(fold_dirs) == 0:
@@ -623,37 +351,10 @@ def main() -> None:
         n_stations=8
     )
 
-    # Validate volcano geometry bank structure
-    print(f"[GEOMETRY] Volcano geometry bank shape: {volcano_geom_bank.shape}")
-    print(f"[GEOMETRY] Volcanoes in order: {volcano_order}")
-    print(f"[GEOMETRY] Volcano name -> index mapping: {volcano_name_to_idx}")
     if volcano_geom_bank.shape[0] != len(volcano_order):
         raise ValueError(
             f"Geometry bank size ({volcano_geom_bank.shape[0]}) does not match "
             f"volcano_order length ({len(volcano_order)})"
-        )
-
-    # Verify that geometries actually differ between volcanoes
-    print(
-        f"[GEOMETRY] OK Geometry bank validated: {volcano_geom_bank.shape[0]} volcanoes, "
-        f"{volcano_geom_bank.shape[1]} nodes, {volcano_geom_bank.shape[2]} features each"
-    )
-    geom_checksums = []
-    for v_idx, v_name in enumerate(volcano_order):
-        geom_array = volcano_geom_bank[v_idx]
-        if isinstance(geom_array, np.ndarray):
-            geom_norm = float(np.abs(geom_array).sum())
-        else:
-            geom_norm = float(geom_array.abs().sum().item())
-        geom_checksums.append(geom_norm)
-        print(f"        {v_idx}: {v_name:8s} L1 norm = {geom_norm:.6f}")
-
-    # Check that geometries are actually distinct
-    if len(set(geom_checksums)) != len(geom_checksums):
-        print("[GEOMETRY] WARNING: Some volcanoes have identical geometry norms!")
-    else:
-        print(
-            f"[GEOMETRY] OK All {len(volcano_order)} volcanoes have distinct geometries"
         )
 
     run_manifest = {
@@ -687,10 +388,6 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Models ({len(selected_models)}): {selected_models}")
     print("=" * 90)
-    _log_req(
-        contract_log_path,
-        f"run_start data_root={data_root} output_dir={output_dir} device={device}",
-    )
 
     fieldnames = [
         "model_key",
@@ -724,10 +421,6 @@ def main() -> None:
         )
 
         print(f"\n[MODEL] {model_key} family={family} batch_size={batch_size}")
-        _log_req(
-            contract_log_path,
-            f"model_start model={model_key} family={family} batch_size={batch_size}",
-        )
 
         for fold_idx, fold_dir in enumerate(fold_dirs, start=1):
             train_npz = fold_dir / "train.npz"
@@ -747,16 +440,6 @@ def main() -> None:
             print(
                 f"  [FOLD {fold_idx}] Testing on: {held_out} | Training on: {', '.join(training_volcanoes)}"
             )
-            print(
-                f"    [VOLCANO_IDX] Held out volcano '{held_out}' = index {volcano_name_to_idx[held_out]}"
-            )
-            _log_req(
-                contract_log_path,
-                (
-                    f"fold_start model={model_key} fold={fold_idx} held_out={held_out} "
-                    f"held_out_idx={int(volcano_name_to_idx[held_out])}"
-                ),
-            )
 
             run_start = time.time()
             fold_out = output_dir / model_key / fold_dir.name
@@ -765,14 +448,6 @@ def main() -> None:
             cm_dir = fold_out / "confusion_matrices"
             for p in [ckpt_dir, reports_dir, cm_dir]:
                 p.mkdir(parents=True, exist_ok=True)
-
-            if device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats(device=device)
-            _log_vram(
-                contract_log_path,
-                tag=f"model={model_key} fold={fold_idx} phase=fold_start",
-                device=device,
-            )
 
             if family == "unet":
                 model = spec["model_cls"](
@@ -818,48 +493,6 @@ def main() -> None:
                 model_num_desc = int(getattr(model, "num_descriptors", 0))
                 needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
 
-                # Log graph model configuration
-                log_parts = []
-
-                # Family-specific backend info
-                if model_kwargs.get("graph_backend"):
-                    log_parts.append(
-                        f"Graph backend: {model_kwargs.get('graph_backend')}"
-                    )
-                elif model_kwargs.get("graph_topology"):
-                    log_parts.append(
-                        f"Graph topology: {model_kwargs.get('graph_topology')}"
-                    )
-
-                if model_kwargs.get("use_message_passing"):
-                    log_parts.append("Message passing: ON")
-                if model_kwargs.get("use_bottleneck_attention"):
-                    log_parts.append("Bottleneck attention: ON")
-                if needs_xcorr:
-                    log_parts.append(
-                        f"Edge features: xcorr (dim={model_kwargs.get('xcorr_feat_dim', 'N/A')})"
-                    )
-                elif model_kwargs.get("edge_feature_mode"):
-                    log_parts.append(
-                        f"Edge features: {model_kwargs.get('edge_feature_mode')}"
-                    )
-                if model_num_desc > 0:
-                    log_parts.append(
-                        f"Descriptors: {model_num_desc} ({', '.join(descriptor_names) if descriptor_names else 'N/A'})"
-                    )
-                if model_kwargs.get("use_rsam_node_feat"):
-                    log_parts.append("RSAM node features: ON")
-                print(f"    [CONFIG] {' | '.join(log_parts)}")
-                _log_req(
-                    contract_log_path,
-                    (
-                        f"family={family} "
-                        f"requirements model={model_key} "
-                        f"needs_waveforms=True needs_geometry={bool((family == 'graphsage' and model_kwargs.get('node_feature_mode', 'geometry') in {'geometry', 'both'}) or (family == 'mpnn' and (model_kwargs.get('node_feature_mode', 'geometry') == 'geometry' or model_kwargs.get('edge_feature_mode', 'delta_pos') != 'none')))} "
-                        f"needs_xcorr={bool(needs_xcorr)} needs_rsam={bool(model_kwargs.get('use_rsam_node_feat', False))}"
-                    ),
-                )
-
                 def _edge_npz(npz_path: Path) -> Path:
                     return npz_path.parent / "edge_data" / npz_path.name
 
@@ -888,21 +521,18 @@ def main() -> None:
                 _canonicalize_dataset_volcano_indices(
                     train_ds,
                     volcano_name_to_idx=volcano_name_to_idx,
-                    log_path=contract_log_path,
                     model_key=model_key,
                     split_name="train",
                 )
                 _canonicalize_dataset_volcano_indices(
                     val_ds,
                     volcano_name_to_idx=volcano_name_to_idx,
-                    log_path=contract_log_path,
                     model_key=model_key,
                     split_name="val",
                 )
                 _canonicalize_dataset_volcano_indices(
                     test_ds,
                     volcano_name_to_idx=volcano_name_to_idx,
-                    log_path=contract_log_path,
                     model_key=model_key,
                     split_name="test",
                 )
@@ -922,62 +552,6 @@ def main() -> None:
                     model,
                     needs_rsam=bool(model_kwargs.get("use_rsam_node_feat", False)),
                 ).to(device)
-
-                # Validate geometry indexing
-                expected_volcano_idx = volcano_name_to_idx[held_out]
-                _log_geometry_check(model, held_out, expected_volcano_idx)
-
-                # One-batch contract checks per split (single consolidated log file).
-                _log_split_contract_check(
-                    log_path=contract_log_path,
-                    split_name="train",
-                    model_key=model_key,
-                    family=family,
-                    held_out=held_out,
-                    model=model,
-                    wrapper=wrapper,
-                    loader=train_loader,
-                    device=device,
-                    volcano_name_to_idx=volcano_name_to_idx,
-                    volcano_order=volcano_order,
-                    volcano_geom_bank=volcano_geom_bank,
-                    needs_xcorr=needs_xcorr,
-                )
-                _log_split_contract_check(
-                    log_path=contract_log_path,
-                    split_name="val",
-                    model_key=model_key,
-                    family=family,
-                    held_out=held_out,
-                    model=model,
-                    wrapper=wrapper,
-                    loader=val_loader,
-                    device=device,
-                    volcano_name_to_idx=volcano_name_to_idx,
-                    volcano_order=volcano_order,
-                    volcano_geom_bank=volcano_geom_bank,
-                    needs_xcorr=needs_xcorr,
-                )
-                _log_split_contract_check(
-                    log_path=contract_log_path,
-                    split_name="test",
-                    model_key=model_key,
-                    family=family,
-                    held_out=held_out,
-                    model=model,
-                    wrapper=wrapper,
-                    loader=test_loader,
-                    device=device,
-                    volcano_name_to_idx=volcano_name_to_idx,
-                    volcano_order=volcano_order,
-                    volcano_geom_bank=volcano_geom_bank,
-                    needs_xcorr=needs_xcorr,
-                )
-                _log_vram(
-                    contract_log_path,
-                    tag=f"model={model_key} fold={fold_idx} phase=post_contract_checks",
-                    device=device,
-                )
 
             optimizer = optim.Adam(
                 [p for p in wrapper.parameters() if p.requires_grad],
@@ -1003,55 +577,6 @@ def main() -> None:
                 wrapper.train()
                 train_loss = 0.0
 
-                # On first epoch, validate per-batch volcano indices for graph models
-                if epoch == 0 and family != "unet":
-                    sample_batch = next(iter(train_loader))
-                    batch_volcano_idx = _extract_volcano_idx_from_batch(sample_batch)
-                    if batch_volcano_idx is not None:
-                        unique_in_batch = set(
-                            batch_volcano_idx.cpu().numpy().flatten().tolist()
-                        )
-                        held_out_idx = volcano_name_to_idx[held_out]
-
-                        # Training batches should NOT contain held_out volcano
-                        if held_out_idx in unique_in_batch:
-                            raise ValueError(
-                                f"ERROR: Training batch should exclude held_out volcano {held_out} "
-                                f"(idx={held_out_idx}), but found it in batch indices: {unique_in_batch}"
-                            )
-
-                        print(
-                            f"      [BATCH_IDX] First training batch volcano indices: {sorted(unique_in_batch)} OK (excluded {held_out})"
-                        )
-
-                        # Log actual geometry values being used per sample - show samples from different volcanoes
-                        print(
-                            f"      [SAMPLE_GEOM] Verifying per-sample geometry usage (training volcanoes):"
-                        )
-                        batch_size = batch_volcano_idx.shape[0]
-                        sample_indices_to_log = [
-                            0,
-                            min(1, batch_size - 1),
-                            batch_size - 1,
-                        ]
-                        sample_indices_to_log = sorted(set(sample_indices_to_log))
-
-                        for sample_idx in sample_indices_to_log:
-                            vol_idx = int(batch_volcano_idx[sample_idx].item())
-                            vol_name = volcano_order[vol_idx]
-                            sample_geom = volcano_geom_bank[vol_idx]  # shape: [9, 3]
-                            if isinstance(sample_geom, np.ndarray):
-                                geom_norm = float(np.abs(sample_geom).sum())
-                                first_node = sample_geom[0]
-                            else:
-                                geom_norm = float(sample_geom.abs().sum().item())
-                                first_node = sample_geom[0].detach().cpu().numpy()
-                            print(
-                                f"          sample {sample_idx}: volcano_idx={vol_idx} ({vol_name:8s}) | "
-                                f"node[0]=[{first_node[0]:7.3f}, {first_node[1]:7.3f}, {first_node[2]:7.3f}] | "
-                                f"total_norm={geom_norm:.6f}"
-                            )
-
                 if family == "unet":
                     for batch_idx, (xb, y_onehot, _) in enumerate(train_loader, 1):
                         xb = xb.to(device)
@@ -1066,17 +591,7 @@ def main() -> None:
                             dice_weight=float(args.dice_weight),
                             ce_weight=float(args.ce_weight),
                         )
-                        _backward_with_diagnostics(
-                            loss,
-                            log_path=contract_log_path,
-                            device=device,
-                            model_key=model_key,
-                            fold_idx=fold_idx,
-                            epoch_idx=epoch,
-                            batch_idx=batch_idx,
-                            family=family,
-                            batch_size=batch_size,
-                        )
+                        loss.backward()
                         optimizer.step()
                         train_loss += float(loss.item())
                         del xb, y_onehot, out, loss
@@ -1103,17 +618,7 @@ def main() -> None:
                             dice_weight=float(args.dice_weight),
                             ce_weight=float(args.ce_weight),
                         )
-                        _backward_with_diagnostics(
-                            loss,
-                            log_path=contract_log_path,
-                            device=device,
-                            model_key=model_key,
-                            fold_idx=fold_idx,
-                            epoch_idx=epoch,
-                            batch_idx=batch_idx,
-                            family=family,
-                            batch_size=batch_size,
-                        )
+                        loss.backward()
                         optimizer.step()
                         train_loss += float(loss.item())
                         del xb, y_onehot, out, loss
@@ -1309,14 +814,6 @@ def main() -> None:
                 f"test_f1={test_mean_f1:.4f} test_iou={test_mean_iou:.4f}"
             )
             print(f"    -> Saved to: {fold_out}")
-            _log_vram(
-                contract_log_path,
-                tag=(
-                    f"model={model_key} fold={fold_idx} phase=fold_end "
-                    f"held_out={held_out}"
-                ),
-                device=device,
-            )
 
             del train_loader, val_loader, test_loader
             del train_ds, val_ds, test_ds
