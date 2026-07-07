@@ -21,8 +21,15 @@ class UNetBottleneckAttention(nn.Module):
         bottleneck_attn_heads=4,
         bottleneck_attn_dropout=0.0,
         bottleneck_attn_ff_mult=2,
+        feature_dropout=0.0,
     ):
         super().__init__()
+
+        if feature_dropout < 0.0 or feature_dropout >= 1.0:
+            raise ValueError(
+                f"feature_dropout must be in [0, 1). Got: {feature_dropout}."
+            )
+        self.feature_dropout_p = float(feature_dropout)
 
         features = init_features
         self.encoder_list = nn.ModuleList()
@@ -33,7 +40,12 @@ class UNetBottleneckAttention(nn.Module):
         feat_in = in_channels
         for idx in range(depth):
             feat_out = features * 2 ** (idx)
-            encoder = self._block(feat_in, feat_out, name=f"enc{idx}")
+            encoder = self._block(
+                feat_in,
+                feat_out,
+                name=f"enc{idx}",
+                feature_dropout=self.feature_dropout_p,
+            )
             feat_in = feat_out
             pool = nn.MaxPool2d(kernel_size=2, stride=2)
             self.encoder_list.append(encoder)
@@ -41,7 +53,10 @@ class UNetBottleneckAttention(nn.Module):
 
         self.bottleneck_channels = features * 2**depth
         self.bottleneck = self._block(
-            features * 2 ** (depth - 1), features * 2**depth, name="bottleneck"
+            features * 2 ** (depth - 1),
+            features * 2**depth,
+            name="bottleneck",
+            feature_dropout=self.feature_dropout_p,
         )
 
         if self.bottleneck_channels % bottleneck_attn_heads != 0:
@@ -79,8 +94,15 @@ class UNetBottleneckAttention(nn.Module):
             upconv = nn.ConvTranspose2d(feat_in, feat_out, kernel_size=2, stride=2)
             self.upconv_list.append(upconv)
 
-            decoder = self._block(feat_in, feat_out, name=f"dec{depth-idx}")
+            decoder = self._block(
+                feat_in,
+                feat_out,
+                name=f"dec{depth-idx}",
+                feature_dropout=self.feature_dropout_p,
+            )
             self.decoder_list.append(decoder)
+
+        self.final_dropout = nn.Dropout(self.feature_dropout_p)
 
         self.conv = nn.Conv2d(
             in_channels=features, out_channels=out_channels, kernel_size=1
@@ -112,10 +134,14 @@ class UNetBottleneckAttention(nn.Module):
             x = self.upconv_list[i](x)
             x = torch.cat((x, encodings[-(i + 1)]), dim=1)
             x = self.decoder_list[i](x)
+        x = self.final_dropout(x)
         return self.conv(x)
 
     @staticmethod
-    def _block(in_channels, features, name):
+    def _block(in_channels, features, name, feature_dropout):
+        dropout = (
+            nn.Dropout(feature_dropout) if feature_dropout > 0.0 else nn.Identity()
+        )
         return nn.Sequential(
             OrderedDict(
                 [
@@ -131,6 +157,7 @@ class UNetBottleneckAttention(nn.Module):
                     ),
                     (name + "norm1", nn.BatchNorm2d(num_features=features)),
                     (name + "relu1", nn.ReLU(inplace=True)),
+                    (name + "drop1", dropout),
                     (
                         name + "conv2",
                         nn.Conv2d(
@@ -143,6 +170,7 @@ class UNetBottleneckAttention(nn.Module):
                     ),
                     (name + "norm2", nn.BatchNorm2d(num_features=features)),
                     (name + "relu2", nn.ReLU(inplace=True)),
+                    (name + "drop2", dropout),
                 ]
             )
         )

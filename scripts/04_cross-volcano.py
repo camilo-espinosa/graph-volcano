@@ -35,14 +35,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.edge_features import compute_rsam
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
 
 MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
 
 from utils.script_common import parse_csv_selection, resolve_project_path
-from utils.station_info import build_volcano_geometry_bank, infer_volcano_name_from_path
 from utils.train_utils import (
     BalancedBatchSampler,
     CrossVolcanoLOODataset,
@@ -53,9 +51,9 @@ from utils.train_utils import (
     combined_dice_ce_loss_2d,
     compute_event_f1_iou_graphsage,
     compute_summary,
-    extract_descriptor_tensor,
     f1_score_from_confusion_matrix,
 )
+from models.PhaseNet import PhaseNet
 
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "data" / "prepared_data" / "cross_volcano_loo"
 DEFAULT_EXPERIMENT_ROOT = (
@@ -114,131 +112,27 @@ def parse_args() -> argparse.Namespace:
 
 
 class GraphForwardWrapper(torch.nn.Module):
-    """Inject RSAM kwargs on demand while preserving model signature expectations."""
+    """Compatibility wrapper for graph-family models."""
 
     def __init__(
         self,
         base_model: torch.nn.Module,
-        needs_rsam: bool,
     ):
         super().__init__()
         self.base_model = base_model
-        self.needs_rsam = bool(needs_rsam)
-
-        self.use_envelope = getattr(base_model, "use_envelope", False)
-        self.num_descriptors = int(getattr(base_model, "num_descriptors", 0))
 
     def forward(self, x: torch.Tensor, **kwargs):
-        if self.needs_rsam:
-            waveforms_np = x.detach().cpu().numpy()
-            if self.needs_rsam:
-                rsam_np = compute_rsam(waveforms_np)
-                kwargs["rsam"] = torch.from_numpy(rsam_np).to(
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-
         return self.base_model(x, **kwargs)
 
 
 def _extract_graph_batch(
     batch,
     device: torch.device,
-    model: torch.nn.Module,
 ):
     xb = batch[0].to(device)
     y_onehot = batch[1].to(device)
-
-    descriptor_payload = None
-    volcano_idx = None
-    if len(batch) > 3 and isinstance(batch[3], dict):
-        descriptor_payload = batch[3]
-    elif len(batch) > 3 and torch.is_tensor(batch[3]):
-        volcano_idx = batch[3].to(device).long()
-
-    if len(batch) > 4 and torch.is_tensor(batch[4]):
-        volcano_idx = batch[4].to(device).long()
-
     forward_kwargs: dict[str, Any] = {}
-
-    if volcano_idx is not None:
-        forward_kwargs["volcano_idx"] = volcano_idx
-
-    if getattr(model, "use_envelope", False):
-        if descriptor_payload is None or "envelope" not in descriptor_payload:
-            raise ValueError(
-                "Model requires envelope but batch has no descriptor payload with 'envelope'."
-            )
-        env = descriptor_payload["envelope"]
-        if not torch.is_tensor(env):
-            env = torch.as_tensor(env)
-        if env.ndim == 4 and env.shape[1] == 1:
-            env = env[:, 0, :, :]
-        elif env.ndim == 4 and env.shape[2] == 1:
-            env = env[:, :, 0, :]
-        env = env.to(device=xb.device, dtype=xb.dtype)
-        forward_kwargs["envelope"] = env
-
-    model_num_desc = int(getattr(model, "num_descriptors", 0))
-    if model_num_desc > 0:
-        descriptor_names = getattr(model, "descriptor_names", None)
-        if descriptor_names is None:
-            raise ValueError(
-                "Model has num_descriptors > 0 but does not expose descriptor_names."
-            )
-        descriptors = extract_descriptor_tensor(
-            descriptor_payload,
-            descriptor_names,
-            xb,
-        )
-        forward_kwargs["descriptors"] = descriptors
-
-    if descriptor_payload is not None and "edge_attr_dynamic" in descriptor_payload:
-        edge_attr_dynamic = descriptor_payload["edge_attr_dynamic"]
-        if not torch.is_tensor(edge_attr_dynamic):
-            edge_attr_dynamic = torch.as_tensor(edge_attr_dynamic)
-        forward_kwargs["edge_attr_dynamic"] = edge_attr_dynamic.to(
-            device=xb.device,
-            dtype=xb.dtype,
-        )
-
     return xb, y_onehot, forward_kwargs
-
-
-def _canonicalize_dataset_volcano_indices(
-    dataset,
-    *,
-    volcano_name_to_idx: dict[str, int],
-    model_key: str,
-    split_name: str,
-) -> None:
-    """Remap dataset.sample_volcano_idx to the active volcano_name_to_idx mapping."""
-    if not hasattr(dataset, "filepaths") or not hasattr(dataset, "sample_volcano_idx"):
-        return
-
-    inferred = np.asarray(
-        [
-            int(volcano_name_to_idx[infer_volcano_name_from_path(str(fp))])
-            for fp in dataset.filepaths
-        ],
-        dtype=np.int64,
-    )
-
-    current = getattr(dataset, "sample_volcano_idx", None)
-    if current is None:
-        dataset.sample_volcano_idx = inferred
-        return
-
-    current_arr = np.asarray(current, dtype=np.int64)
-    if current_arr.shape != inferred.shape:
-        raise ValueError(
-            f"[{model_key}][{split_name}] sample_volcano_idx shape {current_arr.shape} "
-            f"does not match inferred shape {inferred.shape}."
-        )
-
-    if not np.array_equal(current_arr, inferred):
-        dataset.sample_volcano_idx = inferred
-    del current_arr, inferred
 
 
 def _evaluate_unet(
@@ -348,16 +242,6 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    volcano_geom_bank, volcano_name_to_idx, volcano_order = build_volcano_geometry_bank(
-        n_stations=8
-    )
-
-    if volcano_geom_bank.shape[0] != len(volcano_order):
-        raise ValueError(
-            f"Geometry bank size ({volcano_geom_bank.shape[0]}) does not match "
-            f"volcano_order length ({len(volcano_order)})"
-        )
-
     run_manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "project_root": str(PROJECT_ROOT),
@@ -376,8 +260,6 @@ def main() -> None:
         ),
         "selected_models": selected_models,
         "fold_dirs": [str(p) for p in fold_dirs],
-        "volcano_order": list(volcano_order),
-        "volcano_name_to_idx": {k: int(v) for k, v in volcano_name_to_idx.items()},
     }
     with (output_dir / "run_manifest.json").open("w", encoding="utf-8") as f:
         json.dump(run_manifest, f, indent=2)
@@ -414,6 +296,7 @@ def main() -> None:
     for model_key in selected_models:
         spec = MODEL_SPECS[model_key]
         family = str(spec["family"])
+        trainer_kind = str(spec["trainer_kind"])
         model_kwargs = dict(spec["model_kwargs"])
         batch_size = (
             int(args.batch_size)
@@ -436,11 +319,7 @@ def main() -> None:
                         name.split("holdout_")[-1] if "holdout_" in name else "UNKNOWN"
                     )
 
-            # Determine training volcanoes
-            training_volcanoes = [v for v in volcano_order if v != held_out]
-            print(
-                f"  [FOLD {fold_idx}] Testing on: {held_out} | Training on: {', '.join(training_volcanoes)}"
-            )
+            print(f"  [FOLD {fold_idx}] Testing on: {held_out}")
 
             run_start = time.time()
             fold_out = output_dir / model_key / fold_dir.name
@@ -450,7 +329,7 @@ def main() -> None:
             for p in [ckpt_dir, reports_dir, cm_dir]:
                 p.mkdir(parents=True, exist_ok=True)
 
-            if family == "unet":
+            if trainer_kind == "2d":
                 model = spec["model_cls"](
                     in_channels=1,
                     out_channels=6,
@@ -478,64 +357,37 @@ def main() -> None:
 
                 wrapper = model
             else:
-                model = spec["model_cls"](
-                    n_stations=8,
-                    in_channels=1,
-                    out_channels=6,
-                    volcano_geom_nodes=volcano_geom_bank,
-                    **{
-                        k: v
-                        for k, v in model_kwargs.items()
-                        if k not in {"n_stations", "in_channels", "out_channels"}
-                    },
-                ).to(device)
-
-                descriptor_names = getattr(model, "descriptor_names", None)
-                model_num_desc = int(getattr(model, "num_descriptors", 0))
-                needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
-
-                def _edge_npz(npz_path: Path) -> Path:
-                    return npz_path.parent / "edge_data" / npz_path.name
+                if spec["model_cls"] is PhaseNet:
+                    model = spec["model_cls"](**model_kwargs).to(device)
+                else:
+                    model = spec["model_cls"](
+                        n_stations=8,
+                        in_channels=1,
+                        out_channels=6,
+                        **{
+                            k: v
+                            for k, v in model_kwargs.items()
+                            if k not in {"n_stations", "in_channels", "out_channels"}
+                        },
+                    ).to(device)
 
                 train_ds = CrossVolcanoLOODataset(
                     train_npz,
-                    descriptor_names=descriptor_names if model_num_desc > 0 else None,
-                    edge_data_npz=_edge_npz(train_npz) if needs_xcorr else None,
-                    return_volcano_idx=True,
-                    volcano_name_to_idx=volcano_name_to_idx,
+                    descriptor_names=None,
+                    edge_data_npz=None,
+                    return_volcano_idx=False,
                 )
                 val_ds = CrossVolcanoLOODataset(
                     val_npz,
-                    descriptor_names=descriptor_names if model_num_desc > 0 else None,
-                    edge_data_npz=_edge_npz(val_npz) if needs_xcorr else None,
-                    return_volcano_idx=True,
-                    volcano_name_to_idx=volcano_name_to_idx,
+                    descriptor_names=None,
+                    edge_data_npz=None,
+                    return_volcano_idx=False,
                 )
                 test_ds = CrossVolcanoLOODataset(
                     test_npz,
-                    descriptor_names=descriptor_names if model_num_desc > 0 else None,
-                    edge_data_npz=_edge_npz(test_npz) if needs_xcorr else None,
-                    return_volcano_idx=True,
-                    volcano_name_to_idx=volcano_name_to_idx,
-                )
-
-                _canonicalize_dataset_volcano_indices(
-                    train_ds,
-                    volcano_name_to_idx=volcano_name_to_idx,
-                    model_key=model_key,
-                    split_name="train",
-                )
-                _canonicalize_dataset_volcano_indices(
-                    val_ds,
-                    volcano_name_to_idx=volcano_name_to_idx,
-                    model_key=model_key,
-                    split_name="val",
-                )
-                _canonicalize_dataset_volcano_indices(
-                    test_ds,
-                    volcano_name_to_idx=volcano_name_to_idx,
-                    model_key=model_key,
-                    split_name="test",
+                    descriptor_names=None,
+                    edge_data_npz=None,
+                    return_volcano_idx=False,
                 )
 
                 print(
@@ -551,7 +403,6 @@ def main() -> None:
 
                 wrapper = GraphForwardWrapper(
                     model,
-                    needs_rsam=bool(model_kwargs.get("use_rsam_node_feat", False)),
                 ).to(device)
 
             optimizer = optim.Adam(
@@ -578,7 +429,7 @@ def main() -> None:
                 wrapper.train()
                 train_loss = 0.0
 
-                if family == "unet":
+                if trainer_kind == "2d":
                     for batch_idx, (xb, y_onehot, _) in enumerate(train_loader, 1):
                         xb = xb.to(device)
                         y_onehot = y_onehot.to(device)
@@ -607,7 +458,7 @@ def main() -> None:
                 else:
                     for batch_idx, batch in enumerate(train_loader, 1):
                         xb, y_onehot, forward_kwargs = _extract_graph_batch(
-                            batch, device, model
+                            batch, device
                         )
 
                         optimizer.zero_grad(set_to_none=True)
@@ -634,7 +485,7 @@ def main() -> None:
 
                 scheduler.step()
 
-                if family == "unet":
+                if trainer_kind == "2d":
                     (
                         val_f1_per_class,
                         val_mean_f1,
@@ -650,7 +501,6 @@ def main() -> None:
                         ce_weight=float(args.ce_weight),
                     )
                 else:
-                    descriptor_names = getattr(model, "descriptor_names", None)
                     (
                         val_f1_per_class,
                         val_mean_f1,
@@ -664,11 +514,7 @@ def main() -> None:
                         wrapper,
                         val_loader,
                         device,
-                        descriptor_names=(
-                            list(descriptor_names)
-                            if descriptor_names is not None
-                            else None
-                        ),
+                        descriptor_names=None,
                         return_cm=True,
                         return_val_loss=True,
                         return_event_plot_payloads=False,
@@ -737,7 +583,7 @@ def main() -> None:
             model.load_state_dict(best_ckpt["model_state_dict"])
             wrapper.eval()
 
-            if family == "unet":
+            if trainer_kind == "2d":
                 (
                     test_f1_per_class,
                     test_mean_f1,
@@ -753,7 +599,6 @@ def main() -> None:
                     ce_weight=float(args.ce_weight),
                 )
             else:
-                descriptor_names = getattr(model, "descriptor_names", None)
                 (
                     test_f1_per_class,
                     test_mean_f1,
@@ -767,9 +612,7 @@ def main() -> None:
                     wrapper,
                     test_loader,
                     device,
-                    descriptor_names=(
-                        list(descriptor_names) if descriptor_names is not None else None
-                    ),
+                    descriptor_names=None,
                     return_cm=True,
                     return_val_loss=True,
                     return_event_plot_payloads=False,

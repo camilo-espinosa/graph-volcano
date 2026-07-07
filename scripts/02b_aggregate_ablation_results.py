@@ -8,6 +8,7 @@ Default experiment root:
     results/experiments/complete_experiment
 
 The script scans <experiment_root>/ablations/* and aggregates all discovered ablation folders.
+It is metadata-agnostic and does not consume station or edge-feature artifacts.
 """
 
 from __future__ import annotations

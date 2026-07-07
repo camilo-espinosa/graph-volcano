@@ -14,14 +14,20 @@ class PhaseNet(nn.Module):
         self,
         in_channels=3,
         classes=3,
+        out_channels=None,
         depth=5,
         kernel_size=7,
         stride=4,
         filters_root=8,
         norm="std",
+        feature_dropout=0.0,
+        **kwargs,
     ):
 
         super().__init__()
+
+        if out_channels is not None:
+            classes = out_channels
 
         self.in_channels = in_channels
         self.classes = classes
@@ -30,7 +36,14 @@ class PhaseNet(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.filters_root = filters_root
+        if feature_dropout < 0.0 or feature_dropout >= 1.0:
+            raise ValueError(
+                f"feature_dropout must be in [0, 1). Got: {feature_dropout}."
+            )
+        self.feature_dropout_p = float(feature_dropout)
         self.activation = torch.relu
+        self.feature_dropout = nn.Dropout(self.feature_dropout_p)
+        self.final_dropout = nn.Dropout(self.feature_dropout_p)
 
         self.inc = nn.Conv1d(
             self.in_channels, self.filters_root, self.kernel_size, padding="same"
@@ -99,12 +112,14 @@ class PhaseNet(nn.Module):
         self.out = nn.Conv1d(last_filters, self.classes, 1, padding="same")
         self.softmax = torch.nn.Softmax(dim=1)
 
-    def forward(self, x, logits=False):
+    def forward(self, x, logits=True, **kwargs):
         x = self.activation(self.in_bn(self.inc(x)))
+        x = self.feature_dropout(x)
 
         skips = []
         for i, (conv_same, bn1, conv_down, bn2) in enumerate(self.down_branch):
             x = self.activation(bn1(conv_same(x)))
+            x = self.feature_dropout(x)
 
             if conv_down is not None:
                 skips.append(x)
@@ -116,16 +131,20 @@ class PhaseNet(nn.Module):
                     x = F.pad(x, (2, 3), "constant", 0)
 
                 x = self.activation(bn2(conv_down(x)))
+                x = self.feature_dropout(x)
 
         for i, ((conv_up, bn1, conv_same, bn2), skip) in enumerate(
             zip(self.up_branch, skips[::-1])
         ):
             x = self.activation(bn1(conv_up(x)))
+            x = self.feature_dropout(x)
             x = x[:, :, 1:-2]
 
             x = self._merge_skip(skip, x)
             x = self.activation(bn2(conv_same(x)))
+            x = self.feature_dropout(x)
 
+        x = self.final_dropout(x)
         x = self.out(x)
         if logits:
             return x

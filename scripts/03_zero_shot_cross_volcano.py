@@ -34,7 +34,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.edge_features import compute_rsam
 from utils.fold_io_utils import (
     append_row_csv,
     checkpoint_path_for_fold,
@@ -46,7 +45,6 @@ from utils.script_common import (
     parse_csv_selection,
     resolve_project_path,
 )
-from utils.station_info import get_crater_coords, get_station_coords
 from utils.train_utils import (
     GraphSAGEDataset,
     UNetPatchDataset,
@@ -58,6 +56,7 @@ from utils.train_utils import (
     f1_score_from_confusion_matrix,
     save_confusion_matrix_image,
 )
+from models.PhaseNet import PhaseNet
 
 CLASS_NAMES = ["VT", "LP", "TR", "AV", "IC"]
 ALL_CLASS_NAMES = ["BG", "VT", "LP", "TR", "AV", "IC"]
@@ -154,26 +153,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save confusion matrix image per evaluated ablation/fold/target.",
     )
-    parser.add_argument(
-        "--strict-required-features",
-        action="store_true",
-        help=(
-            "Fail if a model requires unavailable auxiliary inputs (descriptors, "
-            "envelope, dynamic edge features) instead of skipping that run."
-        ),
-    )
-    parser.add_argument(
-        "--verbose-model-stations",
-        action="store_true",
-        help="Print station metadata/order used by UNet_GraphSAGE on model creation.",
-    )
-    parser.add_argument(
-        "--no-verbose-model-stations",
-        action="store_false",
-        dest="verbose_model_stations",
-        help="Disable station metadata/order logs from UNet_GraphSAGE.",
-    )
-    parser.set_defaults(verbose_model_stations=True)
     return parser.parse_args()
 
 
@@ -235,45 +214,11 @@ def discover_loo_target_test_paths(cross_data_root: Path) -> dict[str, Path]:
     return dict(sorted(target_to_test_npz.items()))
 
 
-class GraphEvalForwardWrapper(torch.nn.Module):
-    """Inject optional RSAM node feature at inference time."""
-
-    def __init__(
-        self,
-        base_model: torch.nn.Module,
-        *,
-        needs_rsam: bool,
-    ) -> None:
-        super().__init__()
-        self.base_model = base_model
-        self.needs_rsam = bool(needs_rsam)
-
-        # compute_event_f1_iou_graphsage checks these with getattr on the model.
-        self.use_envelope = getattr(base_model, "use_envelope", False)
-        self.num_descriptors = int(getattr(base_model, "num_descriptors", 0))
-
-    def forward(self, x: torch.Tensor, **kwargs):
-        waveforms_np = None
-
-        if self.needs_rsam:
-            waveforms_np = x.detach().cpu().numpy()
-
-        if self.needs_rsam:
-            rsam_np = compute_rsam(waveforms_np)
-            kwargs["rsam"] = torch.from_numpy(rsam_np).to(
-                device=x.device, dtype=x.dtype
-            )
-
-        return self.base_model(x, **kwargs)
-
-
 def evaluate_graph_checkpoint_on_target(
     model: torch.nn.Module,
-    model_kwargs: dict[str, Any],
     test_npz_path: Path,
     batch_size: int,
     device: torch.device,
-    strict_required_features: bool,
 ) -> tuple[
     list[float],
     float,
@@ -286,46 +231,12 @@ def evaluate_graph_checkpoint_on_target(
     int,
     list[int],
 ]:
-    needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
-    edge_data_npz = test_npz_path.parent / "edge_data" / test_npz_path.name
-
-    if needs_xcorr and not edge_data_npz.exists():
-        msg = (
-            "Model requires precomputed dynamic edge features "
-            "(edge_feature_mode='delta_pos_xcorr'), but edge data file was not found: "
-            f"{edge_data_npz}. Run scripts/01b_edge_data.py first."
-        )
-        if strict_required_features:
-            raise RuntimeError(msg)
-        raise ValueError(msg)
-
-    descriptor_names = getattr(model, "descriptor_names", None)
-    model_num_descriptors = int(getattr(model, "num_descriptors", 0))
-    use_envelope = bool(getattr(model, "use_envelope", False))
-
-    if model_num_descriptors > 0 and descriptor_names is None:
-        msg = (
-            "Model requires descriptors (num_descriptors > 0) but does not expose "
-            "descriptor_names."
-        )
-        if strict_required_features:
-            raise RuntimeError(msg)
-        raise ValueError(msg)
-
     ds = GraphSAGEDataset(
         test_npz_path,
-        descriptor_names=descriptor_names if model_num_descriptors > 0 else None,
-        edge_data_npz=edge_data_npz if needs_xcorr else None,
+        descriptor_names=None,
+        edge_data_npz=None,
+        return_volcano_idx=False,
     )
-
-    if (model_num_descriptors > 0 or use_envelope) and not ds.use_descriptors:
-        msg = (
-            "Model requires descriptor payloads (descriptors or envelope), but test "
-            f"artifact has no descriptor paths: {test_npz_path}"
-        )
-        if strict_required_features:
-            raise RuntimeError(msg)
-        raise ValueError(msg)
 
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
@@ -336,10 +247,7 @@ def evaluate_graph_checkpoint_on_target(
 
     model.eval()
 
-    wrapper = GraphEvalForwardWrapper(
-        model,
-        needs_rsam=bool(model_kwargs.get("use_rsam_node_feat", False)),
-    ).to(device)
+    wrapper = model
 
     with torch.inference_mode():
         (
@@ -355,9 +263,7 @@ def evaluate_graph_checkpoint_on_target(
             wrapper,
             loader,
             device,
-            descriptor_names=(
-                list(descriptor_names) if descriptor_names is not None else None
-            ),
+            descriptor_names=None,
             return_cm=True,
             return_val_loss=True,
             return_event_plot_payloads=False,
@@ -372,7 +278,6 @@ def evaluate_graph_checkpoint_on_target(
 
     n_samples = int(len(ds))
 
-    del wrapper
     del ds, loader
     cleanup_gpu_cache()
 
@@ -477,37 +382,15 @@ def load_checkpoint_into_model(
     checkpoint_path: Path,
     device: torch.device,
     *,
-    family: str,
+    trainer_kind: str,
 ) -> None:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     ckpt_state = ckpt["model_state_dict"]
 
-    if family == "unet":
+    if trainer_kind == "2d":
         model.load_state_dict(ckpt_state)
     else:
-        # Geometry buffers are target-volcano specific; keep current model buffers.
-        geometry_buffer_keys = {
-            "station_xy",
-            "dist_to_crater",
-            "network_xy",
-            "network_dist",
-            "geom_nodes",
-            "edge_index_base",
-        }
-        state = {k: v for k, v in ckpt_state.items() if k not in geometry_buffer_keys}
-
-        emb_key = "station_id_embedding.weight"
-        if emb_key in state and emb_key in model.state_dict():
-            src = state[emb_key]
-            dst = model.state_dict()[emb_key]
-            if src.shape != dst.shape:
-                patched = dst.clone()
-                rows = min(int(src.shape[0]), int(dst.shape[0]))
-                cols = min(int(src.shape[1]), int(dst.shape[1]))
-                patched[:rows, :cols] = src[:rows, :cols]
-                state[emb_key] = patched
-
-        model.load_state_dict(state, strict=False)
+        model.load_state_dict(ckpt_state, strict=False)
 
     del ckpt
     cleanup_gpu_cache()
@@ -715,11 +598,6 @@ def main() -> None:
         experiment_root
     )
 
-    # Validate station/crater metadata availability up front.
-    for target_name in selected_targets:
-        _ = get_station_coords(target_name)
-        _ = get_crater_coords(target_name)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     run_manifest = {
@@ -738,12 +616,9 @@ def main() -> None:
         "target_test_npz": {
             target: str(target_to_test_npz[target]) for target in selected_targets
         },
-        "strict_required_features": bool(args.strict_required_features),
         "allow_missing_models": bool(args.allow_missing_models),
         "allow_missing_folds": bool(args.allow_missing_folds),
         "save_confusion_matrices": bool(args.save_confusion_matrices),
-        "expected_input_stations": int(EXPECTED_INPUT_STATIONS),
-        "verbose_model_stations": bool(args.verbose_model_stations),
         "unet_shape": {
             "init_features": int(init_features),
             "depth": int(depth),
@@ -751,9 +626,6 @@ def main() -> None:
         "unet_loss": {
             "dice_weight": float(dice_weight),
             "ce_weight": float(ce_weight),
-        },
-        "target_station_count": {
-            target: int(len(get_station_coords(target))) for target in selected_targets
         },
         "folds": [int(f) for f in FOLDS],
         "model_specs": {
@@ -821,6 +693,7 @@ def main() -> None:
 
         model_spec = MODEL_SPECS[model_key]
         family = str(model_spec["family"])
+        trainer_kind = str(model_spec["trainer_kind"])
         model_kwargs = dict(model_spec["model_kwargs"])
 
         print(f"\n[MODEL] {model_key} ({model_spec['display_name']}, family={family})")
@@ -872,65 +745,39 @@ def main() -> None:
                     else int(model_spec.get("batch_size", 16))
                 )
 
-                station_coords = get_station_coords(target_name)
-                crater_coords = get_crater_coords(target_name)
-                real_station_count = int(len(station_coords))
-
-                if family in {"graphsage", "mpnn"}:
-                    if real_station_count != EXPECTED_INPUT_STATIONS:
-                        print(
-                            f"  [INFO] target={target_name}: metadata has {real_station_count} stations; "
-                            f"model uses {EXPECTED_INPUT_STATIONS} (metadata padding/trimming applied in model)."
-                        )
-
-                    model = model_spec["model_cls"](
-                        n_stations=int(EXPECTED_INPUT_STATIONS),
-                        station_coords=station_coords,
-                        crater_coords=crater_coords,
-                        verbose=bool(args.verbose_model_stations),
-                        **model_kwargs,
-                    ).to(device)
+                if trainer_kind == "1d":
+                    if model_spec["model_cls"] is PhaseNet:
+                        model = model_spec["model_cls"](**model_kwargs).to(device)
+                    else:
+                        model = model_spec["model_cls"](
+                            n_stations=int(EXPECTED_INPUT_STATIONS),
+                            **model_kwargs,
+                        ).to(device)
                     load_checkpoint_into_model(
                         model=model,
                         checkpoint_path=ckpt_path,
                         device=device,
-                        family=family,
+                        trainer_kind=trainer_kind,
                     )
 
-                    try:
-                        (
-                            f1_per_class,
-                            mean_f1,
-                            iou_per_class,
-                            mean_iou,
-                            iou_all_classes,
-                            mean_iou_all,
-                            eval_loss,
-                            cm,
-                            n_samples,
-                            active_event_ids,
-                        ) = evaluate_graph_checkpoint_on_target(
-                            model=model,
-                            model_kwargs=model_kwargs,
-                            test_npz_path=test_npz_path,
-                            batch_size=batch_size,
-                            device=device,
-                            strict_required_features=bool(
-                                args.strict_required_features
-                            ),
-                        )
-                    except Exception as exc:
-                        if args.strict_required_features:
-                            raise
-                        print(
-                            f"  [WARN] fold={fold_id:02d} target={target_name} "
-                            f"skipped due to required-feature issue: {exc}"
-                        )
-                        del model
-                        cleanup_gpu_cache()
-                        gc.collect()
-                        continue
-                elif family == "unet":
+                    (
+                        f1_per_class,
+                        mean_f1,
+                        iou_per_class,
+                        mean_iou,
+                        iou_all_classes,
+                        mean_iou_all,
+                        eval_loss,
+                        cm,
+                        n_samples,
+                        active_event_ids,
+                    ) = evaluate_graph_checkpoint_on_target(
+                        model=model,
+                        test_npz_path=test_npz_path,
+                        batch_size=batch_size,
+                        device=device,
+                    )
+                elif trainer_kind == "2d":
                     model = model_spec["model_cls"](
                         in_channels=1,
                         out_channels=6,
@@ -952,7 +799,7 @@ def main() -> None:
                         model=model,
                         checkpoint_path=ckpt_path,
                         device=device,
-                        family=family,
+                        trainer_kind=trainer_kind,
                     )
                     (
                         f1_per_class,

@@ -12,8 +12,21 @@ import torch.nn as nn
 
 class UNet(nn.Module):
 
-    def __init__(self, in_channels=3, out_channels=1, init_features=32, depth=4):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=1,
+        init_features=32,
+        depth=4,
+        feature_dropout=0.0,
+    ):
         super(UNet, self).__init__()
+
+        if feature_dropout < 0.0 or feature_dropout >= 1.0:
+            raise ValueError(
+                f"feature_dropout must be in [0, 1). Got: {feature_dropout}."
+            )
+        self.feature_dropout_p = float(feature_dropout)
 
         features = init_features
         self.encoder_list = nn.ModuleList()
@@ -24,14 +37,22 @@ class UNet(nn.Module):
         feat_in = in_channels
         for idx in range(depth):
             feat_out = features * 2 ** (idx)
-            encoder = UNet._block(feat_in, feat_out, name=f"enc{idx}")
+            encoder = UNet._block(
+                feat_in,
+                feat_out,
+                name=f"enc{idx}",
+                feature_dropout=self.feature_dropout_p,
+            )
             feat_in = feat_out
             pool = nn.MaxPool2d(kernel_size=2, stride=2)
             self.encoder_list.append(encoder)
             self.pool_list.append(pool)
 
         self.bottleneck = UNet._block(
-            features * 2 ** (depth - 1), features * 2**depth, name="bottleneck"
+            features * 2 ** (depth - 1),
+            features * 2**depth,
+            name="bottleneck",
+            feature_dropout=self.feature_dropout_p,
         )
 
         for idx in range(depth):
@@ -41,8 +62,15 @@ class UNet(nn.Module):
             upconv = nn.ConvTranspose2d(feat_in, feat_out, kernel_size=2, stride=2)
             self.upconv_list.append(upconv)
 
-            decoder = UNet._block(feat_in, feat_out, name=f"dec{depth-idx}")
+            decoder = UNet._block(
+                feat_in,
+                feat_out,
+                name=f"dec{depth-idx}",
+                feature_dropout=self.feature_dropout_p,
+            )
             self.decoder_list.append(decoder)
+
+        self.final_dropout = nn.Dropout(self.feature_dropout_p)
 
         self.conv = nn.Conv2d(
             in_channels=features, out_channels=out_channels, kernel_size=1
@@ -62,10 +90,14 @@ class UNet(nn.Module):
             x = self.upconv_list[i](x)
             x = torch.cat((x, encodings[-(i + 1)]), dim=1)
             x = self.decoder_list[i](x)
+        x = self.final_dropout(x)
         return self.conv(x)
 
     @staticmethod
-    def _block(in_channels, features, name):
+    def _block(in_channels, features, name, feature_dropout):
+        dropout = (
+            nn.Dropout(feature_dropout) if feature_dropout > 0.0 else nn.Identity()
+        )
         return nn.Sequential(
             OrderedDict(
                 [
@@ -81,6 +113,7 @@ class UNet(nn.Module):
                     ),
                     (name + "norm1", nn.BatchNorm2d(num_features=features)),
                     (name + "relu1", nn.ReLU(inplace=True)),
+                    (name + "drop1", dropout),
                     (
                         name + "conv2",
                         nn.Conv2d(
@@ -93,6 +126,7 @@ class UNet(nn.Module):
                     ),
                     (name + "norm2", nn.BatchNorm2d(num_features=features)),
                     (name + "relu2", nn.ReLU(inplace=True)),
+                    (name + "drop2", dropout),
                 ]
             )
         )

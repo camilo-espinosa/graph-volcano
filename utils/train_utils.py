@@ -710,13 +710,13 @@ def compute_event_f1_iou_graphsage(
     Compute class-level F1 and IoU for GraphSAGE model output.
 
     Supports:
-    - [B, C, T] legacy aggregated output
-    - [B, S, C, T] per-station output (stations are averaged only for metric logic)
+    - [B, C, T] native graph-model output
+    - [B, S, C, T] legacy compatibility path; stations are reduced before metrics
 
     Returns:
         f1_per_class: list[float] len=5
         mean_f1: float
-        iou_per_class: list[float] len=5
+        iou_per_class: list[float] len=5 (from confusion matrix, same as UNet eval)
         mean_iou: float
         if return_val_loss=True, returns mean_val_loss before cm
         if return_event_plot_payloads=True, returns event_plot_payloads before cm
@@ -728,8 +728,6 @@ def compute_event_f1_iou_graphsage(
     model.eval()
     pred_label = []
     true_label = []
-    iou_scores = []
-    iou_by_true_class = {c: [] for c in event_classes}
     temporal_intersections = np.zeros(6, dtype=np.int64)
     temporal_unions = np.zeros(6, dtype=np.int64)
     val_loss_sum = 0.0
@@ -902,7 +900,7 @@ def compute_event_f1_iou_graphsage(
                 val_batch_count += 1
 
             if output.ndim == 4:
-                # New format [B, S, C, T]: aggregate stations to preserve old metric logic.
+                # Reduce station dimension before temporal postprocessing.
                 probs = torch.softmax(output, dim=2).mean(dim=1)
             elif output.ndim == 3:
                 probs = torch.softmax(output, dim=1)
@@ -911,8 +909,7 @@ def compute_event_f1_iou_graphsage(
                     f"Unexpected GraphSAGE output shape {tuple(output.shape)}; expected [B,C,T] or [B,S,C,T]."
                 )
 
-            # Window-level event class for F1/confusion:
-            # saturate [C,T] -> one-hot over classes per time, then class-sum over event window.
+            # Window-level event class for F1/confusion.
             pred_evt_list = []
             for b in range(probs.shape[0]):
                 out_np = probs[b].detach().cpu().numpy()  # [C, T]
@@ -988,9 +985,7 @@ def compute_event_f1_iou_graphsage(
             pred_label.extend(pred_evt_np.tolist())
             true_label.extend(true_evt_np.tolist())
 
-            # Legacy IoU-like score (Dice on binary event masks) per sample.
-            # Apply the exact same processing to true and predicted outputs:
-            # argmax over classes -> BG mask -> event mask.
+            # Separate multiclass temporal IoU over [BG, VT, LP, TR, AV, IC].
             true_max_idx = torch.argmax(y_onehot, dim=1)  # [B, T]
             pred_max_idx = torch.argmax(probs, dim=1)  # [B, T]
             true_max_idx_np = true_max_idx.detach().cpu().numpy().reshape(-1)
@@ -1002,24 +997,6 @@ def compute_event_f1_iou_graphsage(
                     np.logical_and(pred_mask, true_mask).sum()
                 )
                 temporal_unions[c] += int(np.logical_or(pred_mask, true_mask).sum())
-            true_bg_mask = (true_max_idx == 0).float()
-            pred_bg_mask = (pred_max_idx == 0).float()
-            true_event_mask = 1.0 - true_bg_mask
-            pred_event_mask = 1.0 - pred_bg_mask
-
-            inter = (pred_event_mask * true_event_mask).sum(dim=1)
-            denom = pred_event_mask.sum(dim=1) + true_event_mask.sum(dim=1)
-            iou_like_batch = torch.where(
-                denom > 0, (2.0 * inter) / denom, torch.zeros_like(denom)
-            )
-
-            iou_like_np = iou_like_batch.detach().cpu().numpy()
-            iou_scores.extend(iou_like_np.tolist())
-
-            for c in event_classes:
-                class_vals = iou_like_np[true_evt_np == c]
-                if class_vals.size > 0:
-                    iou_by_true_class[c].extend(class_vals.tolist())
 
             del (
                 xb,
@@ -1031,13 +1008,6 @@ def compute_event_f1_iou_graphsage(
                 true_evt_batch,
                 true_max_idx,
                 pred_max_idx,
-                true_bg_mask,
-                pred_bg_mask,
-                true_event_mask,
-                pred_event_mask,
-                inter,
-                denom,
-                iou_like_batch,
             )
             if descriptor_payload is not None:
                 del descriptor_payload
@@ -1056,10 +1026,13 @@ def compute_event_f1_iou_graphsage(
         else 0.0
     )
 
-    iou_per_class = [
-        float(np.mean(iou_by_true_class[c])) if len(iou_by_true_class[c]) > 0 else 0.0
-        for c in event_classes
-    ]
+    iou_per_class = []
+    for i in range(cm.shape[0]):
+        tp = cm[i, i]
+        fp = np.sum(cm[:, i]) - tp
+        fn = np.sum(cm[i, :]) - tp
+        denom = tp + fp + fn
+        iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
     mean_iou = (
         float(
             np.mean(
@@ -1512,6 +1485,18 @@ def compute_iou_per_class(
         else:
             ious.append(intersection / union)
     return np.array(ious)
+
+
+def compute_iou_from_cm(cm: np.ndarray) -> tuple[list[float], float]:
+    iou_per_class = []
+    for i in range(cm.shape[0]):
+        tp = cm[i, i]
+        fp = np.sum(cm[:, i]) - tp
+        fn = np.sum(cm[i, :]) - tp
+        denom = tp + fp + fn
+        iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
+    mean_iou = float(np.mean(iou_per_class)) if len(iou_per_class) > 0 else 0.0
+    return iou_per_class, mean_iou
 
 
 def f1_score_from_confusion_matrix(confusion_matrix: np.ndarray):

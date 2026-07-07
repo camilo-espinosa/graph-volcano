@@ -50,7 +50,7 @@ from utils.model_registry import MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
 
 # Default run set. Override with --models if needed.
-MODEL_KEYS_TO_RUN = ["edge_mpnn__rsam"]
+MODEL_KEYS_TO_RUN = ["edge_mpnn__no_attention"]
 
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
@@ -88,8 +88,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Comma-separated model keys to process. "
-            "Default: edge_mpnn__rsam"
+            "Comma-separated model keys to process. " "Default: edge_mpnn__no_attention"
         ),
     )
     parser.add_argument(
@@ -187,7 +186,7 @@ def main() -> None:
             ensure_fold_data_exists(fold_data_dir)
 
             fold_out_dir = model_root / f"fold_{fold_id:02d}"
-            if spec["trainer_kind"] == "unet_2d":
+            if spec["trainer_kind"] == "2d":
                 train_one_unet_fold(
                     model_key=model_key,
                     fold_id=fold_id,
