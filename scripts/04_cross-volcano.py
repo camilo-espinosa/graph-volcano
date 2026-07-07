@@ -374,19 +374,16 @@ def main() -> None:
                 train_ds = CrossVolcanoLOODataset(
                     train_npz,
                     descriptor_names=None,
-                    edge_data_npz=None,
                     return_volcano_idx=False,
                 )
                 val_ds = CrossVolcanoLOODataset(
                     val_npz,
                     descriptor_names=None,
-                    edge_data_npz=None,
                     return_volcano_idx=False,
                 )
                 test_ds = CrossVolcanoLOODataset(
                     test_npz,
                     descriptor_names=None,
-                    edge_data_npz=None,
                     return_volcano_idx=False,
                 )
 

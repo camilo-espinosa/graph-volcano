@@ -42,7 +42,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.PhaseNet import PhaseNet
-from utils.edge_features import compute_rsam
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
 from utils.script_common import parse_csv_selection, resolve_project_path
@@ -167,14 +166,6 @@ class GraphForwardWrapper(torch.nn.Module):
         self.num_descriptors = int(getattr(base_model, "num_descriptors", 0))
 
     def forward(self, x: torch.Tensor, **kwargs):
-        if self.needs_rsam:
-            waveforms_np = x.detach().cpu().numpy()
-            rsam_np = compute_rsam(waveforms_np)
-            kwargs["rsam"] = torch.from_numpy(rsam_np).to(
-                device=x.device,
-                dtype=x.dtype,
-            )
-
         return self.base_model(x, **kwargs)
 
 
@@ -884,15 +875,10 @@ def main() -> None:
 
                 descriptor_names = getattr(model, "descriptor_names", None)
                 model_num_desc = int(getattr(model, "num_descriptors", 0))
-                needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
-
-                def _edge_npz(npz_path: Path) -> Path:
-                    return npz_path.parent / "edge_data" / npz_path.name
 
                 test_ds = CrossVolcanoLOODataset(
                     test_npz,
                     descriptor_names=descriptor_names if model_num_desc > 0 else None,
-                    edge_data_npz=_edge_npz(test_npz) if needs_xcorr else None,
                     return_volcano_idx=True,
                     volcano_name_to_idx=volcano_name_to_idx,
                 )

@@ -16,7 +16,7 @@ UNET_BASE_KWARGS: dict[str, Any] = {
     "out_channels": 6,
     "init_features": 16,
     "depth": 5,
-    "feature_dropout": 0.0,
+    "feature_dropout": 0.2,
 }
 
 PHASENET_BASE_KWARGS: dict[str, Any] = {
@@ -27,7 +27,7 @@ PHASENET_BASE_KWARGS: dict[str, Any] = {
     "stride": 2,
     "filters_root": 32,
     "norm": "std",
-    "feature_dropout": 0.0,
+    "feature_dropout": 0.2,
 }
 
 GRAPHSAGE_BASE_KWARGS: dict[str, Any] = {
@@ -57,9 +57,8 @@ MPNN_BASE_KWARGS: dict[str, Any] = {
     "fusion_kernel": 9,
     "readout_mode": "attention",
     "use_bottleneck_attention": True,
-    "feature_dropout": 0.0,
+    "feature_dropout": 0.2,
 }
-
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     "unet": {
@@ -99,6 +98,152 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "sort_order": 5,
         "enabled": True,
         "aliases": ("PhaseNet",),
+    },
+    # ------------------------------------------------------------------
+    # MPNN family (geometry-free, permutation-equivariant station fusion)
+    # ------------------------------------------------------------------
+    # #0 Strict control: no station fusion anywhere, mean readout, no attention.
+    #    "Is any station machinery doing anything?" lower-bound anchor.
+    "mpnn__control_no_fusion_no_attn": {
+        "family": "mpnn",
+        "trainer_kind": "1d",
+        "display_name": "UNet_MPNN",
+        "model_cls": UNet_MPNN,
+        "model_kwargs": {
+            **MPNN_BASE_KWARGS,
+            "station_fusion_levels": [],
+            "readout_mode": "mean",
+            "use_bottleneck_attention": False,
+        },
+        "batch_size": 16,
+        "sort_order": 100,
+        "enabled": True,
+        "aliases": (),
+    },
+    # #0b Control + attention only (no station fusion).
+    #    "1D U-Net + temporal attention, no station interaction."
+    "mpnn__attn_only_no_fusion": {
+        "family": "mpnn",
+        "trainer_kind": "1d",
+        "display_name": "UNet_MPNN",
+        "model_cls": UNet_MPNN,
+        "model_kwargs": {
+            **MPNN_BASE_KWARGS,
+            "station_fusion_levels": [],
+            "readout_mode": "mean",
+            "use_bottleneck_attention": True,
+        },
+        "batch_size": 16,
+        "sort_order": 110,
+        "enabled": True,
+        "aliases": (),
+    },
+    # #2 Multi-level deep-sets fusion (invariant), mean readout, attention on.
+    #    "Does cheap invariant multi-scale fusion help?"
+    "mpnn__fusion_l012_mean": {
+        "family": "mpnn",
+        "trainer_kind": "1d",
+        "display_name": "UNet_MPNN",
+        "model_cls": UNet_MPNN,
+        "model_kwargs": {
+            **MPNN_BASE_KWARGS,
+            "station_fusion_levels": [0, 1, 2],
+            "readout_mode": "mean",
+            "use_bottleneck_attention": True,
+        },
+        "batch_size": 12,
+        "sort_order": 120,
+        "enabled": True,
+        "aliases": (),
+    },
+    # #2b Fusion + max readout. Max was our cross-volcano winner.
+    "mpnn__fusion_l012_max": {
+        "family": "mpnn",
+        "trainer_kind": "1d",
+        "display_name": "UNet_MPNN",
+        "model_cls": UNet_MPNN,
+        "model_kwargs": {
+            **MPNN_BASE_KWARGS,
+            "station_fusion_levels": [0, 1, 2],
+            "readout_mode": "max",
+            "use_bottleneck_attention": True,
+        },
+        "batch_size": 12,
+        "sort_order": 130,
+        "enabled": True,
+        "aliases": (),
+    },
+    # #5 Fusion + attention readout (THE interpretable model; base config).
+    #    station_weights exported for Paper-2 station importance.
+    "mpnn__fusion_l012_attn_readout": {
+        "family": "mpnn",
+        "trainer_kind": "1d",
+        "display_name": "UNet_MPNN",
+        "model_cls": UNet_MPNN,
+        "model_kwargs": {
+            **MPNN_BASE_KWARGS,
+            "station_fusion_levels": [0, 1, 2],
+            "readout_mode": "attention",
+            "use_bottleneck_attention": True,
+        },
+        "batch_size": 12,
+        "sort_order": 140,
+        "enabled": True,
+        "aliases": (),
+    },
+    # Fusion at ALL encoder levels — does deeper/wider fusion help or just cost?
+    "mpnn__fusion_all_levels_attn": {
+        "family": "mpnn",
+        "trainer_kind": "1d",
+        "display_name": "UNet_MPNN",
+        "model_cls": UNet_MPNN,
+        "model_kwargs": {
+            **MPNN_BASE_KWARGS,
+            "station_fusion_levels": [0, 1, 2, 3, 4],
+            "readout_mode": "attention",
+            "use_bottleneck_attention": True,
+        },
+        "batch_size": 8,
+        "sort_order": 150,
+        "enabled": True,
+        "aliases": (),
+    },
+    # Ablation: fusion + attention readout but NO temporal attention.
+    #    Isolates the bottleneck temporal-attention contribution.
+    "mpnn__fusion_l012_attn_readout_no_temporal": {
+        "family": "mpnn",
+        "trainer_kind": "1d",
+        "display_name": "UNet_MPNN",
+        "model_cls": UNet_MPNN,
+        "model_kwargs": {
+            **MPNN_BASE_KWARGS,
+            "station_fusion_levels": [0, 1, 2],
+            "readout_mode": "attention",
+            "use_bottleneck_attention": False,
+        },
+        "batch_size": 12,
+        "sort_order": 160,
+        "enabled": True,
+        "aliases": (),
+    },
+    # #7 Best-config candidate + dropout (feature + attention) for cross-volcano.
+    "mpnn__fusion_l012_attn_dropout": {
+        "family": "mpnn",
+        "trainer_kind": "1d",
+        "display_name": "UNet_MPNN",
+        "model_cls": UNet_MPNN,
+        "model_kwargs": {
+            **MPNN_BASE_KWARGS,
+            "station_fusion_levels": [0, 1, 2],
+            "readout_mode": "attention",
+            "use_bottleneck_attention": True,
+            "feature_dropout": 0.1,
+            "bottleneck_attn_dropout": 0.1,
+        },
+        "batch_size": 12,
+        "sort_order": 170,
+        "enabled": True,
+        "aliases": (),
     },
 }
 

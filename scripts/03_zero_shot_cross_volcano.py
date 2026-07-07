@@ -234,7 +234,6 @@ def evaluate_graph_checkpoint_on_target(
     ds = GraphSAGEDataset(
         test_npz_path,
         descriptor_names=None,
-        edge_data_npz=None,
         return_volcano_idx=False,
     )
 

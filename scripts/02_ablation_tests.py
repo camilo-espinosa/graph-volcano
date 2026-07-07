@@ -50,7 +50,7 @@ from utils.model_registry import MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
 
 # Default run set. Override with --models if needed.
-MODEL_KEYS_TO_RUN = ["edge_mpnn__no_attention"]
+MODEL_KEYS_TO_RUN = ["mpnn__fusion_l012_attn_readout"]
 
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {

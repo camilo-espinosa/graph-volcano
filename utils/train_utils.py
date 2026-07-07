@@ -15,7 +15,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data import BatchSampler, Dataset
 
 from . import data_utils
-from .station_info import get_default_volcano_to_index, infer_volcano_name_from_path
 from utils.model_registry import get_model_spec
 from models.UNet_GraphSAGE import UNet_GraphSAGE
 from models.UNet_MPNN import UNet_MPNN
@@ -1155,7 +1154,6 @@ class GraphSAGEDataset(Dataset):
         self,
         npz_path: Path,
         descriptor_names: Sequence[str] | str | None = None,
-        edge_data_npz: Optional[Path] = None,
         return_volcano_idx: bool = False,
         volcano_name_to_idx: Optional[dict[str, int]] = None,
     ):
@@ -1171,12 +1169,12 @@ class GraphSAGEDataset(Dataset):
         self.use_descriptors = len(self.descriptor_names) > 0
         self.return_volcano_idx = bool(return_volcano_idx)
         self.volcano_name_to_idx = (
-            dict(volcano_name_to_idx)
-            if volcano_name_to_idx is not None
-            else get_default_volcano_to_index()
+            dict(volcano_name_to_idx) if volcano_name_to_idx is not None else {}
         )
 
-        if self.return_volcano_idx:
+        if self.return_volcano_idx and volcano_name_to_idx is not None:
+            from .station_info import infer_volcano_name_from_path
+
             self.sample_volcano_idx = np.asarray(
                 [
                     int(self.volcano_name_to_idx[infer_volcano_name_from_path(str(fp))])
@@ -1189,25 +1187,6 @@ class GraphSAGEDataset(Dataset):
 
         if self.use_descriptors and self.descriptor_paths is None:
             self.descriptor_paths = self._infer_descriptor_paths(npz_path)
-
-        # Precomputed cross-correlation edge features for edge_mpnn__xcorr.
-        self._edge_attr_dynamic: Optional[np.ndarray] = None
-        if edge_data_npz is not None:
-            edge_data_npz = Path(edge_data_npz)
-            if not edge_data_npz.exists():
-                raise FileNotFoundError(
-                    f"Edge data file not found: {edge_data_npz}. "
-                    "Run scripts/01b_edge_data.py first."
-                )
-            with np.load(edge_data_npz) as ed:
-                self._edge_attr_dynamic = ed["edge_attr_dynamic"].astype(
-                    np.float32, copy=True
-                )
-            if len(self._edge_attr_dynamic) != len(self.filepaths):
-                raise ValueError(
-                    f"Edge data length {len(self._edge_attr_dynamic)} does not match "
-                    f"manifest length {len(self.filepaths)} for {edge_data_npz}."
-                )
 
     @classmethod
     def _normalize_descriptor_names(
@@ -1300,22 +1279,14 @@ class GraphSAGEDataset(Dataset):
         descriptors = (
             self._load_selected_descriptors(idx) if self.use_descriptors else None
         )
-        volcano_idx = (
-            torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
-            if self.return_volcano_idx
-            else None
-        )
-
-        if self.use_descriptors and self.return_volcano_idx:
-            return x, y_onehot, y_label, descriptors, volcano_idx
-
-        if self.use_descriptors or self._edge_attr_dynamic is not None:
-            return x, y_onehot, y_label, descriptors
-
+        output = [x, y_onehot, y_label]
+        if self.use_descriptors:
+            output.append(descriptors)
         if self.return_volcano_idx:
-            return x, y_onehot, y_label, volcano_idx
-
-        return x, y_onehot, y_label
+            output.append(
+                torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
+            )
+        return tuple(output) if len(output) > 3 else (x, y_onehot, y_label)
 
 
 class CrossVolcanoLOODataset(Dataset):
@@ -1337,7 +1308,6 @@ class CrossVolcanoLOODataset(Dataset):
         self,
         npz_path: Path,
         descriptor_names: Sequence[str] | str | None = None,
-        edge_data_npz: Optional[Path] = None,
         return_volcano_idx: bool = True,
         volcano_name_to_idx: Optional[dict[str, int]] = None,
     ):
@@ -1360,14 +1330,14 @@ class CrossVolcanoLOODataset(Dataset):
         self.use_descriptors = len(self.descriptor_names) > 0
         self.return_volcano_idx = bool(return_volcano_idx)
         self.volcano_name_to_idx = (
-            dict(volcano_name_to_idx)
-            if volcano_name_to_idx is not None
-            else get_default_volcano_to_index()
+            dict(volcano_name_to_idx) if volcano_name_to_idx is not None else {}
         )
 
         if self.manifest_volcano_idx is not None:
             self.sample_volcano_idx = self.manifest_volcano_idx
-        else:
+        elif self.return_volcano_idx and volcano_name_to_idx is not None:
+            from .station_info import infer_volcano_name_from_path
+
             self.sample_volcano_idx = np.asarray(
                 [
                     int(self.volcano_name_to_idx[infer_volcano_name_from_path(str(fp))])
@@ -1375,28 +1345,11 @@ class CrossVolcanoLOODataset(Dataset):
                 ],
                 dtype=np.int64,
             )
+        else:
+            self.sample_volcano_idx = None
 
         if self.use_descriptors and self.descriptor_paths is None:
             self.descriptor_paths = self._infer_descriptor_paths()
-
-        # Optional precomputed dynamic edge features for xcorr ablations.
-        self._edge_attr_dynamic: Optional[np.ndarray] = None
-        if edge_data_npz is not None:
-            edge_data_npz = Path(edge_data_npz)
-            if not edge_data_npz.exists():
-                raise FileNotFoundError(
-                    f"Edge data file not found: {edge_data_npz}. "
-                    "Run scripts/01b_edge_data.py first."
-                )
-            with np.load(edge_data_npz) as ed:
-                self._edge_attr_dynamic = ed["edge_attr_dynamic"].astype(
-                    np.float32, copy=True
-                )
-            if len(self._edge_attr_dynamic) != len(self.filepaths):
-                raise ValueError(
-                    f"Edge data length {len(self._edge_attr_dynamic)} does not match "
-                    f"manifest length {len(self.filepaths)} for {edge_data_npz}."
-                )
 
     def _infer_descriptor_paths(self) -> np.ndarray:
         project_root = Path(__file__).resolve().parents[1]
@@ -1447,28 +1400,14 @@ class CrossVolcanoLOODataset(Dataset):
         x = torch.from_numpy(x_raw)
         y_onehot = torch.from_numpy(y_raw)
         y_label = torch.tensor(int(self.label_ids[idx]), dtype=torch.long)
-        descriptors: dict = (
-            self._load_selected_descriptors(idx) if self.use_descriptors else {}
-        )
-        if self._edge_attr_dynamic is not None:
-            descriptors["edge_attr_dynamic"] = torch.from_numpy(
-                self._edge_attr_dynamic[idx].copy()
-            )
-        volcano_idx = (
-            torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
-            if self.return_volcano_idx
-            else None
-        )
-
-        has_payload = self.use_descriptors or self._edge_attr_dynamic is not None
-
-        if has_payload and self.return_volcano_idx:
-            return x, y_onehot, y_label, descriptors, volcano_idx
-        if has_payload:
-            return x, y_onehot, y_label, descriptors
+        output = [x, y_onehot, y_label]
+        if self.use_descriptors:
+            output.append(self._load_selected_descriptors(idx))
         if self.return_volcano_idx:
-            return x, y_onehot, y_label, volcano_idx
-        return x, y_onehot, y_label
+            output.append(
+                torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
+            )
+        return tuple(output) if len(output) > 3 else (x, y_onehot, y_label)
 
 
 def compute_iou_per_class(
@@ -1577,25 +1516,14 @@ def train_one_ablation_fold(
     for p in (checkpoints_dir, reports_dir, cm_dir, val_plot_dir):
         p.mkdir(parents=True, exist_ok=True)
 
-    # edge_feature_mode="delta_pos_xcorr" requires precomputed edge data (01b_edge_data.py).
-    _needs_xcorr = model_kwargs.get("edge_feature_mode") == "delta_pos_xcorr"
-
-    def _edge_npz(split_name: str) -> Optional[Path]:
-        if not _needs_xcorr:
-            return None
-        return fold_data_dir / "edge_data" / split_name
-
     train_ds = GraphSAGEDataset(
         fold_data_dir / "train_aug.npz",
-        edge_data_npz=_edge_npz("train_aug.npz"),
     )
     val_ds = GraphSAGEDataset(
         fold_data_dir / "val.npz",
-        edge_data_npz=_edge_npz("val.npz"),
     )
     test_ds = GraphSAGEDataset(
         fold_data_dir / "test.npz",
-        edge_data_npz=_edge_npz("test.npz"),
     )
 
     balanced_batch_sampler = BalancedBatchSampler(
@@ -1662,17 +1590,9 @@ def train_one_ablation_fold(
         for batch_idx, batch in enumerate(train_loader):
             xb = batch[0].to(device)
             y_onehot = batch[1].to(device)
-            _train_payload = batch[3] if len(batch) > 3 else None
-
-            _train_edge_attr = None
-            if _train_payload is not None and "edge_attr_dynamic" in _train_payload:
-                ead = _train_payload["edge_attr_dynamic"]
-                if not torch.is_tensor(ead):
-                    ead = torch.as_tensor(ead)
-                _train_edge_attr = ead.to(device=device, dtype=xb.dtype)
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(xb, edge_attr_dynamic=_train_edge_attr)
+            out = model(xb)
             loss, dice_component, ce_component = combined_dice_ce_loss(
                 out,
                 y_onehot,
@@ -1697,8 +1617,6 @@ def train_one_ablation_fold(
                 loss,
                 dice_component,
                 ce_component,
-                _train_payload,
-                _train_edge_attr,
             )
 
         scheduler.step()
