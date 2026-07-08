@@ -18,7 +18,7 @@ class UNet(nn.Module):
         out_channels=1,
         init_features=32,
         depth=4,
-        feature_dropout=0.0,
+        feature_dropout=0.2,
     ):
         super(UNet, self).__init__()
 

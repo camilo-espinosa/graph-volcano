@@ -38,7 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
 
-MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
+# MODEL_SPECS = dict(reversed(list(MODEL_SPECS.items())))
 
 from utils.script_common import parse_csv_selection, resolve_project_path
 from utils.train_utils import (
@@ -52,8 +52,11 @@ from utils.train_utils import (
     compute_event_f1_iou_graphsage,
     compute_summary,
     f1_score_from_confusion_matrix,
+    predicted_from_output,
+    save_confusion_matrix_image,
+    save_event_plot_payloads,
 )
-from models.PhaseNet import PhaseNet
+from utils import data_utils
 
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "data" / "prepared_data" / "cross_volcano_loo"
 DEFAULT_EXPERIMENT_ROOT = (
@@ -99,15 +102,21 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help="Optional model family filter.",
     )
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lr-final", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr-final", type=float, default=5e-6)
     parser.add_argument("--early-stop-patience", type=int, default=20)
     parser.add_argument("--dice-weight", type=float, default=0.7)
     parser.add_argument("--ce-weight", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-confusion-matrices", action="store_true")
+    parser.add_argument(
+        "--max-event-plots-per-class",
+        type=int,
+        default=20,
+        help="Max misclassified examples saved per true class on best-val-F1 epochs.",
+    )
     return parser.parse_args()
 
 
@@ -205,6 +214,77 @@ def _evaluate_unet(
         mean_loss,
         cm,
     )
+
+
+def _filter_payloads_per_class(
+    payloads: list[dict],
+    max_per_class: int,
+) -> list[dict]:
+    """Keep at most max_per_class misclassified payloads per true class."""
+    counts: dict[str, int] = {}
+    filtered = []
+    for p in payloads:
+        key = p["true_name"]
+        if counts.get(key, 0) < max_per_class:
+            filtered.append(p)
+            counts[key] = counts.get(key, 0) + 1
+    return filtered
+
+
+def _collect_unet_misclassified_plots(
+    model: torch.nn.Module,
+    npz_path: Path,
+    device: torch.device,
+    max_per_class: int,
+    class_names: list[str],
+) -> list[dict]:
+    """Collect misclassified UNet examples (one sample at a time) for event plot saving."""
+    class_map = {1.0: "VT", 2.0: "LP", 3.0: "TR", 4.0: "AV", 5.0: "IC"}
+    ds = UNetPatchDataset(npz_path, return_debug=True)
+    payloads: list[dict] = []
+    counts: dict[int, int] = {}
+    event_classes = list(class_map.keys())
+
+    model.eval()
+    with torch.inference_mode():
+        for i in range(len(ds)):
+            if all(counts.get(int(c), 0) >= max_per_class for c in event_classes):
+                break
+            x_unet, _y_onehot_2d, _y_idx, x_raw, y_raw, _x_used, _y_used, _aug_meta = ds[i]
+            true_class = int(np.argmax(y_raw[1:].sum(axis=1))) + 1
+            if counts.get(true_class, 0) >= max_per_class:
+                continue
+            xb = x_unet.unsqueeze(0).to(device)
+            out = model(xb)
+            out_probs = torch.softmax(out, dim=1).detach().cpu()
+            out_unstacked = data_utils.activation_unstacking(
+                out_probs, len_window=8192, N=256, n_classes=6
+            )
+            out_np = out_unstacked[0].numpy()
+            del xb, out, out_probs, out_unstacked
+
+            pred_class, _, _, _ = predicted_from_output(out_np, class_map)
+            if int(pred_class) == true_class:
+                continue
+
+            max_indices = np.argmax(out_np, axis=0)
+            processed_out = np.eye(out_np.shape[0], dtype=np.float32)[max_indices].T
+            payloads.append(
+                {
+                    "sample_global_idx": i,
+                    "true_evt": true_class,
+                    "pred_evt": int(pred_class),
+                    "true_name": class_names[true_class],
+                    "pred_name": class_names[int(pred_class)],
+                    "x_raw": x_raw,
+                    "out_np": out_np,
+                    "processed_out": processed_out,
+                    "y_onehot": y_raw,
+                }
+            )
+            counts[true_class] = counts.get(true_class, 0) + 1
+
+    return payloads
 
 
 def main() -> None:
@@ -326,7 +406,8 @@ def main() -> None:
             ckpt_dir = fold_out / "checkpoints"
             reports_dir = fold_out / "reports"
             cm_dir = fold_out / "confusion_matrices"
-            for p in [ckpt_dir, reports_dir, cm_dir]:
+            val_event_plots_dir = fold_out / "val_event_plots"
+            for p in [ckpt_dir, reports_dir, cm_dir, val_event_plots_dir]:
                 p.mkdir(parents=True, exist_ok=True)
 
             if trainer_kind == "2d":
@@ -357,7 +438,7 @@ def main() -> None:
 
                 wrapper = model
             else:
-                if spec["model_cls"] is PhaseNet:
+                if family == "phasenet":
                     model = spec["model_cls"](**model_kwargs).to(device)
                 else:
                     model = spec["model_cls"](
@@ -408,7 +489,7 @@ def main() -> None:
             )
             scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=max(1, int(args.epochs / 4)),
+                T_max=max(1, int(args.epochs / 5)),
                 eta_min=float(args.lr_final),
             )
 
@@ -506,6 +587,7 @@ def main() -> None:
                         _val_iou_all,
                         _val_mean_iou_all,
                         val_loss,
+                        val_event_payloads,
                         val_cm,
                     ) = compute_event_f1_iou_graphsage(
                         wrapper,
@@ -514,10 +596,10 @@ def main() -> None:
                         descriptor_names=None,
                         return_cm=True,
                         return_val_loss=True,
-                        return_event_plot_payloads=False,
+                        return_event_plot_payloads=True,
                         save_event_plots=False,
-                        max_event_plots=0,
-                        epoch=None,
+                        max_event_plots=int(args.max_event_plots_per_class) * len(CLASS_NAMES),
+                        epoch=epoch,
                     )
 
                 improved = float(val_mean_f1) > float(best_val_mean_f1)
@@ -535,7 +617,27 @@ def main() -> None:
                         },
                         ckpt_dir / "best_f1.pt",
                     )
-                    print(f"      ✓ epoch={epoch+1:3d} val_f1={val_mean_f1:.4f} [BEST]")
+                    save_confusion_matrix_image(
+                        cm=val_cm,
+                        labels=CLASS_NAMES,
+                        out_path=cm_dir / f"val_cm_best_f1_epoch_{epoch:03d}.png",
+                        title=f"Val CM - {model_key} fold {fold_idx} epoch {epoch}",
+                    )
+                    if trainer_kind == "2d":
+                        _best_plots = _collect_unet_misclassified_plots(
+                            model=model,
+                            npz_path=val_npz,
+                            device=device,
+                            max_per_class=int(args.max_event_plots_per_class),
+                            class_names=ALL_CLASS_NAMES,
+                        )
+                    else:
+                        _best_plots = _filter_payloads_per_class(
+                            val_event_payloads,
+                            max_per_class=int(args.max_event_plots_per_class),
+                        )
+                    save_event_plot_payloads(_best_plots, val_event_plots_dir, epoch=epoch)
+                    print(f"      \u2713 epoch={epoch+1:3d} val_f1={val_mean_f1:.4f} [BEST]")
                 else:
                     no_improve += 1
                     if (epoch + 1) % max(
@@ -560,6 +662,8 @@ def main() -> None:
                     break
 
                 del val_cm
+                if trainer_kind != "2d":
+                    del val_event_payloads
                 cleanup_gpu_cache()
 
             pd.DataFrame(metrics_rows).to_csv(

@@ -1,14 +1,9 @@
-import json
-from typing import Any
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from packaging import version
 
 
-class PhaseNet(nn.Module):
+class PhaseNetBottleneckAttention(nn.Module):
 
     def __init__(
         self,
@@ -21,6 +16,9 @@ class PhaseNet(nn.Module):
         filters_root=8,
         norm="std",
         feature_dropout=0.2,
+        bottleneck_attn_heads=4,
+        bottleneck_attn_dropout=0.2,
+        bottleneck_attn_ff_mult=2,
         **kwargs,
     ):
 
@@ -66,7 +64,7 @@ class PhaseNet(nn.Module):
                 bn2 = None
             else:
                 if i in [1, 2, 3]:
-                    padding = 0  # Pad manually
+                    padding = 0  # Pad manually to preserve legacy PhaseNet behavior.
                 else:
                     padding = self.kernel_size // 2
                 conv_down = nn.Conv1d(
@@ -80,6 +78,35 @@ class PhaseNet(nn.Module):
                 bn2 = nn.BatchNorm1d(filters, eps=1e-3)
 
             self.down_branch.append(nn.ModuleList([conv_same, bn1, conv_down, bn2]))
+
+        self.bottleneck_channels = int(2 ** (self.depth - 1) * self.filters_root)
+        if self.bottleneck_channels % bottleneck_attn_heads != 0:
+            raise ValueError(
+                "bottleneck channels must be divisible by bottleneck_attn_heads. "
+                f"Got C={self.bottleneck_channels}, heads={bottleneck_attn_heads}."
+            )
+
+        self.bottleneck_attn_norm1 = nn.LayerNorm(self.bottleneck_channels)
+        self.bottleneck_attn = nn.MultiheadAttention(
+            embed_dim=self.bottleneck_channels,
+            num_heads=bottleneck_attn_heads,
+            dropout=bottleneck_attn_dropout,
+            batch_first=True,
+        )
+        self.bottleneck_attn_norm2 = nn.LayerNorm(self.bottleneck_channels)
+        self.bottleneck_ff = nn.Sequential(
+            nn.Linear(
+                self.bottleneck_channels,
+                self.bottleneck_channels * bottleneck_attn_ff_mult,
+            ),
+            nn.GELU(),
+            nn.Dropout(bottleneck_attn_dropout),
+            nn.Linear(
+                self.bottleneck_channels * bottleneck_attn_ff_mult,
+                self.bottleneck_channels,
+            ),
+            nn.Dropout(bottleneck_attn_dropout),
+        )
 
         for i in range(self.depth - 1):
             filters = int(2 ** (self.depth - 2 - i) * self.filters_root)
@@ -95,22 +122,19 @@ class PhaseNet(nn.Module):
 
             self.up_branch.append(nn.ModuleList([conv_up, bn1, conv_same, bn2]))
 
-        # for i in range(self.depth - 1):
-        #     filters = int(2 ** (3 - i) * self.filters_root)
-        #     conv_up = nn.ConvTranspose1d(
-        #         last_filters, filters, self.kernel_size, self.stride, bias=False
-        #     )
-        #     last_filters = filters
-        #     bn1 = nn.BatchNorm1d(filters, eps=1e-3)
-        #     conv_same = nn.Conv1d(
-        #         2 * filters, filters, self.kernel_size, padding="same", bias=False
-        #     )
-        #     bn2 = nn.BatchNorm1d(filters, eps=1e-3)
-
-        #     self.up_branch.append(nn.ModuleList([conv_up, bn1, conv_same, bn2]))
-
         self.out = nn.Conv1d(last_filters, self.classes, 1, padding="same")
         self.softmax = torch.nn.Softmax(dim=1)
+
+    def _apply_bottleneck_attention(self, x: torch.Tensor) -> torch.Tensor:
+        # Convert [B, C, T] -> [B, T, C] for batch_first attention.
+        x_seq = x.transpose(1, 2)
+
+        x_norm = self.bottleneck_attn_norm1(x_seq)
+        x_attn, _ = self.bottleneck_attn(x_norm, x_norm, x_norm, need_weights=False)
+        x_seq = x_seq + x_attn
+        x_seq = x_seq + self.bottleneck_ff(self.bottleneck_attn_norm2(x_seq))
+
+        return x_seq.transpose(1, 2)
 
     def forward(self, x, logits=True, **kwargs):
         x = self.activation(self.in_bn(self.inc(x)))
@@ -132,6 +156,8 @@ class PhaseNet(nn.Module):
 
                 x = self.activation(bn2(conv_down(x)))
                 x = self.feature_dropout(x)
+
+        x = self._apply_bottleneck_attention(x)
 
         for i, ((conv_up, bn1, conv_same, bn2), skip) in enumerate(
             zip(self.up_branch, skips[::-1])

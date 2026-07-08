@@ -7,6 +7,7 @@ from typing import Any
 
 from models.UNet import UNet
 from models.PhaseNet import PhaseNet
+from models.PhaseNet_bottleneck_attention import PhaseNetBottleneckAttention
 from models.UNet_bottleneck_attention import UNetBottleneckAttention
 from models.UNet_GraphSAGE import UNet_GraphSAGE
 from models.UNet_MPNN import UNet_MPNN
@@ -30,6 +31,13 @@ PHASENET_BASE_KWARGS: dict[str, Any] = {
     "feature_dropout": 0.2,
 }
 
+PHASENET_BOTTLENECK_ATTENTION_BASE_KWARGS: dict[str, Any] = {
+    **PHASENET_BASE_KWARGS,
+    "bottleneck_attn_heads": 4,
+    "bottleneck_attn_dropout": 0.2,
+    "bottleneck_attn_ff_mult": 2,
+}
+
 GRAPHSAGE_BASE_KWARGS: dict[str, Any] = {
     "in_channels": 1,
     "out_channels": 6,
@@ -45,6 +53,7 @@ GRAPHSAGE_BASE_KWARGS: dict[str, Any] = {
     "use_skip_graph": True,
     "init_features": 16,
     "depth": 5,
+    "bottleneck_attn_dropout": 0.2,
 }
 
 MPNN_BASE_KWARGS: dict[str, Any] = {
@@ -58,20 +67,35 @@ MPNN_BASE_KWARGS: dict[str, Any] = {
     "readout_mode": "attention",
     "use_bottleneck_attention": True,
     "feature_dropout": 0.2,
+    "bottleneck_attn_dropout": 0.2,
+
 }
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
-    "unet": {
-        "family": "unet",
-        "trainer_kind": "2d",
-        "display_name": "UNet",
-        "model_cls": UNet,
-        "model_kwargs": deepcopy(UNET_BASE_KWARGS),
-        "batch_size": 24,
-        "sort_order": 10,
+    "phasenet_bottleneck_attention": {
+        "family": "phasenet",
+        "trainer_kind": "1d",
+        "display_name": "PhaseNetBottleneckAttention",
+        "model_cls": PhaseNetBottleneckAttention,
+        "model_kwargs": deepcopy(PHASENET_BOTTLENECK_ATTENTION_BASE_KWARGS),
+        "batch_size": 64,
+        "sort_order": 6,
         "enabled": True,
-        "aliases": (),
+        "aliases": ("PhaseNetBottleneckAttention",),
+    },    
+    "phasenet": {
+        "family": "phasenet",
+        "trainer_kind": "1d",
+        "display_name": "PhaseNet",
+        "model_cls": PhaseNet,
+        "model_kwargs": deepcopy(PHASENET_BASE_KWARGS),
+        "batch_size": 64,
+        "sort_order": 5,
+        "enabled": True,
+        "aliases": ("PhaseNet",),
     },
+
+
     "unet_bottleneck_attention": {
         "family": "unet",
         "trainer_kind": "2d",
@@ -80,25 +104,15 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {
             **UNET_BASE_KWARGS,
             "bottleneck_attn_heads": 4,
-            "bottleneck_attn_dropout": 0.0,
+            "bottleneck_attn_dropout": 0.2,
             "bottleneck_attn_ff_mult": 2,
         },
-        "batch_size": 24,
+        "batch_size": 32,
         "sort_order": 20,
         "enabled": True,
         "aliases": (),
     },
-    "phasenet": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "PhaseNet",
-        "model_cls": PhaseNet,
-        "model_kwargs": deepcopy(PHASENET_BASE_KWARGS),
-        "batch_size": 24,
-        "sort_order": 5,
-        "enabled": True,
-        "aliases": ("PhaseNet",),
-    },
+
     # ------------------------------------------------------------------
     # MPNN family (geometry-free, permutation-equivariant station fusion)
     # ------------------------------------------------------------------
@@ -115,7 +129,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "readout_mode": "mean",
             "use_bottleneck_attention": False,
         },
-        "batch_size": 16,
+        "batch_size": 24,
         "sort_order": 100,
         "enabled": True,
         "aliases": (),
@@ -133,7 +147,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "readout_mode": "mean",
             "use_bottleneck_attention": True,
         },
-        "batch_size": 16,
+        "batch_size": 24,
         "sort_order": 110,
         "enabled": True,
         "aliases": (),
@@ -151,7 +165,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "readout_mode": "mean",
             "use_bottleneck_attention": True,
         },
-        "batch_size": 12,
+        "batch_size": 16,
         "sort_order": 120,
         "enabled": True,
         "aliases": (),
@@ -168,7 +182,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "readout_mode": "max",
             "use_bottleneck_attention": True,
         },
-        "batch_size": 12,
+        "batch_size": 16,
         "sort_order": 130,
         "enabled": True,
         "aliases": (),
@@ -186,7 +200,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "readout_mode": "attention",
             "use_bottleneck_attention": True,
         },
-        "batch_size": 12,
+        "batch_size": 16,
         "sort_order": 140,
         "enabled": True,
         "aliases": (),
@@ -203,7 +217,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "readout_mode": "attention",
             "use_bottleneck_attention": True,
         },
-        "batch_size": 8,
+        "batch_size": 14,
         "sort_order": 150,
         "enabled": True,
         "aliases": (),
@@ -221,30 +235,22 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "readout_mode": "attention",
             "use_bottleneck_attention": False,
         },
-        "batch_size": 12,
+        "batch_size": 18,
         "sort_order": 160,
         "enabled": True,
         "aliases": (),
     },
-    # #7 Best-config candidate + dropout (feature + attention) for cross-volcano.
-    "mpnn__fusion_l012_attn_dropout": {
-        "family": "mpnn",
-        "trainer_kind": "1d",
-        "display_name": "UNet_MPNN",
-        "model_cls": UNet_MPNN,
-        "model_kwargs": {
-            **MPNN_BASE_KWARGS,
-            "station_fusion_levels": [0, 1, 2],
-            "readout_mode": "attention",
-            "use_bottleneck_attention": True,
-            "feature_dropout": 0.1,
-            "bottleneck_attn_dropout": 0.1,
-        },
-        "batch_size": 12,
-        "sort_order": 170,
+    "unet": {
+        "family": "unet",
+        "trainer_kind": "2d",
+        "display_name": "UNet",
+        "model_cls": UNet,
+        "model_kwargs": deepcopy(UNET_BASE_KWARGS),
+        "batch_size": 32,
+        "sort_order": 10,
         "enabled": True,
         "aliases": (),
-    },
+    },    
 }
 
 
@@ -284,7 +290,7 @@ def build_model_from_spec(model_key: str, n_classes: int = 6, **overrides):
     model_cls = spec["model_cls"]
     kwargs = dict(spec["model_kwargs"])
     kwargs.update(overrides)
-    if model_cls is PhaseNet:
+    if spec["family"] == "phasenet":
         kwargs.setdefault("classes", n_classes)
         kwargs.setdefault("in_channels", 8)
     else:

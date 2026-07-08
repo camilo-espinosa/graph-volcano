@@ -141,7 +141,7 @@ class UNet_GraphSAGE(nn.Module):
         skip_graph_levels: Optional[List[int]] = None,
         volcano_geom_nodes: Optional[torch.Tensor] = None,
         bottleneck_attn_heads: int = 4,
-        bottleneck_attn_dropout: float = 0.0,
+        bottleneck_attn_dropout: float = 0.2,
         bottleneck_attn_ff_mult: int = 2,
         verbose: bool = False,
     ):

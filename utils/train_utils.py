@@ -4,6 +4,8 @@ from pathlib import Path
 import time
 from typing import Optional, Sequence
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -501,6 +503,7 @@ def save_validation_event_plot(
     processed_out: np.ndarray,
     out_path: Path,
     title: str,
+    true_out: Optional[np.ndarray] = None,
 ):
     """Save validation debug plot with traces + raw activations + postprocessed activations."""
     class_names = ["BG", "VT", "LP", "TR", "AV", "IC"]
@@ -515,10 +518,11 @@ def save_validation_event_plot(
 
     t = np.arange(x_raw.shape[1])
     n_stations = min(8, x_raw.shape[0])
+    n_extra_panels = 3 if true_out is not None else 2
     fig, axes = plt.subplots(
-        n_stations + 2,
+        n_stations + n_extra_panels,
         1,
-        figsize=(14, 11),
+        figsize=(14, 11 + int(true_out is not None)),
         sharex=True,
         gridspec_kw={"hspace": 0.0},
     )
@@ -553,8 +557,24 @@ def save_validation_event_plot(
         )
     ax_proc.set_ylim(-0.2, 1.2)
     ax_proc.set_ylabel("proc", rotation=0, labelpad=18, fontsize=9)
-    ax_proc.set_xlabel("sample")
+    if true_out is None:
+        ax_proc.set_xlabel("sample")
     ax_proc.margins(x=0)
+
+    if true_out is not None:
+        ax_true = axes[n_stations + 2]
+        for c, cname in enumerate(class_names):
+            ax_true.plot(
+                t,
+                true_out[c],
+                lw=1.0,
+                color=class_colors[cname],
+                label=cname,
+            )
+        ax_true.set_ylim(-0.2, 1.2)
+        ax_true.set_ylabel("true", rotation=0, labelpad=18, fontsize=9)
+        ax_true.set_xlabel("sample")
+        ax_true.margins(x=0)
 
     for ax in axes[n_stations:]:
         ax.grid(alpha=0.2, linestyle="--", linewidth=0.5)
@@ -593,6 +613,7 @@ def save_event_plot_payloads(
             processed_out=payload["processed_out"],
             out_path=out_path,
             title=title,
+            true_out=payload.get("y_onehot"),
         )
         saved_count += 1
 
@@ -964,6 +985,7 @@ def compute_event_f1_iou_graphsage(
                                 "x_raw": x_raw,
                                 "out_np": out_np,
                                 "processed_out": processed_out,
+                                "y_onehot": y_onehot[b].detach().cpu().numpy(),
                             }
                         )
                     saved_plot_count += 1

@@ -41,7 +41,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.PhaseNet import PhaseNet
 from utils.fold_io_utils import append_row_csv
 from utils.model_registry import MODEL_SPECS
 from utils.script_common import parse_csv_selection, resolve_project_path
@@ -852,7 +851,7 @@ def main() -> None:
                 iou_all_classes = [np.nan] * len(ALL_CLASS_NAMES)
 
             else:
-                if spec["model_cls"] is PhaseNet:
+                if family == "phasenet":
                     model = spec["model_cls"](**model_kwargs).to(device)
                 else:
                     model = spec["model_cls"](

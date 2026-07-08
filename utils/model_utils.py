@@ -11,6 +11,7 @@ def build_model(arch: str, n_classes: int = 6, **model_kwargs):
     legacy_arch_map = {
         "UNet": "unet",
         "UNetBottleneckAttention": "unet_bottleneck_attention",
+        "PhaseNetBottleneckAttention": "phasenet_bottleneck_attention",
         "UNet_GraphSAGE": "v5_full",
         "UNet_GraphSAGE_Ablation2_MLPBackend": "ablation_2_mlp_backend",
         "UNet_GraphSAGE_Ablation3_NoMessagePassing": "ablation_3_no_message_passing",

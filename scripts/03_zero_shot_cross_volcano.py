@@ -56,7 +56,6 @@ from utils.train_utils import (
     f1_score_from_confusion_matrix,
     save_confusion_matrix_image,
 )
-from models.PhaseNet import PhaseNet
 
 CLASS_NAMES = ["VT", "LP", "TR", "AV", "IC"]
 ALL_CLASS_NAMES = ["BG", "VT", "LP", "TR", "AV", "IC"]
@@ -745,7 +744,7 @@ def main() -> None:
                 )
 
                 if trainer_kind == "1d":
-                    if model_spec["model_cls"] is PhaseNet:
+                    if family == "phasenet":
                         model = model_spec["model_cls"](**model_kwargs).to(device)
                     else:
                         model = model_spec["model_cls"](

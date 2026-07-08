@@ -165,9 +165,9 @@ class UNet_MPNN(nn.Module):
         readout_mode: Literal["mean", "max", "attention"] = "attention",
         use_bottleneck_attention: bool = True,
         bottleneck_attn_heads: int = 4,
-        bottleneck_attn_dropout: float = 0.0,
+        bottleneck_attn_dropout: float = 0.2,
         bottleneck_attn_ff_mult: int = 2,
-        feature_dropout: float = 0.0,
+        feature_dropout: float = 0.2,
         return_attention: bool = False,
     ):
         super().__init__()

@@ -19,9 +19,9 @@ class UNetBottleneckAttention(nn.Module):
         init_features=32,
         depth=4,
         bottleneck_attn_heads=4,
-        bottleneck_attn_dropout=0.0,
+        bottleneck_attn_dropout=0.2,
         bottleneck_attn_ff_mult=2,
-        feature_dropout=0.0,
+        feature_dropout=0.2,
     ):
         super().__init__()
 
