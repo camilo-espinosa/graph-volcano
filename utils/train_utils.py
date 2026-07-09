@@ -19,8 +19,7 @@ from torch.utils.data import BatchSampler, Dataset
 
 from . import data_utils
 from utils.model_registry import get_model_spec
-from models.UNet_GraphSAGE import UNet_GraphSAGE
-from models.UNet_MPNN import UNet_MPNN
+
 
 
 def dice_loss_2d(

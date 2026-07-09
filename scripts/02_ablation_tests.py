@@ -52,7 +52,7 @@ from utils.script_common import resolve_project_path
 
 # Default run set. Override with --models if needed.
 MODEL_KEYS_TO_RUN = list(MODEL_REGISTRY.keys())
-MODEL_KEYS_TO_RUN.reverse()
+# MODEL_KEYS_TO_RUN.reverse()
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
     "volcano": "NVCHVC",
@@ -64,7 +64,7 @@ CONFIG = {
     "lr_final": 1e-6,
     "dice_weight": 0.7,
     "ce_weight": 0.3,
-    "val_plot_events": 20,
+    "val_plot_events": 5,
     "save_confusion_matrix_each_epoch": True,
     "seed": 42,
 }

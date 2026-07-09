@@ -9,8 +9,7 @@ from models.UNet import UNet
 from models.PhaseNet import PhaseNet
 from models.PhaseNet_bottleneck_attention import PhaseNetBottleneckAttention
 from models.UNet_bottleneck_attention import UNetBottleneckAttention
-from models.UNet_GraphSAGE import UNet_GraphSAGE
-from models.UNet_MPNN import UNet_MPNN
+
 
 UNET_BASE_KWARGS: dict[str, Any] = {
     "in_channels": 1,
@@ -94,22 +93,22 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "enabled": True,
         "aliases": ("PhaseNet",),
     },
-    "unet_bottleneck_attention": {
-        "family": "unet",
-        "trainer_kind": "2d",
-        "display_name": "UNetBottleneckAttention",
-        "model_cls": UNetBottleneckAttention,
-        "model_kwargs": {
-            **UNET_BASE_KWARGS,
-            "bottleneck_attn_heads": 4,
-            "bottleneck_attn_dropout": 0.2,
-            "bottleneck_attn_ff_mult": 2,
-        },
-        "batch_size": 32,
-        "sort_order": 20,
-        "enabled": True,
-        "aliases": (),
-    },
+    # "unet_bottleneck_attention": {
+    #     "family": "unet",
+    #     "trainer_kind": "2d",
+    #     "display_name": "UNetBottleneckAttention",
+    #     "model_cls": UNetBottleneckAttention,
+    #     "model_kwargs": {
+    #         **UNET_BASE_KWARGS,
+    #         "bottleneck_attn_heads": 4,
+    #         "bottleneck_attn_dropout": 0.2,
+    #         "bottleneck_attn_ff_mult": 2,
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 20,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
     "unet": {
         "family": "unet",
         "trainer_kind": "2d",
