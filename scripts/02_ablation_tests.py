@@ -46,12 +46,12 @@ from utils.train_utils import (
     train_one_unet_fold,
     train_one_ablation_fold,
 )
-from utils.model_registry import MODEL_SPECS, get_model_spec
+from utils.model_registry import MODEL_REGISTRY, MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
 
 # Default run set. Override with --models if needed.
-MODEL_KEYS_TO_RUN = ["mpnn__fusion_l012_attn_readout"]
-
+MODEL_KEYS_TO_RUN = list(MODEL_REGISTRY.keys())
+MODEL_KEYS_TO_RUN.reverse()
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
     "volcano": "NVCHVC",
