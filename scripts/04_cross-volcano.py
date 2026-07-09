@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr-final", type=float, default=1e-6)
     parser.add_argument("--early-stop-patience", type=int, default=20)
     parser.add_argument("--dice-weight", type=float, default=0.7)
@@ -250,7 +250,9 @@ def _collect_unet_misclassified_plots(
         for i in range(len(ds)):
             if all(counts.get(int(c), 0) >= max_per_class for c in event_classes):
                 break
-            x_unet, _y_onehot_2d, _y_idx, x_raw, y_raw, _x_used, _y_used, _aug_meta = ds[i]
+            x_unet, _y_onehot_2d, _y_idx, x_raw, y_raw, _x_used, _y_used, _aug_meta = (
+                ds[i]
+            )
             true_class = int(np.argmax(y_raw[1:].sum(axis=1))) + 1
             if counts.get(true_class, 0) >= max_per_class:
                 continue
@@ -598,7 +600,8 @@ def main() -> None:
                         return_val_loss=True,
                         return_event_plot_payloads=True,
                         save_event_plots=False,
-                        max_event_plots=int(args.max_event_plots_per_class) * len(CLASS_NAMES),
+                        max_event_plots=int(args.max_event_plots_per_class)
+                        * len(CLASS_NAMES),
                         epoch=epoch,
                     )
 
@@ -636,8 +639,12 @@ def main() -> None:
                             val_event_payloads,
                             max_per_class=int(args.max_event_plots_per_class),
                         )
-                    save_event_plot_payloads(_best_plots, val_event_plots_dir, epoch=epoch)
-                    print(f"      \u2713 epoch={epoch+1:3d} val_f1={val_mean_f1:.4f} [BEST]")
+                    save_event_plot_payloads(
+                        _best_plots, val_event_plots_dir, epoch=epoch
+                    )
+                    print(
+                        f"      \u2713 epoch={epoch+1:3d} val_f1={val_mean_f1:.4f} [BEST]"
+                    )
                 else:
                     no_improve += 1
                     if (epoch + 1) % max(
