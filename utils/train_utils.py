@@ -5,6 +5,7 @@ import time
 from typing import Optional, Sequence
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -618,6 +619,76 @@ def save_event_plot_payloads(
         saved_count += 1
 
     return saved_count
+
+
+def collect_unet_misclassified_event_plots(
+    model: torch.nn.Module,
+    npz_path: Path,
+    device: torch.device,
+    max_per_class: int,
+    class_names: list[str],
+) -> list[dict]:
+    """Collect misclassified UNet examples for best-epoch validation plotting."""
+    if max_per_class <= 0:
+        return []
+
+    class_map = {1.0: "VT", 2.0: "LP", 3.0: "TR", 4.0: "AV", 5.0: "IC"}
+    ds = UNetPatchDataset(npz_path, return_debug=True)
+    payloads: list[dict] = []
+    counts: dict[int, int] = {}
+    event_classes = list(class_map.keys())
+
+    was_training = model.training
+    model.eval()
+    with torch.inference_mode():
+        for i in range(len(ds)):
+            if all(counts.get(int(c), 0) >= max_per_class for c in event_classes):
+                break
+
+            x_unet, _y_onehot_2d, _y_idx, x_raw, y_raw, _x_used, _y_used, _aug_meta = (
+                ds[i]
+            )
+            true_class = int(np.argmax(y_raw[1:].sum(axis=1))) + 1
+            if counts.get(true_class, 0) >= max_per_class:
+                continue
+
+            xb = x_unet.unsqueeze(0).to(device)
+            out = model(xb)
+            out_probs = torch.softmax(out, dim=1).detach().cpu()
+            out_unstacked = data_utils.activation_unstacking(
+                out_probs,
+                len_window=8192,
+                N=256,
+                n_classes=6,
+            )
+            out_np = out_unstacked[0].numpy()
+            del xb, out, out_probs, out_unstacked
+
+            pred_class, _, _, _ = predicted_from_output(out_np, class_map)
+            if int(pred_class) == true_class:
+                continue
+
+            max_indices = np.argmax(out_np, axis=0)
+            processed_out = np.eye(out_np.shape[0], dtype=np.float32)[max_indices].T
+            payloads.append(
+                {
+                    "sample_global_idx": i,
+                    "true_evt": true_class,
+                    "pred_evt": int(pred_class),
+                    "true_name": class_names[true_class],
+                    "pred_name": class_names[int(pred_class)],
+                    "x_raw": x_raw,
+                    "out_np": out_np,
+                    "processed_out": processed_out,
+                    "y_onehot": y_raw,
+                }
+            )
+            counts[true_class] = counts.get(true_class, 0) + 1
+
+    if was_training:
+        model.train()
+
+    return payloads
 
 
 class BalancedBatchSampler(BatchSampler):
@@ -1568,14 +1639,14 @@ def train_one_ablation_fold(
     else:
         model_class_name = getattr(model_class, "__name__", str(model_class))
 
-    model_kwargs_copy.pop("in_channels", None)
-    model_kwargs_copy.pop("out_channels", None)
+    if model_class_name.startswith("PhaseNet"):
+        model_kwargs_copy.setdefault("in_channels", 8)
+        model_kwargs_copy.setdefault("classes", 6)
+    else:
+        model_kwargs_copy.setdefault("in_channels", 1)
+        model_kwargs_copy.setdefault("out_channels", 6)
 
-    model = model_class(
-        in_channels=1,
-        out_channels=6,
-        **model_kwargs_copy,
-    ).to(device)
+    model = model_class(**model_kwargs_copy).to(device)
 
     model_name = (
         f"{model_class_name}_{ablation_name}_{config['volcano']}_fold_{fold_id:02d}"
@@ -1672,6 +1743,12 @@ def train_one_ablation_fold(
                 event_plot_payloads,
                 val_plot_dir,
                 epoch=epoch,
+            )
+            save_confusion_matrix_image(
+                cm=cm,
+                labels=["VT", "LP", "TR", "AV", "IC"],
+                out_path=cm_dir / "confusion_matrix_val_best_f1.png",
+                title=f"Validation Confusion Matrix - {model_name} - best_f1",
             )
             best_mean_f1 = float(mean_f1)
             best_epoch = int(epoch)
@@ -1941,7 +2018,8 @@ def train_one_unet_fold(
     checkpoints_dir = fold_out_dir / "checkpoints"
     reports_dir = fold_out_dir / "reports"
     cm_dir = fold_out_dir / "confusion_matrices"
-    for p in (checkpoints_dir, reports_dir, cm_dir):
+    val_plot_dir = fold_out_dir / "validation_event_plots"
+    for p in (checkpoints_dir, reports_dir, cm_dir, val_plot_dir):
         p.mkdir(parents=True, exist_ok=True)
 
     train_ds = UNetPatchDataset(fold_data_dir / "train_aug.npz")
@@ -1958,6 +2036,8 @@ def train_one_unet_fold(
 
     spec = get_model_spec(model_key)
     model = spec["model_cls"](**spec["model_kwargs"]).to(device)
+    len_window = int(config.get("len_window", 8192))
+    im_size = int(config.get("im_size", 256))
 
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -2026,13 +2106,33 @@ def train_one_unet_fold(
             model=model,
             dataloader=val_loader,
             device=device,
-            len_window=config["len_window"],
-            im_size=config["im_size"],
+            len_window=len_window,
+            im_size=im_size,
             config=config,
         )
 
         is_best_mean_f1_epoch = float(val_mean_f1) > float(best_mean_f1)
         if is_best_mean_f1_epoch:
+            saved_plot_count = save_event_plot_payloads(
+                collect_unet_misclassified_event_plots(
+                    model=model,
+                    npz_path=fold_data_dir / "val.npz",
+                    device=device,
+                    max_per_class=int(config.get("val_plot_events", 0)),
+                    class_names=["BG", "VT", "LP", "TR", "AV", "IC"],
+                ),
+                val_plot_dir,
+                epoch=epoch,
+            )
+            save_confusion_matrix_image(
+                cm=val_cm,
+                labels=["VT", "LP", "TR", "AV", "IC"],
+                out_path=cm_dir / "confusion_matrix_val_best_f1.png",
+                title=(
+                    f"Validation Confusion Matrix - {spec['display_name']} "
+                    f"fold {fold_id:02d} - best_f1"
+                ),
+            )
             best_mean_f1 = float(val_mean_f1)
             best_epoch = int(epoch)
             epochs_without_improvement = 0
@@ -2047,6 +2147,7 @@ def train_one_unet_fold(
                 checkpoints_dir / "best_f1.pt",
             )
         else:
+            saved_plot_count = 0
             epochs_without_improvement += 1
 
         if float(train_loss) < float(best_train_loss):
@@ -2139,7 +2240,8 @@ def train_one_unet_fold(
             f"EPOCH {epoch:03d} | train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
             f"mean_f1={val_mean_f1:.4f} mean_iou={val_mean_iou:.4f} "
             f"best_epoch={best_epoch if best_epoch >= 0 else 'NA'} "
-            f"no_improve={epochs_without_improvement}/{config['early_stop_patience']}"
+            f"no_improve={epochs_without_improvement}/{config['early_stop_patience']} "
+            f"saved_best_plots={saved_plot_count}"
         )
 
         del val_cm
@@ -2173,8 +2275,8 @@ def train_one_unet_fold(
         model=model,
         dataloader=test_loader,
         device=device,
-        len_window=config["len_window"],
-        im_size=config["im_size"],
+        len_window=len_window,
+        im_size=im_size,
         config=config,
     )
 
