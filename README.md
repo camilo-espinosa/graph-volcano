@@ -26,8 +26,8 @@ pip install -r requirements.txt
 - `scripts/02_ablation_tests.py`: runs 5-fold training for the active registry models on NVCHVC.
 - `scripts/02b_aggregate_ablation_results.py`: re-aggregates already completed ablation folds into summary/comparison tables.
 - `scripts/03_evaluate_nvchvc_station_scramble.py`: evaluates NVCHVC fold test sets with randomly scrambled station ordering.
-- `scripts/04_zero_shot_cross_volcano.py`: evaluates trained checkpoints in zero-shot mode on held-out volcano test sets.
-- `scripts/04b_zero_shot_cross_volcano_scrambled.py`: zero-shot evaluation with randomly scrambled station ordering.
+- `scripts/04_zero_shot_cross_volcano.py`: evaluates trained checkpoints in zero-shot mode on the progressive-finetuning held-out test sets.
+- `scripts/04b_zero_shot_cross_volcano_scrambled.py`: zero-shot evaluation on the same test sets with randomly scrambled station ordering.
 - `scripts/05_progressive_finetuning.py`: placeholder for the progressive finetuning workflow.
 - `scripts/06_continuous_tests.py`: placeholder for the continuous tests workflow.
 - `scripts/07_detection_heads.py`: placeholder for the detection heads workflow.
@@ -65,7 +65,7 @@ python scripts/02b_aggregate_ablation_results.py
 python scripts/03_evaluate_nvchvc_station_scramble.py
 ```
 
-### 5. Evaluate zero-shot cross-volcano performance
+### 5. Evaluate zero-shot progressive finetuning performance
 
 ```bash
 python scripts/04_zero_shot_cross_volcano.py
