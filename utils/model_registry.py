@@ -80,7 +80,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "bottleneck_attn_ff_mult": 2,
             "feature_dropout": 0.2,
         },
-        "batch_size": 24,
+        "batch_size": 32,
         "sort_order": 6,
         "enabled": True,
         "aliases": (),
@@ -208,22 +208,22 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "enabled": True,
         "aliases": (),
     },
-    "phaseno": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "PhaseNO",
-        "model_cls": PhaseNO,
-        "model_kwargs": {
-            "in_channels": 8,
-            "classes": 6,
-            "modes": 24,
-            "width": 48,
-        },
-        "batch_size": 8,
-        "sort_order": 70,
-        "enabled": True,
-        "aliases": (),
-    },
+    # "phaseno": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "PhaseNO",
+    #     "model_cls": PhaseNO,
+    #     "model_kwargs": {
+    #         "in_channels": 8,
+    #         "classes": 6,
+    #         "modes": 24,
+    #         "width": 48,
+    #     },
+    #     "batch_size": 8,
+    #     "sort_order": 70,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
 }
 
 
