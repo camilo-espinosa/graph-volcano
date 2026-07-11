@@ -64,3 +64,13 @@ models/__pycache__/PhaseNet_bottleneck_attention.cpython-311.pyc
 models/__pycache__/PhaseNet_bottleneck_attention.cpython-311.pyc
 models/__pycache__/PhaseNet_bottleneck_attention.cpython-311.pyc
 models/__pycache__/PhaseNet_permutation_invariant.cpython-311.pyc
+scripts/__pycache__/03_evaluate_nvchvc_station_scramble.cpython-311.pyc
+scripts/__pycache__/04b_zero_shot_cross_volcano_scrambled.cpython-311.pyc
+scripts/__pycache__/05_progressive_finetuning.cpython-311.pyc
+scripts/__pycache__/06_continuous_tests.cpython-311.pyc
+scripts/__pycache__/07_detection_heads.cpython-311.pyc
+scripts/__pycache__/ablation_param_counts.cpython-311.pyc
+scripts/__pycache__/cross_volcano_leave_one_out_eval_only.cpython-311.pyc
+scripts/__pycache__/cross_volcano_leave_one_out.cpython-311.pyc
+utils/__pycache__/active_eval_utils.cpython-311.pyc
+utils/__pycache__/model_utils.cpython-311.pyc

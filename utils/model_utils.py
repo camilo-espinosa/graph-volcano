@@ -12,11 +12,6 @@ def build_model(arch: str, n_classes: int = 6, **model_kwargs):
         "UNet": "unet",
         "UNetBottleneckAttention": "unet_bottleneck_attention",
         "PhaseNetBottleneckAttention": "phasenet_ba",
-        "UNet_GraphSAGE": "v5_full",
-        "UNet_GraphSAGE_Ablation2_MLPBackend": "ablation_2_mlp_backend",
-        "UNet_GraphSAGE_Ablation3_NoMessagePassing": "ablation_3_no_message_passing",
-        "UNet_GraphSAGE_Ablation7_MeanVirtualNodePooling": "ablation_7_mean_virtual_node_pool",
-        "UNet_GraphSAGE_Ablation9_NoSkipGraph": "ablation_9_no_skip_graph",
     }
     arch = legacy_arch_map.get(arch, arch)
 

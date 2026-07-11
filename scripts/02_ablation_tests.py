@@ -1,5 +1,5 @@
 """
-5-fold ablation runner for UNet_MPNN and UNet_GraphSAGE.
+5-fold ablation runner for the active model registry.
 
 How to run:
     # Run script defaults (see MODEL_KEYS_TO_RUN below)
@@ -14,9 +14,7 @@ How to run:
     # Run multiple specific ablations
     python scripts/02_ablation_tests.py --models <model_key_1>,<model_key_2>
 
-This script trains and evaluates selected ablations across stratified 5-fold CV:
-- Folds: 1..5
-- Currently configured for UNet_MPNN ablations (UNet_GraphSAGE configs commented out)
+This script trains and evaluates selected models across stratified 5-fold CV.
 
 Fold data is read from:
     data/prepared_data/NVCHVC/cv_5fold/fold_XX/{train_aug,val,test}.npz
@@ -46,17 +44,15 @@ from utils.train_utils import (
     train_one_unet_fold,
     train_one_ablation_fold,
 )
-from utils.model_registry import MODEL_REGISTRY, MODEL_SPECS, get_model_spec
-from utils.model_registry import MODEL_REGISTRY, MODEL_SPECS, get_model_spec
+from utils.model_registry import MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
 
 # Default run set. Override with --models if needed.
-MODEL_KEYS_TO_RUN = list(MODEL_REGISTRY.keys())
-# MODEL_KEYS_TO_RUN.reverse()
+MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
+MODEL_KEYS_TO_RUN.reverse()
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
     "volcano": "NVCHVC",
-    "arch": "UNet_MPNN",  # Informational; actual arch per ablation
     "batch_size": 16,
     "epochs": 100,
     "early_stop_patience": 20,
@@ -88,9 +84,7 @@ def parse_args() -> argparse.Namespace:
         "--models",
         type=str,
         default=None,
-        help=(
-            "Comma-separated model keys to process. " "Default: edge_mpnn__no_attention"
-        ),
+        help="Comma-separated model keys to process. Default: all active registry entries.",
     )
     parser.add_argument(
         "--experiment-root",
@@ -105,19 +99,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def select_model_keys(raw_models: str | None) -> list[str]:
+    available_keys = list(MODEL_SPECS.keys())
     if raw_models is None:
         candidate_names = list(MODEL_KEYS_TO_RUN)
     else:
         if raw_models.strip().lower() == "all":
-            candidate_names = list(MODEL_SPECS.keys())
+            candidate_names = list(available_keys)
         else:
             candidate_names = [x.strip() for x in raw_models.split(",") if x.strip()]
 
     selected = []
     for name in candidate_names:
-        if name not in MODEL_SPECS:
+        if name not in available_keys:
             raise ValueError(
-                f"Unknown model key '{name}'. Available: {sorted(MODEL_SPECS.keys())}"
+                f"Unknown model key '{name}'. Available: {sorted(available_keys)}"
             )
         selected.append(name)
     return selected
@@ -147,7 +142,6 @@ def main() -> None:
         "model_specs": {
             name: {
                 "display_name": spec["display_name"],
-                "family": spec["family"],
                 "trainer_kind": spec["trainer_kind"],
                 "batch_size": spec["batch_size"],
                 "model_kwargs": spec["model_kwargs"],
@@ -225,7 +219,7 @@ def main() -> None:
         )
 
     print("=" * 80)
-    print("Model-family 5-fold training complete")
+    print("Model 5-fold training complete")
     print(f"Experiment folder: {experiment_root}")
     print("Run script 02b to aggregate fold outputs and build comparison reports.")
     print("=" * 80)

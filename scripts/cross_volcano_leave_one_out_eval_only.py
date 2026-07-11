@@ -5,7 +5,7 @@ This script loads existing checkpoints and evaluates them on their corresponding
 hold-out test sets.
 
 Typical run:
-    python scripts/04b_cross-volcano.py
+    python scripts/cross_volcano_leave_one_out_eval_only.py
 
 Default checkpoint roots checked (in this order):
 - results/experiments/complete_experiment/leave-one-out

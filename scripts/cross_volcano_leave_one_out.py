@@ -2,7 +2,7 @@
 Leave-one-out cross-volcano training and evaluation.
 
 Run:
-    python scripts/04_cross-volcano.py
+    python scripts/cross_volcano_leave_one_out.py
 
 Folds:
 - train on NVCHVC+CAU+LDM, test on VCA

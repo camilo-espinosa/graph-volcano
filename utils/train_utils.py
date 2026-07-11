@@ -21,7 +21,6 @@ from . import data_utils
 from utils.model_registry import get_model_spec
 
 
-
 def dice_loss_2d(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -783,7 +782,7 @@ def compute_event_f1_iou(model, loader, device):
     return list(f1_scores), mean_f1, iou_per_class, mean_iou
 
 
-def compute_event_f1_iou_graphsage(
+def compute_event_f1_iou_multistation(
     model,
     loader,
     device,
@@ -797,7 +796,7 @@ def compute_event_f1_iou_graphsage(
     epoch: int = None,
 ):
     """
-    Compute class-level F1 and IoU for GraphSAGE model output.
+    Compute class-level F1 and IoU for 1D multi-station model output.
 
     Supports:
     - [B, C, T] native graph-model output
@@ -910,7 +909,7 @@ def compute_event_f1_iou_graphsage(
         for batch in loader:
             if not isinstance(batch, (list, tuple)) or len(batch) < 3:
                 raise ValueError(
-                    "Loader must return at least (x, y_onehot, y_label) for GraphSAGE metrics."
+                    "Loader must return at least (x, y_onehot, y_label) for multistation metrics."
                 )
 
             xb, y_onehot, y_label = batch[0], batch[1], batch[2]
@@ -996,7 +995,7 @@ def compute_event_f1_iou_graphsage(
                 probs = torch.softmax(output, dim=1)
             else:
                 raise ValueError(
-                    f"Unexpected GraphSAGE output shape {tuple(output.shape)}; expected [B,C,T] or [B,S,C,T]."
+                    f"Unexpected multistation output shape {tuple(output.shape)}; expected [B,C,T] or [B,S,C,T]."
                 )
 
             # Window-level event class for F1/confusion.
@@ -1162,12 +1161,43 @@ def compute_event_f1_iou_graphsage(
     return result
 
 
+def compute_event_f1_iou_graphsage(
+    model,
+    loader,
+    device,
+    descriptor_names: Optional[list[str]] = None,
+    return_cm: bool = False,
+    return_val_loss: bool = False,
+    return_event_plot_payloads: bool = False,
+    save_event_plots: bool = False,
+    event_plots_dir: Path = None,
+    max_event_plots: int = 30,
+    epoch: int = None,
+):
+    """Backward-compatible alias for the legacy helper name."""
+    return compute_event_f1_iou_multistation(
+        model,
+        loader,
+        device,
+        descriptor_names=descriptor_names,
+        return_cm=return_cm,
+        return_val_loss=return_val_loss,
+        return_event_plot_payloads=return_event_plot_payloads,
+        save_event_plots=save_event_plots,
+        event_plots_dir=event_plots_dir,
+        max_event_plots=max_event_plots,
+        epoch=epoch,
+    )
+
+
 class UNetPatchDataset(Dataset):
     def __init__(
         self,
         npz_path: Path,
         return_debug: bool = False,
         return_meta: bool = False,
+        scramble_stations: bool = False,
+        station_scramble_seed: int = 42,
     ):
         with np.load(npz_path) as data:
             self.filepaths = data["filepaths"].copy()
@@ -1175,15 +1205,34 @@ class UNetPatchDataset(Dataset):
             self.label_ids = data["label_ids"].astype(np.int64, copy=True)
         self.return_debug = return_debug
         self.return_meta = return_meta
+        self.scramble_stations = bool(scramble_stations)
+        self.station_scramble_seed = int(station_scramble_seed)
 
     def __len__(self):
         return len(self.filepaths)
+
+    @staticmethod
+    def _station_permutation(
+        n_stations: int,
+        idx: int,
+        base_seed: int,
+    ) -> np.ndarray:
+        rng = np.random.default_rng(int(base_seed) + int(idx))
+        return rng.permutation(int(n_stations)).astype(np.int64, copy=False)
 
     def __getitem__(self, idx):
         arr = np.load(self.filepaths[idx], mmap_mode="r")
         arr = np.array(arr, dtype=np.float32)
         x_raw = arr[:8, :]
         y_raw = arr[8:, :]
+
+        if self.scramble_stations:
+            perm = self._station_permutation(
+                n_stations=x_raw.shape[0],
+                idx=idx,
+                base_seed=self.station_scramble_seed,
+            )
+            x_raw = x_raw[perm, :]
 
         x_used, y_used = x_raw, y_raw
         aug_meta = {
@@ -1221,124 +1270,84 @@ class UNetPatchDataset(Dataset):
         return x_unet, y_onehot, y_idx
 
 
-class GraphSAGEDataset(Dataset):
-    """
-    Dataset for multi-station seismic segmentation with GraphSAGE.
+AVAILABLE_TRACE_DESCRIPTORS = (
+    "envelope",
+    "dominant_frequency",
+    "spectral_centroid",
+    "spectral_bandwidth",
+    "spectral_entropy",
+)
 
-    Returns data in [B, S, T] format without patch stacking:
-    - x: [S, T] multi-station waveforms (S=8 stations, T=8192 samples)
-    - y: [6, S, T] one-hot encoded labels (6 classes)
-    - y_idx: [S, T] class indices
 
-    Optional descriptors can be returned as stacked tensor [D, S, T], where D is
-    the number of selected descriptors.
-    """
+def _normalize_descriptor_names(
+    descriptor_names: Sequence[str] | str | None,
+) -> tuple[str, ...]:
+    if descriptor_names is None:
+        return tuple()
+    if isinstance(descriptor_names, str):
+        if descriptor_names.lower() == "all":
+            return tuple(AVAILABLE_TRACE_DESCRIPTORS)
+        names = (descriptor_names,)
+    else:
+        names = tuple(descriptor_names)
 
-    AVAILABLE_DESCRIPTORS = (
-        "envelope",
-        "dominant_frequency",
-        "spectral_centroid",
-        "spectral_bandwidth",
-        "spectral_entropy",
-    )
+    unknown = sorted(set(names) - set(AVAILABLE_TRACE_DESCRIPTORS))
+    if len(unknown) > 0:
+        raise ValueError(
+            "Unknown descriptor names: "
+            f"{unknown}. Available: {list(AVAILABLE_TRACE_DESCRIPTORS)}"
+        )
+    return tuple(names)
+
+
+def _station_permutation(
+    n_stations: int,
+    idx: int,
+    base_seed: int,
+) -> np.ndarray:
+    rng = np.random.default_rng(int(base_seed) + int(idx))
+    return rng.permutation(int(n_stations)).astype(np.int64, copy=False)
+
+
+def _permute_station_tensor(
+    tensor: torch.Tensor,
+    permutation: torch.Tensor,
+) -> torch.Tensor:
+    result = tensor
+    n_stations = int(permutation.numel())
+    if result.ndim >= 1 and int(result.shape[0]) == n_stations:
+        result = result.index_select(0, permutation)
+    if result.ndim >= 2 and int(result.shape[1]) == n_stations:
+        result = result.index_select(1, permutation)
+    return result
+
+
+def _permute_descriptor_payload(
+    descriptor_payload: dict[str, torch.Tensor],
+    permutation: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    return {
+        key: _permute_station_tensor(value, permutation)
+        for key, value in descriptor_payload.items()
+    }
+
+
+class MultiStation1DDataset(Dataset):
+    """Simple multi-station 1D dataset for PhaseNet-style models."""
 
     def __init__(
         self,
         npz_path: Path,
-        descriptor_names: Sequence[str] | str | None = None,
-        return_volcano_idx: bool = False,
-        volcano_name_to_idx: Optional[dict[str, int]] = None,
+        scramble_stations: bool = False,
+        station_scramble_seed: int = 42,
     ):
         with np.load(npz_path) as data:
             self.filepaths = data["filepaths"].copy()
-            self.descriptor_paths = (
-                data["descriptor_paths"].copy() if "descriptor_paths" in data else None
-            )
             self.labels = data["labels"].copy()
             self.label_ids = data["label_ids"].astype(np.int64, copy=True)
 
-        self.descriptor_names = self._normalize_descriptor_names(descriptor_names)
-        self.use_descriptors = len(self.descriptor_names) > 0
-        self.return_volcano_idx = bool(return_volcano_idx)
-        self.volcano_name_to_idx = (
-            dict(volcano_name_to_idx) if volcano_name_to_idx is not None else {}
-        )
-
-        if self.return_volcano_idx and volcano_name_to_idx is not None:
-            from .station_info import infer_volcano_name_from_path
-
-            self.sample_volcano_idx = np.asarray(
-                [
-                    int(self.volcano_name_to_idx[infer_volcano_name_from_path(str(fp))])
-                    for fp in self.filepaths
-                ],
-                dtype=np.int64,
-            )
-        else:
-            self.sample_volcano_idx = None
-
-        if self.use_descriptors and self.descriptor_paths is None:
-            self.descriptor_paths = self._infer_descriptor_paths(npz_path)
-
-    @classmethod
-    def _normalize_descriptor_names(
-        cls,
-        descriptor_names: Sequence[str] | str | None,
-    ) -> tuple[str, ...]:
-        if descriptor_names is None:
-            return tuple()
-        if isinstance(descriptor_names, str):
-            if descriptor_names.lower() == "all":
-                return tuple(cls.AVAILABLE_DESCRIPTORS)
-            names = (descriptor_names,)
-        else:
-            names = tuple(descriptor_names)
-
-        unknown = sorted(set(names) - set(cls.AVAILABLE_DESCRIPTORS))
-        if len(unknown) > 0:
-            raise ValueError(
-                "Unknown descriptor names: "
-                f"{unknown}. Available: {list(cls.AVAILABLE_DESCRIPTORS)}"
-            )
-        return tuple(names)
-
-    def _infer_descriptor_paths(self, npz_path: Path) -> np.ndarray:
-        """
-        Backward-compatible path inference for manifests without descriptor_paths.
-
-        Expected descriptor layout:
-            prepared/descriptors/<VOLCANO>/<class>/<event>.npz
-        """
-        npz_path = Path(npz_path)
-        volcano_name = npz_path.parent.name
-        descriptors_root = npz_path.parent.parent / "descriptors" / volcano_name
-
-        inferred = []
-        for fp in self.filepaths:
-            src = Path(str(fp))
-            if volcano_name in src.parts:
-                idx = src.parts.index(volcano_name)
-                rel = Path(*src.parts[idx + 1 :])
-            else:
-                rel = src.name
-            inferred.append(
-                str((descriptors_root / rel).with_suffix(".npz").as_posix())
-            )
-        return np.array(inferred)
-
-    def _load_selected_descriptors(self, idx: int) -> dict[str, torch.Tensor]:
-        desc_path = Path(str(self.descriptor_paths[idx]))
-        if not desc_path.exists():
-            raise FileNotFoundError(
-                f"Descriptor file not found for sample index {idx}: {desc_path}"
-            )
-
-        with np.load(desc_path, mmap_mode="r") as desc_npz:
-            desc_dict = {
-                name: torch.from_numpy(np.array(desc_npz[name], dtype=np.float32))
-                for name in self.descriptor_names
-            }
-        return desc_dict
+        self.scramble_stations = bool(scramble_stations)
+        self.station_scramble_seed = int(station_scramble_seed)
 
     def __len__(self):
         return len(self.filepaths)
@@ -1346,39 +1355,21 @@ class GraphSAGEDataset(Dataset):
     def __getitem__(self, idx):
         arr = np.load(self.filepaths[idx], mmap_mode="r")
         arr = np.array(arr, dtype=np.float32)
-        x_raw = arr[:8, :]  # [S=8, T=8192]
-        y_raw = arr[8:, :]  # [C=6, T=8192]
+        x_raw = arr[:8, :]
+        y_raw = arr[8:, :]
 
-        x_used, y_used = x_raw, y_raw
-        aug_meta = {
-            "shift": 0,
-            "did_amp": False,
-            "amp_scale": 1.0,
-            "did_noise": False,
-            "noise_std": 0.0,
-        }
-
-        # Convert to tensors without patch stacking
-        x = torch.from_numpy(x_used)  # [S=8, T=8192]
-        y = torch.from_numpy(y_used)  # [C=6, T=8192]
-
-        # Labels are same across all stations, return as [C=6, T=8192]
-        y_onehot = y  # [C=6, T=8192]
-
-        # Get class indices: [C=6, T=8192] -> [T=8192]
-        y_idx = torch.argmax(y_onehot, dim=0).long()  # [T]
-        y_label = torch.tensor(int(self.label_ids[idx]), dtype=torch.long)
-        descriptors = (
-            self._load_selected_descriptors(idx) if self.use_descriptors else None
-        )
-        output = [x, y_onehot, y_label]
-        if self.use_descriptors:
-            output.append(descriptors)
-        if self.return_volcano_idx:
-            output.append(
-                torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
+        if self.scramble_stations:
+            permutation = _station_permutation(
+                n_stations=x_raw.shape[0],
+                idx=idx,
+                base_seed=self.station_scramble_seed,
             )
-        return tuple(output) if len(output) > 3 else (x, y_onehot, y_label)
+            x_raw = x_raw[permutation, :]
+
+        x = torch.from_numpy(x_raw)
+        y_onehot = torch.from_numpy(y_raw)
+        y_label = torch.tensor(int(self.label_ids[idx]), dtype=torch.long)
+        return x, y_onehot, y_label
 
 
 class CrossVolcanoLOODataset(Dataset):
@@ -1394,7 +1385,7 @@ class CrossVolcanoLOODataset(Dataset):
     - descriptor_paths
     """
 
-    AVAILABLE_DESCRIPTORS = GraphSAGEDataset.AVAILABLE_DESCRIPTORS
+    AVAILABLE_DESCRIPTORS = AVAILABLE_TRACE_DESCRIPTORS
 
     def __init__(
         self,
@@ -1402,6 +1393,8 @@ class CrossVolcanoLOODataset(Dataset):
         descriptor_names: Sequence[str] | str | None = None,
         return_volcano_idx: bool = True,
         volcano_name_to_idx: Optional[dict[str, int]] = None,
+        scramble_stations: bool = False,
+        station_scramble_seed: int = 42,
     ):
         with np.load(npz_path) as data:
             self.filepaths = data["filepaths"].copy()
@@ -1416,14 +1409,14 @@ class CrossVolcanoLOODataset(Dataset):
                 else None
             )
 
-        self.descriptor_names = GraphSAGEDataset._normalize_descriptor_names(
-            descriptor_names
-        )
+        self.descriptor_names = _normalize_descriptor_names(descriptor_names)
         self.use_descriptors = len(self.descriptor_names) > 0
         self.return_volcano_idx = bool(return_volcano_idx)
         self.volcano_name_to_idx = (
             dict(volcano_name_to_idx) if volcano_name_to_idx is not None else {}
         )
+        self.scramble_stations = bool(scramble_stations)
+        self.station_scramble_seed = int(station_scramble_seed)
 
         if self.manifest_volcano_idx is not None:
             self.sample_volcano_idx = self.manifest_volcano_idx
@@ -1489,12 +1482,28 @@ class CrossVolcanoLOODataset(Dataset):
         x_raw = arr[:8, :]
         y_raw = arr[8:, :]
 
+        permutation_t: torch.Tensor | None = None
+        if self.scramble_stations:
+            permutation = _station_permutation(
+                n_stations=x_raw.shape[0],
+                idx=idx,
+                base_seed=self.station_scramble_seed,
+            )
+            x_raw = x_raw[permutation, :]
+            permutation_t = torch.as_tensor(permutation, dtype=torch.long)
+
         x = torch.from_numpy(x_raw)
         y_onehot = torch.from_numpy(y_raw)
         y_label = torch.tensor(int(self.label_ids[idx]), dtype=torch.long)
         output = [x, y_onehot, y_label]
         if self.use_descriptors:
-            output.append(self._load_selected_descriptors(idx))
+            descriptors = self._load_selected_descriptors(idx)
+            if permutation_t is not None:
+                descriptors = _permute_descriptor_payload(
+                    descriptors,
+                    permutation_t,
+                )
+            output.append(descriptors)
         if self.return_volcano_idx:
             output.append(
                 torch.tensor(int(self.sample_volcano_idx[idx]), dtype=torch.long)
@@ -1608,13 +1617,13 @@ def train_one_ablation_fold(
     for p in (checkpoints_dir, reports_dir, cm_dir, val_plot_dir):
         p.mkdir(parents=True, exist_ok=True)
 
-    train_ds = GraphSAGEDataset(
+    train_ds = MultiStation1DDataset(
         fold_data_dir / "train_aug.npz",
     )
-    val_ds = GraphSAGEDataset(
+    val_ds = MultiStation1DDataset(
         fold_data_dir / "val.npz",
     )
-    test_ds = GraphSAGEDataset(
+    test_ds = MultiStation1DDataset(
         fold_data_dir / "test.npz",
     )
 
@@ -1654,7 +1663,7 @@ def train_one_ablation_fold(
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=max(1, int(config["epochs"] / 4)),
+        T_max=max(1, int(config["epochs"] / 2)),
         eta_min=config["lr_final"],
     )
 
@@ -2041,7 +2050,7 @@ def train_one_unet_fold(
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=max(1, int(config["epochs"] / 4)),
+        T_max=max(1, int(config["epochs"] / 2)),
         eta_min=config["lr_final"],
     )
 
