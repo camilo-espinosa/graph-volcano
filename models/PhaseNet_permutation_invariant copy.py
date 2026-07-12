@@ -52,7 +52,8 @@ class PairConvBlock(nn.Module):
             bias=False,
         )
         self.message_bn = nn.BatchNorm1d(self.pairconv_channels, eps=1e-3)
-        self.message_dropout = nn.Dropout(dropout_p)
+        _ = dropout_p
+        self.message_dropout = nn.Identity()
 
         if self.aggregation == "attention":
             self.score_conv = nn.Conv1d(
@@ -174,7 +175,7 @@ class StationAttentionBlock(nn.Module):
         self,
         channels: int,
         heads: int = 4,
-        dropout: float = 0.2,
+        dropout: float = 0.0,
         ff_mult: int = 2,
     ):
         super().__init__()
@@ -187,16 +188,16 @@ class StationAttentionBlock(nn.Module):
         self.attn = nn.MultiheadAttention(
             embed_dim=channels,
             num_heads=heads,
-            dropout=dropout,
+            dropout=0.0,
             batch_first=True,
         )
         self.norm2 = nn.LayerNorm(channels)
         self.ff = nn.Sequential(
             nn.Linear(channels, channels * ff_mult),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Identity(),
             nn.Linear(channels * ff_mult, channels),
-            nn.Dropout(dropout),
+            nn.Identity(),
         )
 
     def forward(self, x: torch.Tensor, station_mask: torch.Tensor) -> torch.Tensor:
@@ -239,7 +240,7 @@ class PhaseNetPermutationInvariant(nn.Module):
         stride=4,
         filters_root=8,
         norm="std",
-        feature_dropout=0.2,
+        feature_dropout=0.0,
         bottleneck_attention=False,
         shared_station_encoder=False,
         station_interaction="none",
@@ -248,10 +249,10 @@ class PhaseNetPermutationInvariant(nn.Module):
         pairconv_ratio=1.0,
         station_attention_levels=None,
         bottleneck_attn_heads=4,
-        bottleneck_attn_dropout=0.2,
+        bottleneck_attn_dropout=0.0,
         bottleneck_attn_ff_mult=2,
         station_attn_heads=4,
-        station_attn_dropout=0.2,
+        station_attn_dropout=0.0,
         station_attn_ff_mult=2,
         **kwargs,
     ):
@@ -357,8 +358,8 @@ class PhaseNetPermutationInvariant(nn.Module):
 
         self.feature_dropout_p = float(feature_dropout)
         self.activation = torch.relu
-        self.feature_dropout = nn.Dropout(self.feature_dropout_p)
-        self.final_dropout = nn.Dropout(self.feature_dropout_p)
+        self.feature_dropout = nn.Identity()
+        self.final_dropout = nn.Identity()
 
         self.inc = nn.Conv1d(
             self.in_channels, self.filters_root, self.kernel_size, padding="same"
@@ -433,7 +434,7 @@ class PhaseNetPermutationInvariant(nn.Module):
         self.bottleneck_attn = nn.MultiheadAttention(
             embed_dim=self.bottleneck_channels,
             num_heads=bottleneck_attn_heads,
-            dropout=bottleneck_attn_dropout,
+            dropout=0.0,
             batch_first=True,
         )
         self.bottleneck_attn_norm2 = nn.LayerNorm(self.bottleneck_channels)
@@ -443,12 +444,12 @@ class PhaseNetPermutationInvariant(nn.Module):
                 self.bottleneck_channels * bottleneck_attn_ff_mult,
             ),
             nn.GELU(),
-            nn.Dropout(bottleneck_attn_dropout),
+            nn.Identity(),
             nn.Linear(
                 self.bottleneck_channels * bottleneck_attn_ff_mult,
                 self.bottleneck_channels,
             ),
-            nn.Dropout(bottleneck_attn_dropout),
+            nn.Identity(),
         )
 
         for i in range(self.depth - 1):

@@ -20,7 +20,7 @@ class PhaseNet(nn.Module):
         stride=4,
         filters_root=8,
         norm="std",
-        feature_dropout=0.2,
+        feature_dropout=0.0,
         **kwargs,
     ):
 
@@ -42,8 +42,8 @@ class PhaseNet(nn.Module):
             )
         self.feature_dropout_p = float(feature_dropout)
         self.activation = torch.relu
-        self.feature_dropout = nn.Dropout(self.feature_dropout_p)
-        self.final_dropout = nn.Dropout(self.feature_dropout_p)
+        self.feature_dropout = nn.Identity()
+        self.final_dropout = nn.Identity()
 
         self.inc = nn.Conv1d(
             self.in_channels, self.filters_root, self.kernel_size, padding="same"

@@ -19,9 +19,9 @@ class UNetBottleneckAttention(nn.Module):
         init_features=32,
         depth=4,
         bottleneck_attn_heads=4,
-        bottleneck_attn_dropout=0.2,
+        bottleneck_attn_dropout=0.0,
         bottleneck_attn_ff_mult=2,
-        feature_dropout=0.2,
+        feature_dropout=0.0,
     ):
         super().__init__()
 
@@ -69,7 +69,7 @@ class UNetBottleneckAttention(nn.Module):
         self.bottleneck_attn = nn.MultiheadAttention(
             embed_dim=self.bottleneck_channels,
             num_heads=bottleneck_attn_heads,
-            dropout=bottleneck_attn_dropout,
+            dropout=0.0,
             batch_first=True,
         )
         self.bottleneck_attn_norm2 = nn.LayerNorm(self.bottleneck_channels)
@@ -79,12 +79,12 @@ class UNetBottleneckAttention(nn.Module):
                 self.bottleneck_channels * bottleneck_attn_ff_mult,
             ),
             nn.GELU(),
-            nn.Dropout(bottleneck_attn_dropout),
+            nn.Identity(),
             nn.Linear(
                 self.bottleneck_channels * bottleneck_attn_ff_mult,
                 self.bottleneck_channels,
             ),
-            nn.Dropout(bottleneck_attn_dropout),
+            nn.Identity(),
         )
 
         for idx in range(depth):
@@ -102,7 +102,7 @@ class UNetBottleneckAttention(nn.Module):
             )
             self.decoder_list.append(decoder)
 
-        self.final_dropout = nn.Dropout(self.feature_dropout_p)
+        self.final_dropout = nn.Identity()
 
         self.conv = nn.Conv2d(
             in_channels=features, out_channels=out_channels, kernel_size=1
@@ -139,9 +139,8 @@ class UNetBottleneckAttention(nn.Module):
 
     @staticmethod
     def _block(in_channels, features, name, feature_dropout):
-        dropout = (
-            nn.Dropout(feature_dropout) if feature_dropout > 0.0 else nn.Identity()
-        )
+        _ = feature_dropout
+        dropout = nn.Identity()
         return nn.Sequential(
             OrderedDict(
                 [

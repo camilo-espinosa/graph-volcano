@@ -49,7 +49,7 @@ from utils.script_common import resolve_project_path
 
 # Default run set. Override with --models if needed.
 MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
-MODEL_KEYS_TO_RUN.reverse()
+# MODEL_KEYS_TO_RUN.reverse()
 # ------------------------------- HYPERPARAMETERS --------------------------------
 CONFIG = {
     "volcano": "NVCHVC",

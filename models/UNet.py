@@ -18,7 +18,7 @@ class UNet(nn.Module):
         out_channels=1,
         init_features=32,
         depth=4,
-        feature_dropout=0.2,
+        feature_dropout=0.0,
     ):
         super(UNet, self).__init__()
 
@@ -70,7 +70,7 @@ class UNet(nn.Module):
             )
             self.decoder_list.append(decoder)
 
-        self.final_dropout = nn.Dropout(self.feature_dropout_p)
+        self.final_dropout = nn.Identity()
 
         self.conv = nn.Conv2d(
             in_channels=features, out_channels=out_channels, kernel_size=1
@@ -95,9 +95,8 @@ class UNet(nn.Module):
 
     @staticmethod
     def _block(in_channels, features, name, feature_dropout):
-        dropout = (
-            nn.Dropout(feature_dropout) if feature_dropout > 0.0 else nn.Identity()
-        )
+        _ = feature_dropout
+        dropout = nn.Identity()
         return nn.Sequential(
             OrderedDict(
                 [

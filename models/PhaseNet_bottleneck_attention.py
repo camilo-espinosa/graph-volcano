@@ -15,9 +15,9 @@ class PhaseNetBottleneckAttention(nn.Module):
         stride=4,
         filters_root=8,
         norm="std",
-        feature_dropout=0.2,
+        feature_dropout=0.0,
         bottleneck_attn_heads=4,
-        bottleneck_attn_dropout=0.2,
+        bottleneck_attn_dropout=0.0,
         bottleneck_attn_ff_mult=2,
         **kwargs,
     ):
@@ -40,8 +40,8 @@ class PhaseNetBottleneckAttention(nn.Module):
             )
         self.feature_dropout_p = float(feature_dropout)
         self.activation = torch.relu
-        self.feature_dropout = nn.Dropout(self.feature_dropout_p)
-        self.final_dropout = nn.Dropout(self.feature_dropout_p)
+        self.feature_dropout = nn.Identity()
+        self.final_dropout = nn.Identity()
 
         self.inc = nn.Conv1d(
             self.in_channels, self.filters_root, self.kernel_size, padding="same"
@@ -90,7 +90,7 @@ class PhaseNetBottleneckAttention(nn.Module):
         self.bottleneck_attn = nn.MultiheadAttention(
             embed_dim=self.bottleneck_channels,
             num_heads=bottleneck_attn_heads,
-            dropout=bottleneck_attn_dropout,
+            dropout=0.0,
             batch_first=True,
         )
         self.bottleneck_attn_norm2 = nn.LayerNorm(self.bottleneck_channels)
@@ -100,12 +100,12 @@ class PhaseNetBottleneckAttention(nn.Module):
                 self.bottleneck_channels * bottleneck_attn_ff_mult,
             ),
             nn.GELU(),
-            nn.Dropout(bottleneck_attn_dropout),
+            nn.Identity(),
             nn.Linear(
                 self.bottleneck_channels * bottleneck_attn_ff_mult,
                 self.bottleneck_channels,
             ),
-            nn.Dropout(bottleneck_attn_dropout),
+            nn.Identity(),
         )
 
         for i in range(self.depth - 1):
