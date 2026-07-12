@@ -196,7 +196,8 @@ class StationAttentionBlock(nn.Module):
         return x + station_update
 
 
-class PhaseNetPermutationInvariant(nn.Module):
+class MuSSeg(nn.Module):
+    """MuSSeg standalone model with optional shared-station permutation-invariant path."""
 
     def __init__(
         self,
@@ -587,7 +588,3 @@ class PhaseNetPermutationInvariant(nn.Module):
         return self._forward_joint(x, logits=logits)
 
 
-class MuSSeg(PhaseNetPermutationInvariant):
-    """MuSSeg model entry point with permutation-invariant shared-station support."""
-
-    pass

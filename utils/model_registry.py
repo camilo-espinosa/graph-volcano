@@ -6,8 +6,10 @@ from copy import deepcopy
 from typing import Any
 
 from models.PhaseNO import PhaseNO
+from models.PhaseNet import PhaseNet
 from models.PhaseNet_bottleneck_attention import PhaseNetBottleneckAttention
-from models.MuSSeg import MuSSeg, PhaseNetPermutationInvariant
+from models.MuSSeg import MuSSeg
+from models.PhaseNet_permutation_invariant import PhaseNetPermutationInvariant
 from models.UNet import UNet
 from models.UNet_bottleneck_attention import UNetBottleneckAttention
 
@@ -48,72 +50,46 @@ PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS: dict[str, Any] = {
 }
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
-    "unet": {
-        "family": "unet",
-        "trainer_kind": "2d",
-        "display_name": "UNet",
-        "model_cls": UNet,
-        "model_kwargs": {
-            "in_channels": 1,
-            "out_channels": 6,
-            "init_features": 16,
-            "depth": 5,
-        },
-        "batch_size": 32,
-        "sort_order": 5,
-        "enabled": True,
-        "aliases": (),
-    },
-    "unet_attention": {
-        "family": "unet",
-        "trainer_kind": "2d",
-        "display_name": "UNetBottleneckAttention",
-        "model_cls": UNetBottleneckAttention,
-        "model_kwargs": {
-            "in_channels": 1,
-            "out_channels": 6,
-            "init_features": 16,
-            "depth": 5,
-            "bottleneck_attn_heads": 4,
-            "bottleneck_attn_dropout": 0.2,
-            "bottleneck_attn_ff_mult": 2,
-            "feature_dropout": 0.2,
-        },
-        "batch_size": 32,
-        "sort_order": 6,
-        "enabled": True,
-        "aliases": (),
-    },
-    # "phasenet_ba": {
+    # "phasenet": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "PhaseNet",
+    #     "model_cls": PhaseNet,
+    #     "model_kwargs": deepcopy(PHASENET_BASE_KWARGS),
+    #     "batch_size": 64,
+    #     "sort_order": 10,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "phasenet_bottleneck_attention": {
     #     "family": "phasenet",
     #     "trainer_kind": "1d",
     #     "display_name": "PhaseNetBottleneckAttention",
     #     "model_cls": PhaseNetBottleneckAttention,
     #     "model_kwargs": deepcopy(PHASENET_BOTTLENECK_ATTENTION_BASE_KWARGS),
     #     "batch_size": 64,
-    #     "sort_order": 10,
+    #     "sort_order": 13,
     #     "enabled": True,
-    #     "aliases": ("PhaseNetBottleneckAttention", "phasenet_pi_ba"),
+    #     "aliases": ("phasenet_ba",),
     # },
-    # "phasenet_pi_se_ba": {
+    # "phasenet_ba_fr24": {
     #     "family": "phasenet",
     #     "trainer_kind": "1d",
-    #     "display_name": "PhaseNetPI_SharedEncoder_BottleneckAttention",
-    #     "model_cls": PhaseNetPermutationInvariant,
+    #     "display_name": "PhaseNetBottleneckAttention_FR24",
+    #     "model_cls": PhaseNetBottleneckAttention,
     #     "model_kwargs": {
-    #         **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
-    #         "bottleneck_attention": True,
-    #         "shared_station_encoder": True,
+    #         **deepcopy(PHASENET_BOTTLENECK_ATTENTION_BASE_KWARGS),
+    #         "filters_root": 24,
     #     },
-    #     "batch_size": 20,
-    #     "sort_order": 20,
+    #     "batch_size": 64,
+    #     "sort_order": 30,
     #     "enabled": True,
-    #     "aliases": ("phasenet_pi_shared_encoder_bottleneck_attention",),
+    #     "aliases": (),
     # },
-    "musseg_ablation_pi_se_ba": {
+    "musseg_pi_se_ba": {
         "family": "phasenet",
         "trainer_kind": "1d",
-        "display_name": "MuSSeg_Ablation_PI_SE_BA",
+        "display_name": "MuSSeg_PI_SE_BA",
         "model_cls": MuSSeg,
         "model_kwargs": {
             **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
@@ -121,63 +97,49 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "shared_station_encoder": True,
         },
         "batch_size": 20,
-        "sort_order": 26,
-        "enabled": True,
-        "aliases": ("musseg_pi_se_ba",),
-    },
-    "musseg_ablation_fr16": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "MuSSeg_Ablation_FR16",
-        "model_cls": MuSSeg,
-        "model_kwargs": {
-            **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
-            "filters_root": 16,
-            "bottleneck_attention": True,
-            "shared_station_encoder": False,
-        },
-        "batch_size": 84,
-        "sort_order": 25,
-        "enabled": True,
-        "aliases": ("musseg_fr16",),
-    },
-    "phasenet_ba_fr16": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "PhaseNetBottleneckAttention_FR16",
-        "model_cls": PhaseNetBottleneckAttention,
-        "model_kwargs": {
-            **deepcopy(PHASENET_BOTTLENECK_ATTENTION_BASE_KWARGS),
-            "filters_root": 16,
-        },
-        "batch_size": 84,
-        "sort_order": 30,
+        "sort_order": 20,
         "enabled": True,
         "aliases": (),
     },
-    # "phasenet_pi_se_lpc_sum_ba": {
-    #     "family": "phasenet",
-    #     "trainer_kind": "1d",
-    #     "display_name": "PhaseNetPI_Shared_LatePairConvSum_BottleneckAttention",
-    #     "model_cls": PhaseNetPermutationInvariant,
-    #     "model_kwargs": {
-    #         **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
-    #         "bottleneck_attention": True,
-    #         "shared_station_encoder": True,
-    #         "station_interaction": "late_pairconv",
-    #         "pairconv_aggregation": "sum",
-    #         "pairconv_ratio": 0.25,
-    #     },
-    #     "batch_size": 12,
-    #     "sort_order": 40,
-    #     "enabled": True,
-    #     "aliases": (),
-    # },
-    "phasenet_pi_se_lpc_attn_ba": {
+    "musseg_fr24": {
         "family": "phasenet",
         "trainer_kind": "1d",
-        "display_name": "PhaseNetPI_Shared_LatePairConvAttention_BottleneckAttention",
-        "model_cls": PhaseNetPermutationInvariant,
+        "display_name": "MuSSeg_FR24",
+        "model_cls": MuSSeg,
+        "model_kwargs": {
+            **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
+            "filters_root": 24,
+            "bottleneck_attention": True,
+            "shared_station_encoder": False,
+        },
+        "batch_size": 16,
+        "sort_order": 25,
+        "enabled": True,
+        "aliases": (),
+    },
+    "musseg_pi_se_lpc_sum_ba": {
+        "family": "phasenet",
+        "trainer_kind": "1d",
+        "display_name": "MuSSeg_PI_SE_LatePairConvSum_BA",
+        "model_cls": MuSSeg,
+        "model_kwargs": {
+            **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
+            "bottleneck_attention": True,
+            "shared_station_encoder": True,
+            "station_interaction": "late_pairconv",
+            "pairconv_aggregation": "sum",
+            "pairconv_ratio": 0.25,
+        },
+        "batch_size": 12,
+        "sort_order": 40,
+        "enabled": True,
+        "aliases": (),
+    },
+    "musseg_pi_se_lpc_attn_ba": {
+        "family": "phasenet",
+        "trainer_kind": "1d",
+        "display_name": "MuSSeg_PI_SE_LatePairConvAttention_BA",
+        "model_cls": MuSSeg,
         "model_kwargs": {
             **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
             "bottleneck_attention": True,
@@ -191,11 +153,11 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "enabled": True,
         "aliases": (),
     },
-    "phasenet_pi_se_lsa_ba": {
+    "musseg_pi_se_lsa_ba": {
         "family": "phasenet",
         "trainer_kind": "1d",
-        "display_name": "PhaseNetPI_Shared_LateStationAttention_BottleneckAttention",
-        "model_cls": PhaseNetPermutationInvariant,
+        "display_name": "MuSSeg_PI_SE_LateStationAttention_BA",
+        "model_cls": MuSSeg,
         "model_kwargs": {
             **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
             "bottleneck_attention": True,
@@ -223,6 +185,43 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     "enabled": True,
     #     "aliases": (),
     # },
+    # "unet": {
+    #     "family": "unet",
+    #     "trainer_kind": "2d",
+    #     "display_name": "UNet",
+    #     "model_cls": UNet,
+    #     "model_kwargs": {
+    #         "in_channels": 1,
+    #         "out_channels": 6,
+    #         "init_features": 16,
+    #         "depth": 5,
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 5,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "unet_attention": {
+    #     "family": "unet",
+    #     "trainer_kind": "2d",
+    #     "display_name": "UNetBottleneckAttention",
+    #     "model_cls": UNetBottleneckAttention,
+    #     "model_kwargs": {
+    #         "in_channels": 1,
+    #         "out_channels": 6,
+    #         "init_features": 16,
+    #         "depth": 5,
+    #         "bottleneck_attn_heads": 4,
+    #         "bottleneck_attn_dropout": 0.2,
+    #         "bottleneck_attn_ff_mult": 2,
+    #         "feature_dropout": 0.2,
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 6,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+  
 }
 
 
