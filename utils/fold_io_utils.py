@@ -11,6 +11,14 @@ def checkpoint_path_for_fold(root: Path, fold_id: int, checkpoint_name: str = "b
     return root / f"fold_{fold_id:02d}" / "checkpoints" / checkpoint_name
 
 
+def training_fold_summary_path(root: Path, fold_id: int) -> Path:
+    return root / f"fold_{fold_id:02d}" / "reports" / "fold_summary.json"
+
+
+def is_training_fold_complete(root: Path, fold_id: int) -> bool:
+    return training_fold_summary_path(root, fold_id).exists()
+
+
 def load_fold_summary(
     root: Path,
     fold_id: int,

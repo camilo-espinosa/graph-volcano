@@ -21,6 +21,10 @@ Fold data is read from:
 
 Results are written under:
     results/experiments/EXP_<timestamp>_NVCHVC_5fold/
+
+If you point --experiment-root at an existing experiment folder, completed
+folds are skipped automatically by looking for reports/fold_summary.json.
+Use --rerun-completed-folds to force all folds to run again.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from utils.train_utils import (
     train_one_unet_fold,
     train_one_ablation_fold,
 )
+from utils.fold_io_utils import is_training_fold_complete
 from utils.model_registry import MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
 
@@ -94,6 +99,11 @@ def parse_args() -> argparse.Namespace:
             "Experiment root directory (relative paths are resolved from project root). "
             "Default: a new timestamped folder under results/experiments/."
         ),
+    )
+    parser.add_argument(
+        "--rerun-completed-folds",
+        action="store_true",
+        help="Do not skip folds that already have reports/fold_summary.json.",
     )
     return parser.parse_args()
 
@@ -168,6 +178,10 @@ def main() -> None:
     print(f"Experiment root: {experiment_root}")
     print(f"Device: {device}")
     print(f"Models to run ({len(selected)}): {selected}")
+    if args.rerun_completed_folds:
+        print("Completed folds will be rerun.")
+    else:
+        print("Completed folds will be skipped when fold summaries already exist.")
 
     for model_key in selected:
         spec = selected_specs[model_key]
@@ -176,7 +190,32 @@ def main() -> None:
         model_config = dict(CONFIG)
         model_config["batch_size"] = int(spec["batch_size"] or CONFIG["batch_size"])
 
+        completed_folds = []
+        remaining_folds = []
         for fold_id in FOLDS:
+            if not args.rerun_completed_folds and is_training_fold_complete(
+                model_root,
+                fold_id,
+            ):
+                completed_folds.append(fold_id)
+            else:
+                remaining_folds.append(fold_id)
+
+        if completed_folds:
+            print(
+                f"[{model_key}] Skipping completed folds: "
+                f"{[int(x) for x in completed_folds]}"
+            )
+        if remaining_folds:
+            print(
+                f"[{model_key}] Remaining folds to run: "
+                f"{[int(x) for x in remaining_folds]}"
+            )
+        else:
+            print(f"[{model_key}] All folds already completed; nothing to run.")
+            continue
+
+        for fold_id in remaining_folds:
             fold_data_dir = DATA_ROOT / f"fold_{fold_id:02d}"
             ensure_fold_data_exists(fold_data_dir)
 
