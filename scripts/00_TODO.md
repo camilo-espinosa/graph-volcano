@@ -1,5 +1,5 @@
 
-
+**1.- si ablaciones no son tan buenas, probar cambio de orden**
 
 **3.- antes de seguir, si MPNN es mejorq ue Unet para cross volcano, proseguimos con continuous, si no, hay que ver otra arquitectura o scope para el artículo**
 What this implies for design (your "more general recommendations")
