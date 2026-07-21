@@ -397,13 +397,24 @@ def _evaluate_unet(
         t_cl=0,
     )
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
-    support = np.sum(cm, axis=1)
-    active_mask = support > 0
-    mean_f1 = (
-        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
-        if np.any(active_mask)
-        else 0.0
+
+    dataset = loader.dataset
+    if not hasattr(dataset, "label_ids"):
+        raise AttributeError(
+            "UNet evaluation requires loader.dataset.label_ids to compute active-class means."
+        )
+    label_ids = np.asarray(dataset.label_ids, dtype=np.int64)
+    active_event_ids = sorted(
+        int(v) for v in np.unique(label_ids).tolist() if 1 <= int(v) <= 5
     )
+    if len(active_event_ids) == 0:
+        raise RuntimeError(
+            "No active event classes found in loader.dataset.label_ids for UNet evaluation."
+        )
+    active_class_indices = [event_id - 1 for event_id in active_event_ids]
+
+    mean_f1 = float(np.mean([f1_scores[i] for i in active_class_indices]))
+
     iou_per_class = []
     for c in range(len(CLASS_NAMES)):
         tp = float(cm[c, c])
@@ -411,15 +422,7 @@ def _evaluate_unet(
         fn = float(cm[c, :].sum() - tp)
         denom = tp + fp + fn
         iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
-    mean_iou = (
-        float(
-            np.mean(
-                [iou_per_class[i] for i, active in enumerate(active_mask) if active]
-            )
-        )
-        if np.any(active_mask)
-        else 0.0
-    )
+    mean_iou = float(np.mean([iou_per_class[i] for i in active_class_indices]))
     return (
         [float(x) for x in f1_scores],
         mean_f1,

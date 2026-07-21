@@ -255,7 +255,9 @@ def _load_existing_run_summary_if_complete(run_root: Path) -> dict | None:
     return None
 
 
-def _find_best_source_checkpoint(model_key: str, experiment_root: Path) -> tuple[Path, dict]:
+def _find_best_source_checkpoint(
+    model_key: str, experiment_root: Path
+) -> tuple[Path, dict]:
     model_root = experiment_root / "ablations" / model_key
     if not model_root.exists():
         raise FileNotFoundError(f"Model root not found: {model_root}")
@@ -289,7 +291,9 @@ def _find_best_source_checkpoint(model_key: str, experiment_root: Path) -> tuple
     return best_ckpt_path, meta
 
 
-def _load_base_model(model_key: str, checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
+def _load_base_model(
+    model_key: str, checkpoint_path: Path, device: torch.device
+) -> torch.nn.Module:
     spec = get_model_spec(model_key)
     model = build_model_from_spec(model_key, n_classes=6).to(device)
     load_checkpoint_into_model(
@@ -354,12 +358,14 @@ def _train_one_run(
     model = _load_base_model(model_key, base_checkpoint, device)
     apply_finetune_protocol(model, config["protocol"])
 
-    train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = _prepare_dataloaders(
-        train_npz=train_npz,
-        val_npz=val_npz,
-        test_npz=test_npz,
-        batch_size=int(config["batch_size"]),
-        trainer_kind=str(trainer_kind),
+    train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = (
+        _prepare_dataloaders(
+            train_npz=train_npz,
+            val_npz=val_npz,
+            test_npz=test_npz,
+            batch_size=int(config["batch_size"]),
+            trainer_kind=str(trainer_kind),
+        )
     )
 
     optimizer = optim.Adam(
@@ -367,7 +373,9 @@ def _train_one_run(
         lr=float(config["lr"]),
     )
 
-    run_root = output_dir / model_key / target_volcano / f"fold_{repeat_idx:02d}" / subset_key
+    run_root = (
+        output_dir / model_key / target_volcano / f"fold_{repeat_idx:02d}" / subset_key
+    )
     checkpoints_dir = run_root / "checkpoints"
     reports_dir = run_root / "reports"
     cm_dir = run_root / "confusion_matrices"
@@ -380,7 +388,9 @@ def _train_one_run(
     no_improve = 0
     metrics_rows = []
 
-    trainable_params = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    trainable_params = int(
+        sum(p.numel() for p in model.parameters() if p.requires_grad)
+    )
     total_params = int(sum(p.numel() for p in model.parameters()))
     print(
         "[RUN] "
@@ -674,10 +684,16 @@ def main() -> None:
 
     available_targets = discover_targets(data_root)
     available_models = [k for k, v in MODEL_SPECS.items() if v.get("enabled", True)]
+    available_models.reverse()
     selected_models = parse_csv_selection(args.models, available_models, "models")
     selected_targets = parse_csv_selection(args.targets, available_targets, "targets")
     selected_targets = _order_targets_cau_first(selected_targets)
-    selected_folds = [int(x) for x in parse_csv_selection(args.folds, [str(x) for x in DEFAULT_FOLDS], "folds")]
+    selected_folds = [
+        int(x)
+        for x in parse_csv_selection(
+            args.folds, [str(x) for x in DEFAULT_FOLDS], "folds"
+        )
+    ]
     selected_subsets = parse_csv_selection(
         args.subsets,
         list(DEFAULT_SUBSET_KEYS),
@@ -817,7 +833,9 @@ def main() -> None:
                     raise FileNotFoundError(f"Missing test manifest: {test_npz}")
 
                 fold_subset_keys = _discover_subset_keys(fold_dir)
-                available_subset_keys = [k for k in selected_subsets if k in fold_subset_keys]
+                available_subset_keys = [
+                    k for k in selected_subsets if k in fold_subset_keys
+                ]
                 if len(available_subset_keys) == 0:
                     raise FileNotFoundError(
                         f"No selected subset manifests found under {fold_dir / 'subsets'}"
@@ -825,7 +843,9 @@ def main() -> None:
 
                 skipped_subsets = 0
                 for subset_key in available_subset_keys:
-                    run_key = _run_key(model_key, target_volcano, repeat_idx, subset_key)
+                    run_key = _run_key(
+                        model_key, target_volcano, repeat_idx, subset_key
+                    )
                     run_root = (
                         output_dir
                         / model_key
@@ -842,7 +862,9 @@ def main() -> None:
                         continue
 
                     if not args.rerun_completed:
-                        existing_summary = _load_existing_run_summary_if_complete(run_root)
+                        existing_summary = _load_existing_run_summary_if_complete(
+                            run_root
+                        )
                         if existing_summary is not None:
                             skipped_subsets += 1
                             rows.append(existing_summary)
@@ -865,7 +887,14 @@ def main() -> None:
                         "early_stop_patience": int(args.early_stop_patience),
                         "lr": float(fixed_subset_lr),
                         "lr_final": float(args.lr_final),
-                        "batch_size": int(args.batch_size or int(source_info.get("batch_size", MODEL_SPECS[model_key]["batch_size"]))),
+                        "batch_size": int(
+                            args.batch_size
+                            or int(
+                                source_info.get(
+                                    "batch_size", MODEL_SPECS[model_key]["batch_size"]
+                                )
+                            )
+                        ),
                         "dice_weight": float(args.dice_weight),
                         "ce_weight": float(args.ce_weight),
                         "len_window": int(args.len_window),

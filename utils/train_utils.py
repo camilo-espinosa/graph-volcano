@@ -2009,8 +2009,32 @@ def evaluate_unet_model(
     )
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
     f1_scores = [float(x) for x in f1_scores]
-    mean_f1 = float(np.mean(f1_scores)) if len(f1_scores) > 0 else 0.0
-    iou_per_class, mean_iou = compute_iou_from_cm(cm)
+    iou_per_class, _mean_iou_all = compute_iou_from_cm(cm)
+
+    dataset = dataloader.dataset
+    if not hasattr(dataset, "label_ids"):
+        raise AttributeError(
+            "evaluate_unet_model requires dataloader.dataset.label_ids to compute active-class means."
+        )
+
+    label_ids = np.asarray(dataset.label_ids, dtype=np.int64)
+    active_event_ids = sorted(
+        int(v) for v in np.unique(label_ids).tolist() if 1 <= int(v) <= 5
+    )
+    if len(active_event_ids) == 0:
+        raise RuntimeError(
+            "No active event classes found in dataset.label_ids; cannot compute active-class mean F1/IoU."
+        )
+
+    active_class_indices = [event_id - 1 for event_id in active_event_ids]
+    if max(active_class_indices) >= len(f1_scores):
+        raise RuntimeError(
+            "Active class index is out of bounds for confusion-matrix scores: "
+            f"active_class_indices={active_class_indices}, n_scores={len(f1_scores)}"
+        )
+
+    mean_f1 = float(np.mean([f1_scores[i] for i in active_class_indices]))
+    mean_iou = float(np.mean([float(iou_per_class[i]) for i in active_class_indices]))
 
     return f1_scores, mean_f1, iou_per_class, mean_iou, mean_loss, cm
 
