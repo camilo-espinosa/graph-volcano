@@ -1,6 +1,9 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from utils.station_info import get_crater_coords, get_station_coords
 
 
 class StationPairMessageBlock(nn.Module):
@@ -183,7 +186,9 @@ class StationAttentionBlock(nn.Module):
             nn.Identity(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, dist_bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: [B, S, C, T]
         pooled = x.mean(dim=-1)
 
@@ -192,6 +197,7 @@ class StationAttentionBlock(nn.Module):
             pooled_norm,
             pooled_norm,
             pooled_norm,
+            attn_mask=dist_bias,
             need_weights=False,
         )
         pooled = pooled + attn_out
@@ -229,6 +235,9 @@ class MuSSeg(nn.Module):
         station_attn_heads=4,
         station_attn_dropout=0.0,
         station_attn_ff_mult=2,
+        use_distance_attn_bias=False,
+        use_distance_bottleneck_emb=False,
+        volcano_name=None,
         **kwargs,
     ):
 
@@ -252,6 +261,9 @@ class MuSSeg(nn.Module):
         self.bottleneck_attention = bool(bottleneck_attention)
         self.shared_station_encoder = bool(shared_station_encoder)
         self.station_interaction = str(station_interaction)
+        self.use_distance_attn_bias = bool(use_distance_attn_bias)
+        self.use_distance_bottleneck_emb = bool(use_distance_bottleneck_emb)
+        self.volcano_name = volcano_name
         self.station_message_levels = sorted(
             set(int(level) for level in station_message_levels)
         )
@@ -290,6 +302,24 @@ class MuSSeg(nn.Module):
         if self.station_interaction != "none" and not self.shared_station_encoder:
             raise ValueError(
                 "station_interaction requires shared_station_encoder=True."
+            )
+
+        if (
+            self.use_distance_attn_bias or self.use_distance_bottleneck_emb
+        ) and not self.shared_station_encoder:
+            raise ValueError(
+                "distance-aware station features require shared_station_encoder=True."
+            )
+        if (
+            self.use_distance_attn_bias or self.use_distance_bottleneck_emb
+        ) and self.volcano_name is None:
+            raise ValueError(
+                "volcano_name is required when enabling distance-aware station "
+                "features."
+            )
+        if self.use_distance_attn_bias and self.station_interaction != "late_attention":
+            raise ValueError(
+                "use_distance_attn_bias requires station_interaction='late_attention'."
             )
 
         if self.station_interaction == "late_station_message":
@@ -456,6 +486,52 @@ class MuSSeg(nn.Module):
         self.station_merge_attn_norm = nn.LayerNorm(self.bottleneck_channels)
         self.station_merge_attn_score = nn.Linear(self.bottleneck_channels, 1)
 
+        if self.use_distance_bottleneck_emb:
+            self.dist_bottleneck_proj = nn.Linear(1, self.bottleneck_channels)
+            nn.init.normal_(self.dist_bottleneck_proj.weight, std=1e-3)
+            nn.init.zeros_(self.dist_bottleneck_proj.bias)
+        else:
+            self.dist_bottleneck_proj = None
+
+        if self.use_distance_attn_bias:
+            self.dist_attn_bias_proj = nn.Linear(1, 1, bias=False)
+            nn.init.zeros_(self.dist_attn_bias_proj.weight)
+        else:
+            self.dist_attn_bias_proj = None
+
+        if self.use_distance_attn_bias or self.use_distance_bottleneck_emb:
+            station_coords = list(get_station_coords(self.volcano_name).items())
+            crater_coords = get_crater_coords(self.volcano_name)
+
+            lat_mean = float(np.mean([coords[1] for _, coords in station_coords]))
+            km_per_deg_lon = 111.0 * np.cos(np.radians(lat_mean))
+            km_per_deg_lat = 111.0
+
+            coords_array = np.array(
+                [
+                    (
+                        (lon - crater_coords[0]) * km_per_deg_lon,
+                        (lat - crater_coords[1]) * km_per_deg_lat,
+                    )
+                    for _, (lon, lat) in station_coords
+                ],
+                dtype=np.float32,
+            )
+            dist_to_crater = np.linalg.norm(coords_array, axis=1).astype(np.float32)
+            n_stations = int(dist_to_crater.shape[0])
+            station_rank = np.empty(n_stations, dtype=np.float32)
+            station_rank[np.argsort(dist_to_crater)] = np.arange(
+                n_stations, dtype=np.float32
+            )
+            normalized = 1.0 - station_rank / n_stations + 1.0 / n_stations
+            self.register_buffer(
+                "station_dist",
+                torch.from_numpy(normalized[:, None].astype(np.float32)),
+                persistent=True,
+            )
+        else:
+            self.station_dist = None
+
         for i in range(self.depth - 1):
             filters = int(2 ** (self.depth - 2 - i) * self.filters_root)
             conv_up = nn.ConvTranspose1d(
@@ -577,6 +653,12 @@ class MuSSeg(nn.Module):
                 "shared_station_encoder=True expects input shape [B, S, T] "
                 f"or [B, S, 1, T]. Got shape: {tuple(x.shape)}"
             )
+        if self.station_dist is not None and x.shape[1] != self.station_dist.shape[0]:
+            raise ValueError(
+                "Input station count does not match the configured volcano station "
+                f"metadata. Got {x.shape[1]} stations, expected "
+                f"{self.station_dist.shape[0]} for volcano {self.volcano_name}."
+            )
 
         x = x[:, :, None, :]
         x = self._apply_station_conv(x, self.inc_shared, self.in_bn_shared)
@@ -589,7 +671,16 @@ class MuSSeg(nn.Module):
                 x = self.station_message_blocks[str(level)](x)
 
             if level in self.station_attention_levels:
-                x = self.station_attention_blocks[str(level)](x)
+                dist_bias = None
+                if self.use_distance_attn_bias:
+                    station_dist = self.station_dist.squeeze(-1)
+                    dist_diff = (
+                        station_dist.unsqueeze(0) - station_dist.unsqueeze(1)
+                    ).abs()
+                    dist_bias = self.dist_attn_bias_proj(dist_diff.unsqueeze(-1)).squeeze(
+                        -1
+                    )
+                x = self.station_attention_blocks[str(level)](x, dist_bias=dist_bias)
 
             if conv_down is not None:
                 skips.append(self._station_max(x))
@@ -615,6 +706,9 @@ class MuSSeg(nn.Module):
                 x = x_flat.reshape(bsz, n_stations, channels, t_len)
 
         if not collapsed_before_bottleneck:
+            if self.use_distance_bottleneck_emb:
+                dist_emb = self.dist_bottleneck_proj(self.station_dist)
+                x = x + dist_emb[None, :, :, None]
             x = self._station_max(x)
 
         for (conv_up, bn1, conv_same, bn2), skip in zip(self.up_branch, skips[::-1]):
@@ -637,4 +731,7 @@ class MuSSeg(nn.Module):
             return self._forward_shared(x, logits=logits)
         return self._forward_joint(x, logits=logits)
 
-
+    def permute_stations(self, perm: torch.Tensor) -> None:
+        """Reorder the station distance buffer to match a station permutation."""
+        if self.station_dist is not None:
+            self.station_dist = self.station_dist[perm]
