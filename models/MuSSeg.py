@@ -1,6 +1,9 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from utils.station_info import get_crater_coords, get_station_coords
 
 
 class StationPairMessageBlock(nn.Module):
@@ -183,7 +186,9 @@ class StationAttentionBlock(nn.Module):
             nn.Identity(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, dist_bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: [B, S, C, T]
         pooled = x.mean(dim=-1)
 
@@ -192,6 +197,7 @@ class StationAttentionBlock(nn.Module):
             pooled_norm,
             pooled_norm,
             pooled_norm,
+            attn_mask=dist_bias if dist_bias is not None else None,
             need_weights=False,
         )
         pooled = pooled + attn_out
@@ -229,6 +235,9 @@ class MuSSeg(nn.Module):
         station_attn_heads=4,
         station_attn_dropout=0.0,
         station_attn_ff_mult=2,
+        volcano_name: str | None = None,
+        use_distance_attn_bias: bool = False,
+        use_distance_bottleneck_emb: bool = False,
         **kwargs,
     ):
 
@@ -260,9 +269,48 @@ class MuSSeg(nn.Module):
         self.station_attention_levels = sorted(
             set(int(level) for level in station_attention_levels)
         )
-        self.pre_bottleneck_station_attn_merge = bool(
-            pre_bottleneck_station_attn_merge
-        )
+        self.pre_bottleneck_station_attn_merge = bool(pre_bottleneck_station_attn_merge)
+        self.use_distance_attn_bias = bool(use_distance_attn_bias)
+        self.use_distance_bottleneck_emb = bool(use_distance_bottleneck_emb)
+        self.volcano_name = volcano_name
+
+        if (
+            self.use_distance_attn_bias or self.use_distance_bottleneck_emb
+        ) and self.volcano_name is None:
+            raise ValueError(
+                "volcano_name is required when use_distance_attn_bias or "
+                "use_distance_bottleneck_emb is True"
+            )
+        if self.use_distance_attn_bias and self.station_interaction != "late_attention":
+            raise ValueError(
+                "use_distance_attn_bias requires station_interaction='late_attention'"
+            )
+
+        if self.use_distance_attn_bias or self.use_distance_bottleneck_emb:
+            station_coords = list(get_station_coords(self.volcano_name).values())
+            crater_lon, crater_lat = get_crater_coords(self.volcano_name)
+            lat_mean = float(np.mean([lat for _, lat in station_coords]))
+            km_per_deg_lon = 111.0 * np.cos(np.radians(lat_mean))
+            km_per_deg_lat = 111.0
+            raw_dists = np.array(
+                [
+                    np.sqrt(
+                        ((lon - crater_lon) * km_per_deg_lon) ** 2
+                        + ((lat - crater_lat) * km_per_deg_lat) ** 2
+                    )
+                    for lon, lat in station_coords
+                ],
+                dtype=np.float32,
+            )
+            ranks = np.argsort(np.argsort(raw_dists))
+            n_stations = len(ranks)
+            normalized = 1.0 - ranks / n_stations + 1.0 / n_stations
+            self.register_buffer(
+                "station_dist",
+                torch.from_numpy(normalized.astype(np.float32)[:, None]),
+            )
+        else:
+            self.station_dist = None
 
         if feature_dropout < 0.0 or feature_dropout >= 1.0:
             raise ValueError(
@@ -456,6 +504,15 @@ class MuSSeg(nn.Module):
         self.station_merge_attn_norm = nn.LayerNorm(self.bottleneck_channels)
         self.station_merge_attn_score = nn.Linear(self.bottleneck_channels, 1)
 
+        if self.use_distance_bottleneck_emb:
+            self.dist_bottleneck_proj = nn.Linear(1, self.bottleneck_channels)
+            nn.init.normal_(self.dist_bottleneck_proj.weight, std=1e-3)
+            nn.init.zeros_(self.dist_bottleneck_proj.bias)
+
+        if self.use_distance_attn_bias:
+            self.dist_attn_bias_proj = nn.Linear(1, 1, bias=False)
+            nn.init.zeros_(self.dist_attn_bias_proj.weight)
+
         for i in range(self.depth - 1):
             filters = int(2 ** (self.depth - 2 - i) * self.filters_root)
             conv_up = nn.ConvTranspose1d(
@@ -506,6 +563,10 @@ class MuSSeg(nn.Module):
         station_scores = self.station_merge_attn_score(pooled).squeeze(-1)
         station_weights = torch.softmax(station_scores, dim=1)
         return (x * station_weights[:, :, None, None]).sum(dim=1)
+
+    def permute_stations(self, perm: torch.Tensor) -> None:
+        if self.station_dist is not None:
+            self.station_dist = self.station_dist[perm]
 
     def _apply_station_conv(
         self, x: torch.Tensor, conv: nn.Conv1d, bn: nn.BatchNorm1d
@@ -589,7 +650,19 @@ class MuSSeg(nn.Module):
                 x = self.station_message_blocks[str(level)](x)
 
             if level in self.station_attention_levels:
-                x = self.station_attention_blocks[str(level)](x)
+                if self.use_distance_attn_bias:
+                    station_dist = self.station_dist.squeeze(-1)
+                    dist_diff = (
+                        station_dist.unsqueeze(0) - station_dist.unsqueeze(1)
+                    ).abs()
+                    dist_bias = self.dist_attn_bias_proj(
+                        dist_diff.unsqueeze(-1)
+                    ).squeeze(-1)
+                    x = self.station_attention_blocks[str(level)](
+                        x, dist_bias=dist_bias
+                    )
+                else:
+                    x = self.station_attention_blocks[str(level)](x)
 
             if conv_down is not None:
                 skips.append(self._station_max(x))
@@ -613,6 +686,9 @@ class MuSSeg(nn.Module):
                 x_flat = x.reshape(bsz * n_stations, channels, t_len)
                 x_flat = self._apply_bottleneck_attention(x_flat)
                 x = x_flat.reshape(bsz, n_stations, channels, t_len)
+                if self.use_distance_bottleneck_emb:
+                    dist_emb = self.dist_bottleneck_proj(self.station_dist)
+                    x = x + dist_emb[None, :, :, None]
 
         if not collapsed_before_bottleneck:
             x = self._station_max(x)
@@ -636,5 +712,3 @@ class MuSSeg(nn.Module):
         if self.shared_station_encoder:
             return self._forward_shared(x, logits=logits)
         return self._forward_joint(x, logits=logits)
-
-
