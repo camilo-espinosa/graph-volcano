@@ -292,16 +292,40 @@ def _find_best_source_checkpoint(
 
 
 def _load_base_model(
-    model_key: str, checkpoint_path: Path, device: torch.device
+    model_key: str,
+    checkpoint_path: Path,
+    device: torch.device,
+    target_volcano: str,
 ) -> torch.nn.Module:
     spec = get_model_spec(model_key)
-    model = build_model_from_spec(model_key, n_classes=6).to(device)
-    load_checkpoint_into_model(
-        model,
-        checkpoint_path,
-        device,
-        trainer_kind=str(spec["trainer_kind"]),
+    model_kwargs = dict(spec["model_kwargs"])
+    uses_station_info = bool(
+        model_kwargs.get("use_distance_attn_bias", False)
+        or model_kwargs.get("use_distance_bottleneck_emb", False)
     )
+    if uses_station_info:
+        model = build_model_from_spec(
+            model_key,
+            n_classes=6,
+            volcano_name=str(target_volcano),
+        ).to(device)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        ckpt_state = {
+            key: value
+            for key, value in ckpt["model_state_dict"].items()
+            if key != "station_dist"
+        }
+        model.load_state_dict(ckpt_state, strict=False)
+        del ckpt
+        cleanup_gpu_cache()
+    else:
+        model = build_model_from_spec(model_key, n_classes=6).to(device)
+        load_checkpoint_into_model(
+            model,
+            checkpoint_path,
+            device,
+            trainer_kind=str(spec["trainer_kind"]),
+        )
     return model
 
 
@@ -355,7 +379,12 @@ def _train_one_run(
             f"Missing subset manifests for {target_volcano} fold={repeat_idx:02d} subset={subset_key}"
         )
 
-    model = _load_base_model(model_key, base_checkpoint, device)
+    model = _load_base_model(
+        model_key,
+        base_checkpoint,
+        device,
+        target_volcano,
+    )
     apply_finetune_protocol(model, config["protocol"])
 
     train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = (

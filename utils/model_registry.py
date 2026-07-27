@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from models.PhaseNO import PhaseNO
+# from models.PhaseNO import PhaseNO
 from models.PhaseNet import PhaseNet
 from models.PhaseNet_bottleneck_attention import PhaseNetBottleneckAttention
 from models.MuSSeg import MuSSeg
@@ -50,54 +50,95 @@ PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS: dict[str, Any] = {
     "station_attn_ff_mult": 2,
 }
 
+MUSSEG_PI_SE_LSA_BA_BASE_KWARGS: dict[str, Any] = deepcopy(
+    PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS
+)
+MUSSEG_PI_SE_LSA_BA_BASE_KWARGS.pop("shared_station_encoder", None)
+MUSSEG_PI_SE_LSA_BA_BASE_KWARGS.update(
+    {
+        "bottleneck_attention": True,
+        "station_interaction": "late_attention",
+        "volcano_name": "NVCHVC",
+    }
+)
+
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
-    #    "musseg_pi_se_lsa_ba_dist_attn": {
-    #         "family": "phasenet",
-    #         "trainer_kind": "1d",
-    #         "display_name": "MuSSeg_PI_SE_LSA_BA_DistAttn",
-    #         "model_cls": MuSSeg,
-    #         "model_kwargs": {
-    #             **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
-    #             "bottleneck_attention": True,
-    #             "shared_station_encoder": True,
-    #             "station_interaction": "late_attention",
-    #             "volcano_name": "NVCHVC",
-    #             "use_distance_attn_bias": True,
-    #         },
-    #         "batch_size": 16,
-    #         "sort_order": 61,
-    #         "enabled": True,
-    #         "aliases": (),
-    #     },
-    "musseg_pi_se_lsa_ba_dist_emb": {
+    "musseg_pi_se_lsa_ba_dist_both_wskip": {
         "family": "phasenet",
         "trainer_kind": "1d",
-        "display_name": "MuSSeg_PI_SE_LSA_BA_DistEmb",
+        "display_name": "MuSSeg_PI_SE_LSA_BA_DistBoth_WeightedSkip",
         "model_cls": MuSSeg,
         "model_kwargs": {
-            **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
-            "bottleneck_attention": True,
-            "shared_station_encoder": True,
-            "station_interaction": "late_attention",
-            "volcano_name": "NVCHVC",
+            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+            "use_distance_attn_bias": True,
             "use_distance_bottleneck_emb": True,
+            "use_station_weighted_skips": True,
         },
-        "batch_size": 16,
-        "sort_order": 62,
+        "batch_size": 14,
+        "sort_order": 65,
         "enabled": True,
         "aliases": (),
     },
+    "musseg_pi_se_lsa_ba_wskip": {
+        "family": "phasenet",
+        "trainer_kind": "1d",
+        "display_name": "MuSSeg_PI_SE_LSA_BA_WeightedSkip",
+        "model_cls": MuSSeg,
+        "model_kwargs": {
+            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+            "use_station_weighted_skips": True,
+        },
+        "batch_size": 16,
+        "sort_order": 64,
+        "enabled": True,
+        "aliases": (),
+    },
+    # "musseg_pi_se_lsa_ba": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "MuSSeg_PI_SE_LateStationAttention_BA",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #     "batch_size": 16,
+    #     "sort_order": 60,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "musseg_pi_se_lsa_ba_dist_attn": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "MuSSeg_PI_SE_LSA_BA_DistAttn",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "use_distance_attn_bias": True,
+    #     },
+    #     "batch_size": 16,
+    #     "sort_order": 61,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "musseg_pi_se_lsa_ba_dist_emb": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "MuSSeg_PI_SE_LSA_BA_DistEmb",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "use_distance_bottleneck_emb": True,
+    #     },
+    #     "batch_size": 16,
+    #     "sort_order": 62,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
     "musseg_pi_se_lsa_ba_dist_both": {
         "family": "phasenet",
         "trainer_kind": "1d",
         "display_name": "MuSSeg_PI_SE_LSA_BA_DistBoth",
         "model_cls": MuSSeg,
         "model_kwargs": {
-            **deepcopy(PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS),
-            "bottleneck_attention": True,
-            "shared_station_encoder": True,
-            "station_interaction": "late_attention",
-            "volcano_name": "NVCHVC",
+            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
             "use_distance_attn_bias": True,
             "use_distance_bottleneck_emb": True,
         },
@@ -106,6 +147,36 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "enabled": True,
         "aliases": (),
     },
+    # "musseg_pi_se_lsa_ba_dist_attn_wskip": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "MuSSeg_PI_SE_LSA_BA_DistAttn_WeightedSkip",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "use_distance_attn_bias": True,
+    #         "use_station_weighted_skips": True,
+    #     },
+    #     "batch_size": 16,
+    #     "sort_order": 66,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "musseg_pi_se_lsa_ba_dist_emb_wskip": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "MuSSeg_PI_SE_LSA_BA_DistEmb_WeightedSkip",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "use_distance_bottleneck_emb": True,
+    #         "use_station_weighted_skips": True,
+    #     },
+    #     "batch_size": 16,
+    #     "sort_order": 67,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
     # "unet": {
     #     "family": "unet",
     #     "trainer_kind": "2d",

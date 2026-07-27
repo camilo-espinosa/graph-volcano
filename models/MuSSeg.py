@@ -222,7 +222,6 @@ class MuSSeg(nn.Module):
         norm="std",
         feature_dropout=0.0,
         bottleneck_attention=False,
-        shared_station_encoder=False,
         station_interaction="none",
         station_message_levels=None,
         station_message_aggregation="sum",
@@ -238,6 +237,7 @@ class MuSSeg(nn.Module):
         volcano_name: str | None = None,
         use_distance_attn_bias: bool = False,
         use_distance_bottleneck_emb: bool = False,
+        use_station_weighted_skips: bool = False,
         **kwargs,
     ):
 
@@ -259,7 +259,7 @@ class MuSSeg(nn.Module):
         self.stride = stride
         self.filters_root = filters_root
         self.bottleneck_attention = bool(bottleneck_attention)
-        self.shared_station_encoder = bool(shared_station_encoder)
+        self.shared_station_encoder = True
         self.station_interaction = str(station_interaction)
         self.station_message_levels = sorted(
             set(int(level) for level in station_message_levels)
@@ -272,11 +272,13 @@ class MuSSeg(nn.Module):
         self.pre_bottleneck_station_attn_merge = bool(pre_bottleneck_station_attn_merge)
         self.use_distance_attn_bias = bool(use_distance_attn_bias)
         self.use_distance_bottleneck_emb = bool(use_distance_bottleneck_emb)
+        self.use_station_weighted_skips = bool(use_station_weighted_skips)
+        distance_features_enabled = (
+            self.use_distance_attn_bias or self.use_distance_bottleneck_emb
+        )
         self.volcano_name = volcano_name
 
-        if (
-            self.use_distance_attn_bias or self.use_distance_bottleneck_emb
-        ) and self.volcano_name is None:
+        if distance_features_enabled and self.volcano_name is None:
             raise ValueError(
                 "volcano_name is required when use_distance_attn_bias or "
                 "use_distance_bottleneck_emb is True"
@@ -286,10 +288,10 @@ class MuSSeg(nn.Module):
                 "use_distance_attn_bias requires station_interaction='late_attention'"
             )
 
-        if self.use_distance_attn_bias or self.use_distance_bottleneck_emb:
-            station_coords = list(get_station_coords(self.volcano_name).values())
+        if distance_features_enabled:
+            station_items = list(get_station_coords(self.volcano_name).items())
             crater_lon, crater_lat = get_crater_coords(self.volcano_name)
-            lat_mean = float(np.mean([lat for _, lat in station_coords]))
+            lat_mean = float(np.mean([lat for _, (_, lat) in station_items]))
             km_per_deg_lon = 111.0 * np.cos(np.radians(lat_mean))
             km_per_deg_lat = 111.0
             raw_dists = np.array(
@@ -298,19 +300,54 @@ class MuSSeg(nn.Module):
                         ((lon - crater_lon) * km_per_deg_lon) ** 2
                         + ((lat - crater_lat) * km_per_deg_lat) ** 2
                     )
-                    for lon, lat in station_coords
+                    for _, (lon, lat) in station_items
                 ],
                 dtype=np.float32,
             )
-            ranks = np.argsort(np.argsort(raw_dists))
-            n_stations = len(ranks)
-            normalized = 1.0 - ranks / n_stations + 1.0 / n_stations
+            n_stations = int(raw_dists.shape[0])
+            if n_stations == 1:
+                normalized = np.ones((1,), dtype=np.float32)
+            else:
+                min_dist = float(np.min(raw_dists))
+                max_dist = float(np.max(raw_dists))
+                dist_span = max_dist - min_dist
+                if dist_span <= 0.0:
+                    raise ValueError(
+                        "station distances must span a positive range when more than one station is present."
+                    )
+                min_score = 1.0 / float(n_stations)
+                normalized = 1.0 - (1.0 - min_score) * (
+                    (raw_dists - min_dist) / dist_span
+                )
+                normalized = normalized.astype(np.float32)
+            if not np.all(np.isfinite(normalized)):
+                raise ValueError(
+                    "station distance scores must be finite for distance-aware features."
+                )
             self.register_buffer(
                 "station_dist",
-                torch.from_numpy(normalized.astype(np.float32)[:, None]),
+                torch.from_numpy(normalized[:, None]),
             )
+            closest_idx = int(np.argmin(raw_dists))
+            farthest_idx = int(np.argmax(raw_dists))
+            closest_name = str(station_items[closest_idx][0])
+            farthest_name = str(station_items[farthest_idx][0])
+            print(
+                "[MuSSeg][station_dist] "
+                f"volcano={self.volcano_name} "
+                f"closest={closest_name} "
+                f"km={float(raw_dists[closest_idx]):.3f} "
+                f"score={float(normalized[closest_idx]):.3f} | "
+                f"farthest={farthest_name} "
+                f"km={float(raw_dists[farthest_idx]):.3f} "
+                f"score={float(normalized[farthest_idx]):.3f}"
+            )
+            self.distance_merge_gamma = nn.Parameter(torch.tensor(1.0))
         else:
             self.station_dist = None
+
+        if self.use_station_weighted_skips:
+            self.skip_merge_alpha = nn.Parameter(torch.tensor(0.5))
 
         if feature_dropout < 0.0 or feature_dropout >= 1.0:
             raise ValueError(
@@ -333,11 +370,6 @@ class MuSSeg(nn.Module):
                 "station_interaction must be one of "
                 "{'none', 'late_station_message', 'late_attention'}. "
                 f"Got: {self.station_interaction}."
-            )
-
-        if self.station_interaction != "none" and not self.shared_station_encoder:
-            raise ValueError(
-                "station_interaction requires shared_station_encoder=True."
             )
 
         if self.station_interaction == "late_station_message":
@@ -368,13 +400,6 @@ class MuSSeg(nn.Module):
                 f"Allowed levels for depth={self.depth}: {sorted(valid_pair_levels)}."
             )
 
-        if not self.shared_station_encoder and self.station_message_levels:
-            raise ValueError(
-                "station_message_levels require shared_station_encoder=True, because "
-                "station-message interaction is defined on station embeddings "
-                "[B, S, C, T]."
-            )
-
         valid_station_attention_levels = set(range(self.depth))
         invalid_station_attention_levels = [
             level
@@ -386,17 +411,6 @@ class MuSSeg(nn.Module):
                 f"Invalid station_attention_levels={invalid_station_attention_levels}. "
                 f"Allowed levels for depth={self.depth}: "
                 f"{sorted(valid_station_attention_levels)}."
-            )
-
-        if not self.shared_station_encoder and self.station_attention_levels:
-            raise ValueError(
-                "station_attention_levels require shared_station_encoder=True."
-            )
-
-        if self.pre_bottleneck_station_attn_merge and not self.shared_station_encoder:
-            raise ValueError(
-                "pre_bottleneck_station_attn_merge requires "
-                "shared_station_encoder=True."
             )
 
         if self.pre_bottleneck_station_attn_merge and not self.bottleneck_attention:
@@ -504,6 +518,50 @@ class MuSSeg(nn.Module):
         self.station_merge_attn_norm = nn.LayerNorm(self.bottleneck_channels)
         self.station_merge_attn_score = nn.Linear(self.bottleneck_channels, 1)
 
+        if self.use_station_weighted_skips:
+            self.station_level_descriptor_dim = min(64, self.bottleneck_channels)
+            level_attn_heads = 4
+            while (
+                self.station_level_descriptor_dim % level_attn_heads != 0
+                and level_attn_heads > 1
+            ):
+                level_attn_heads //= 2
+            if self.station_level_descriptor_dim % level_attn_heads != 0:
+                level_attn_heads = 1
+
+            self.station_level_descriptor_proj = nn.ModuleDict()
+            for level in range(self.depth):
+                channels = int(2**level * self.filters_root)
+                self.station_level_descriptor_proj[str(level)] = nn.Linear(
+                    channels,
+                    self.station_level_descriptor_dim,
+                )
+
+            self.station_level_attn_norm1 = nn.LayerNorm(
+                self.station_level_descriptor_dim
+            )
+            self.station_level_attn = nn.MultiheadAttention(
+                embed_dim=self.station_level_descriptor_dim,
+                num_heads=level_attn_heads,
+                dropout=0.0,
+                batch_first=True,
+            )
+            self.station_level_attn_norm2 = nn.LayerNorm(
+                self.station_level_descriptor_dim
+            )
+            self.station_level_attn_ff = nn.Sequential(
+                nn.Linear(
+                    self.station_level_descriptor_dim,
+                    2 * self.station_level_descriptor_dim,
+                ),
+                nn.GELU(),
+                nn.Linear(
+                    2 * self.station_level_descriptor_dim,
+                    self.station_level_descriptor_dim,
+                ),
+            )
+            self.station_level_score = nn.Linear(self.station_level_descriptor_dim, 1)
+
         if self.use_distance_bottleneck_emb:
             self.dist_bottleneck_proj = nn.Linear(1, self.bottleneck_channels)
             nn.init.normal_(self.dist_bottleneck_proj.weight, std=1e-3)
@@ -553,20 +611,124 @@ class MuSSeg(nn.Module):
         # x: [B, S, C, T]
         return x.max(dim=1).values
 
-    def _station_attn_merge(self, x: torch.Tensor) -> torch.Tensor:
+    def _station_distance_prior_logits(
+        self,
+        n_stations: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        station_dist = self._station_dist_for_count(
+            n_stations,
+            device=device,
+            dtype=dtype,
+        ).squeeze(-1)
+        total = station_dist.sum()
+        if float(total) <= 0.0:
+            raise ValueError(
+                "distance-based station merge requires positive station distance mass."
+            )
+        station_prior = station_dist / total
+        return torch.log(station_prior.clamp_min(1e-6))
+
+    def _merge_stations(
+        self,
+        x: torch.Tensor,
+        learned_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # x: [B, S, C, T] -> merged [B, C, T]
         if x.shape[1] == 1:
             return x[:, 0, :, :]
 
+        if learned_logits is not None and learned_logits.shape != x.shape[:2]:
+            raise ValueError(
+                "learned station logits must have shape [B, S]. "
+                f"Got {tuple(learned_logits.shape)} for station tensor "
+                f"{tuple(x.shape)}."
+            )
+
+        if self.station_dist is None:
+            if learned_logits is None:
+                return self._station_max(x)
+            station_weights = torch.softmax(learned_logits, dim=1)
+            return (x * station_weights[:, :, None, None]).sum(dim=1)
+
+        dist_logits = self._station_distance_prior_logits(
+            int(x.shape[1]),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        gamma = self.distance_merge_gamma.to(device=x.device, dtype=x.dtype)
+        dist_logits = gamma * dist_logits[None, :]
+        if learned_logits is None:
+            station_weights = torch.softmax(dist_logits, dim=1)
+        else:
+            station_weights = torch.softmax(learned_logits + dist_logits, dim=1)
+        return (x * station_weights[:, :, None, None]).sum(dim=1)
+
+    def _station_attn_merge(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, S, C, T] -> merged [B, C, T]
         pooled = x.mean(dim=-1)
         pooled = self.station_merge_attn_norm(pooled)
-        station_scores = self.station_merge_attn_score(pooled).squeeze(-1)
-        station_weights = torch.softmax(station_scores, dim=1)
-        return (x * station_weights[:, :, None, None]).sum(dim=1)
+        station_logits = self.station_merge_attn_score(pooled).squeeze(-1)
+        return self._merge_stations(x, learned_logits=station_logits)
+
+    def _weighted_skip_station_logits_from_levels(
+        self, descriptors_by_level: list[torch.Tensor]
+    ) -> torch.Tensor:
+        if len(descriptors_by_level) == 0:
+            raise ValueError(
+                "weighted skip station logits require at least one level descriptor."
+            )
+
+        stacked = torch.stack(descriptors_by_level, dim=2)
+        bsz, n_stations, n_levels, d_model = stacked.shape
+
+        level_tokens = stacked.reshape(bsz * n_stations, n_levels, d_model)
+        level_tokens_norm = self.station_level_attn_norm1(level_tokens)
+        level_attn_out, _ = self.station_level_attn(
+            level_tokens_norm,
+            level_tokens_norm,
+            level_tokens_norm,
+            need_weights=False,
+        )
+        level_tokens = level_tokens + level_attn_out
+        level_tokens = level_tokens + self.station_level_attn_ff(
+            self.station_level_attn_norm2(level_tokens)
+        )
+
+        station_features = level_tokens.mean(dim=1).reshape(bsz, n_stations, d_model)
+        return self.station_level_score(station_features).squeeze(-1)
 
     def permute_stations(self, perm: torch.Tensor) -> None:
         if self.station_dist is not None:
             self.station_dist = self.station_dist[perm]
+
+    def _station_dist_for_count(
+        self,
+        n_stations: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.station_dist is None:
+            raise ValueError(
+                "station_dist is required when distance-aware station features are enabled."
+            )
+
+        dist = self.station_dist
+        current_n = int(dist.shape[0])
+        target_n = int(n_stations)
+        if current_n > target_n:
+            dist = dist[:target_n]
+        elif current_n < target_n:
+            pad_n = target_n - current_n
+            # Extra channels are padded traces and should carry no station information.
+            pad_value = dist.new_tensor(0.0)
+            pad = pad_value.expand(pad_n, 1)
+            dist = torch.cat([dist, pad], dim=0)
+
+        return dist.to(device=device, dtype=dtype)
 
     def _apply_station_conv(
         self, x: torch.Tensor, conv: nn.Conv1d, bn: nn.BatchNorm1d
@@ -591,46 +753,7 @@ class MuSSeg(nn.Module):
             y = F.pad(y, (2, 3), "constant", 0)
         return y.reshape(bsz, n_stations, channels, y.shape[-1])
 
-    def _forward_joint(self, x: torch.Tensor, logits: bool = True) -> torch.Tensor:
-        x = self.activation(self.in_bn(self.inc(x)))
-        x = self.feature_dropout(x)
-
-        skips = []
-        for i, (conv_same, bn1, conv_down, bn2) in enumerate(self.down_branch):
-            x = self.activation(bn1(conv_same(x)))
-            x = self.feature_dropout(x)
-
-            if conv_down is not None:
-                skips.append(x)
-                if i == 1:
-                    x = F.pad(x, (2, 3), "constant", 0)
-                elif i == 2:
-                    x = F.pad(x, (1, 3), "constant", 0)
-                elif i == 3:
-                    x = F.pad(x, (2, 3), "constant", 0)
-
-                x = self.activation(bn2(conv_down(x)))
-                x = self.feature_dropout(x)
-
-        if self.bottleneck_attention:
-            x = self._apply_bottleneck_attention(x)
-
-        for (conv_up, bn1, conv_same, bn2), skip in zip(self.up_branch, skips[::-1]):
-            x = self.activation(bn1(conv_up(x)))
-            x = self.feature_dropout(x)
-            x = x[:, :, 1:-2]
-
-            x = self._merge_skip(skip, x)
-            x = self.activation(bn2(conv_same(x)))
-            x = self.feature_dropout(x)
-
-        x = self.final_dropout(x)
-        x = self.out(x)
-        if logits:
-            return x
-        return self.softmax(x)
-
-    def _forward_shared(self, x: torch.Tensor, logits: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, logits: bool = True) -> torch.Tensor:
         if x.ndim == 4 and x.shape[2] == 1:
             x = x[:, :, 0, :]
         if x.ndim != 3:
@@ -643,6 +766,10 @@ class MuSSeg(nn.Module):
         x = self._apply_station_conv(x, self.inc_shared, self.in_bn_shared)
 
         skips = []
+        station_level_descriptors = []
+        store_station_skips = (
+            self.use_station_weighted_skips or self.station_dist is not None
+        )
         for level, (conv_same, bn1, conv_down, bn2) in enumerate(self.down_branch):
             x = self._apply_station_conv(x, conv_same, bn1)
 
@@ -651,7 +778,11 @@ class MuSSeg(nn.Module):
 
             if level in self.station_attention_levels:
                 if self.use_distance_attn_bias:
-                    station_dist = self.station_dist.squeeze(-1)
+                    station_dist = self._station_dist_for_count(
+                        int(x.shape[1]),
+                        device=x.device,
+                        dtype=x.dtype,
+                    ).squeeze(-1)
                     dist_diff = (
                         station_dist.unsqueeze(0) - station_dist.unsqueeze(1)
                     ).abs()
@@ -664,8 +795,13 @@ class MuSSeg(nn.Module):
                 else:
                     x = self.station_attention_blocks[str(level)](x)
 
+            if self.use_station_weighted_skips:
+                descriptor = x.mean(dim=-1)
+                descriptor = self.station_level_descriptor_proj[str(level)](descriptor)
+                station_level_descriptors.append(descriptor)
+
             if conv_down is not None:
-                skips.append(self._station_max(x))
+                skips.append(x if store_station_skips else self._station_max(x))
                 x = self._pad_shared_downsample(x, level)
                 x = self._apply_station_conv(x, conv_down, bn2)
 
@@ -677,7 +813,7 @@ class MuSSeg(nn.Module):
                 collapsed_before_bottleneck = True
             elif self.station_interaction == "none":
                 # Shared-encoder baseline: fuse stations before temporal bottleneck attention.
-                x = self._station_max(x)
+                x = self._merge_stations(x)
                 x = self._apply_bottleneck_attention(x)
                 collapsed_before_bottleneck = True
             else:
@@ -687,16 +823,47 @@ class MuSSeg(nn.Module):
                 x_flat = self._apply_bottleneck_attention(x_flat)
                 x = x_flat.reshape(bsz, n_stations, channels, t_len)
                 if self.use_distance_bottleneck_emb:
-                    dist_emb = self.dist_bottleneck_proj(self.station_dist)
+                    station_dist = self._station_dist_for_count(
+                        n_stations,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    dist_emb = self.dist_bottleneck_proj(station_dist)
                     x = x + dist_emb[None, :, :, None]
 
+        skip_logits = None
+        if self.use_station_weighted_skips:
+            skip_logits = self._weighted_skip_station_logits_from_levels(
+                station_level_descriptors
+            )
+
         if not collapsed_before_bottleneck:
-            x = self._station_max(x)
+            if self.use_station_weighted_skips:
+                if skip_logits is None:
+                    raise ValueError(
+                        "skip logits are required for weighted station bottleneck merging."
+                    )
+                x = self._merge_stations(x, learned_logits=skip_logits)
+            else:
+                x = self._merge_stations(x)
 
         for (conv_up, bn1, conv_same, bn2), skip in zip(self.up_branch, skips[::-1]):
             x = self.activation(bn1(conv_up(x)))
             x = self.feature_dropout(x)
             x = x[:, :, 1:-2]
+
+            if skip.ndim == 4:
+                if self.use_station_weighted_skips:
+                    if skip_logits is None:
+                        raise ValueError(
+                            "skip logits are required for weighted station skip merging."
+                        )
+                    weighted = self._merge_stations(skip, learned_logits=skip_logits)
+                    base = self._merge_stations(skip)
+                    alpha = self.skip_merge_alpha.clamp(0.0, 1.0)
+                    skip = alpha * weighted + (1.0 - alpha) * base
+                else:
+                    skip = self._merge_stations(skip)
 
             x = self._merge_skip(skip, x)
             x = self.activation(bn2(conv_same(x)))
@@ -707,8 +874,3 @@ class MuSSeg(nn.Module):
         if logits:
             return x
         return self.softmax(x)
-
-    def forward(self, x, logits=True, **kwargs):
-        if self.shared_station_encoder:
-            return self._forward_shared(x, logits=logits)
-        return self._forward_joint(x, logits=logits)

@@ -565,13 +565,40 @@ def main() -> None:
                     )
 
                     if trainer_kind == "1d":
-                        model = model_spec["model_cls"](**model_kwargs).to(device)
-                        load_checkpoint_into_model(
-                            model=model,
-                            checkpoint_path=ckpt_path,
-                            device=device,
-                            trainer_kind=trainer_kind,
+                        model_kwargs_runtime = dict(model_kwargs)
+                        uses_station_info = bool(
+                            model_kwargs_runtime.get("use_distance_attn_bias", False)
+                            or model_kwargs_runtime.get(
+                                "use_distance_bottleneck_emb", False
+                            )
                         )
+                        if uses_station_info:
+                            model_kwargs_runtime["volcano_name"] = str(target_name)
+
+                        model = model_spec["model_cls"](**model_kwargs_runtime).to(
+                            device
+                        )
+                        if uses_station_info:
+                            ckpt = torch.load(
+                                ckpt_path,
+                                map_location=device,
+                                weights_only=False,
+                            )
+                            ckpt_state = {
+                                key: value
+                                for key, value in ckpt["model_state_dict"].items()
+                                if key != "station_dist"
+                            }
+                            model.load_state_dict(ckpt_state, strict=False)
+                            del ckpt
+                            cleanup_gpu_cache()
+                        else:
+                            load_checkpoint_into_model(
+                                model=model,
+                                checkpoint_path=ckpt_path,
+                                device=device,
+                                trainer_kind=trainer_kind,
+                            )
 
                         (
                             f1_per_class,

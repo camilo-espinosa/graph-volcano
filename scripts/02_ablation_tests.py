@@ -92,6 +92,15 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated model keys to process. Default: all active registry entries.",
     )
     parser.add_argument(
+        "--folds",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated folds to run (e.g. '1,3' or '01,03'). "
+            "Use 'all' for all folds. Default: all folds."
+        ),
+    )
+    parser.add_argument(
         "--experiment-root",
         type=Path,
         default=None,
@@ -128,11 +137,43 @@ def select_model_keys(raw_models: str | None) -> list[str]:
     return selected
 
 
+def select_folds(raw_folds: str | None) -> list[int]:
+    available_folds = [int(f) for f in FOLDS]
+    available_fold_set = set(available_folds)
+
+    if raw_folds is None or raw_folds.strip().lower() == "all":
+        return list(available_folds)
+
+    candidate_values = [x.strip() for x in raw_folds.split(",") if x.strip()]
+    if not candidate_values:
+        raise ValueError("--folds was provided but no fold values were parsed.")
+
+    selected: list[int] = []
+    for value in candidate_values:
+        try:
+            fold_id = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid fold '{value}'. Expected integers from {available_folds}."
+            ) from exc
+
+        if fold_id not in available_fold_set:
+            raise ValueError(
+                f"Unsupported fold '{fold_id}'. Available folds: {available_folds}."
+            )
+
+        if fold_id not in selected:
+            selected.append(fold_id)
+
+    return selected
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
     selected = select_model_keys(args.models)
+    selected_folds = select_folds(args.folds)
 
     experiment_root = resolve_project_path(
         args.experiment_root or EXPERIMENT_ROOT, PROJECT_ROOT
@@ -149,6 +190,7 @@ def main() -> None:
         "device": str(device),
         "config": CONFIG,
         "models_to_run": selected,
+        "folds_to_run": [int(f) for f in selected_folds],
         "model_specs": {
             name: {
                 "display_name": spec["display_name"],
@@ -158,7 +200,7 @@ def main() -> None:
             }
             for name, spec in selected_specs.items()
         },
-        "folds": [{"fold": int(f)} for f in FOLDS],
+        "folds": [{"fold": int(f)} for f in selected_folds],
     }
 
     with (experiment_root / "run_manifest.json").open("w", encoding="utf-8") as f:
@@ -178,6 +220,7 @@ def main() -> None:
     print(f"Experiment root: {experiment_root}")
     print(f"Device: {device}")
     print(f"Models to run ({len(selected)}): {selected}")
+    print(f"Folds to run ({len(selected_folds)}): {selected_folds}")
     if args.rerun_completed_folds:
         print("Completed folds will be rerun.")
     else:
@@ -192,7 +235,7 @@ def main() -> None:
 
         completed_folds = []
         remaining_folds = []
-        for fold_id in FOLDS:
+        for fold_id in selected_folds:
             if not args.rerun_completed_folds and is_training_fold_complete(
                 model_root,
                 fold_id,
