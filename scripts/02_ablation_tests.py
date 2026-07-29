@@ -71,6 +71,12 @@ CONFIG = {
 }
 FOLDS = range(1, 6)
 
+# Learning-rate scaling defaults.
+# Effective LR per model is computed as:
+#   lr_eff = lr_base * (batch_size / lr_scale_ref_batch) ** lr_scale_alpha
+LR_SCALE_REF_BATCH = 16
+LR_SCALE_ALPHA = -0.25
+
 
 # ------------------------------ PATHS AND OUTPUTS -------------------------------
 DATA_ROOT = PROJECT_ROOT / "data" / "prepared_data" / CONFIG["volcano"] / "cv_5fold"
@@ -94,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--folds",
         type=str,
-        default="all",
+        default="1,2,4",
         help=(
             "Comma-separated folds to run (e.g. '1,3' or '01,03'). "
             "Use 'all' for all folds. Default: all folds."
@@ -114,7 +120,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not skip folds that already have reports/fold_summary.json.",
     )
+    parser.add_argument(
+        "--lr-scale-ref-batch",
+        type=float,
+        default=LR_SCALE_REF_BATCH,
+        help=(
+            "Reference batch size used for LR scaling. "
+            "Effective lr = base_lr * (batch/ref_batch)^alpha."
+        ),
+    )
+    parser.add_argument(
+        "--lr-scale-alpha",
+        type=float,
+        default=LR_SCALE_ALPHA,
+        help=(
+            "Exponent for LR scaling by batch size. "
+            "Use 0 to disable scaling, 0.5 for sqrt scaling."
+        ),
+    )
     return parser.parse_args()
+
+
+def compute_scaled_lr(base_lr: float, batch_size: int, ref_batch: float, alpha: float) -> float:
+    if ref_batch <= 0:
+        raise ValueError("--lr-scale-ref-batch must be > 0.")
+    if batch_size <= 0:
+        raise ValueError("Batch size must be > 0 for LR scaling.")
+    scale = (float(batch_size) / float(ref_batch)) ** float(alpha)
+    return float(base_lr) * scale
 
 
 def select_model_keys(raw_models: str | None) -> list[str]:
@@ -221,6 +254,13 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Models to run ({len(selected)}): {selected}")
     print(f"Folds to run ({len(selected_folds)}): {selected_folds}")
+    print(
+        "LR scaling: "
+        f"base_lr={CONFIG['lr']:.3e}, "
+        f"base_lr_final={CONFIG['lr_final']:.3e}, "
+        f"ref_batch={float(args.lr_scale_ref_batch):g}, "
+        f"alpha={float(args.lr_scale_alpha):g}"
+    )
     if args.rerun_completed_folds:
         print("Completed folds will be rerun.")
     else:
@@ -231,7 +271,28 @@ def main() -> None:
         model_root = experiment_root / "ablations" / model_key
 
         model_config = dict(CONFIG)
-        model_config["batch_size"] = int(spec["batch_size"] or CONFIG["batch_size"])
+        model_batch_size = int(spec["batch_size"] or CONFIG["batch_size"])
+        model_config["batch_size"] = model_batch_size
+
+        scaled_lr = compute_scaled_lr(
+            base_lr=float(CONFIG["lr"]),
+            batch_size=model_batch_size,
+            ref_batch=float(args.lr_scale_ref_batch),
+            alpha=float(args.lr_scale_alpha),
+        )
+        scaled_lr_final = compute_scaled_lr(
+            base_lr=float(CONFIG["lr_final"]),
+            batch_size=model_batch_size,
+            ref_batch=float(args.lr_scale_ref_batch),
+            alpha=float(args.lr_scale_alpha),
+        )
+        model_config["lr"] = float(scaled_lr)
+        model_config["lr_final"] = float(scaled_lr_final)
+
+        print(
+            f"[{model_key}] batch_size={model_batch_size} | "
+            f"lr={model_config['lr']:.3e} | lr_final={model_config['lr_final']:.3e}"
+        )
 
         completed_folds = []
         remaining_folds = []
