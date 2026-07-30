@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections.abc import Sequence
 
 from utils.station_info import get_crater_coords, get_station_coords
 
@@ -218,6 +219,7 @@ class MuSSeg(nn.Module):
         depth=5,
         kernel_size=7,
         stride=4,
+        dilation=1,
         filters_root=8,
         norm="std",
         feature_dropout=0.0,
@@ -257,7 +259,19 @@ class MuSSeg(nn.Module):
         self.depth = depth
         self.kernel_size = kernel_size
         self.stride = stride
+        self.dilation = dilation
         self.filters_root = filters_root
+        self.encoder_kernel_sizes = self._broadcast_level_param(
+            "kernel_size", kernel_size, self.depth
+        )
+        self.encoder_dilations = self._broadcast_level_param(
+            "dilation", dilation, self.depth
+        )
+        self.encoder_strides = self._broadcast_level_param(
+            "stride", stride, self.depth - 1
+        )
+        self.decoder_kernel_size = self.encoder_kernel_sizes[-1]
+        self.decoder_strides = list(reversed(self.encoder_strides))
         self.bottleneck_attention = bool(bottleneck_attention)
         self.shared_station_encoder = True
         self.station_interaction = str(station_interaction)
@@ -425,10 +439,18 @@ class MuSSeg(nn.Module):
         self.final_dropout = nn.Identity()
 
         self.inc = nn.Conv1d(
-            self.in_channels, self.filters_root, self.kernel_size, padding="same"
+            self.in_channels,
+            self.filters_root,
+            self.encoder_kernel_sizes[0],
+            padding="same",
+            dilation=self.encoder_dilations[0],
         )
         self.inc_shared = nn.Conv1d(
-            1, self.filters_root, self.kernel_size, padding="same"
+            1,
+            self.filters_root,
+            self.encoder_kernel_sizes[0],
+            padding="same",
+            dilation=self.encoder_dilations[0],
         )
         self.in_bn = nn.BatchNorm1d(self.filters_root, eps=1e-3)
         self.in_bn_shared = nn.BatchNorm1d(self.filters_root, eps=1e-3)
@@ -440,8 +462,15 @@ class MuSSeg(nn.Module):
 
         for i in range(self.depth):
             filters = int(2**i * self.filters_root)
+            kernel_i = self.encoder_kernel_sizes[i]
+            dilation_i = self.encoder_dilations[i]
             conv_same = nn.Conv1d(
-                last_filters, filters, self.kernel_size, padding="same", bias=False
+                last_filters,
+                filters,
+                kernel_i,
+                padding="same",
+                dilation=dilation_i,
+                bias=False,
             )
             last_filters = filters
             bn1 = nn.BatchNorm1d(filters, eps=1e-3)
@@ -449,16 +478,14 @@ class MuSSeg(nn.Module):
                 conv_down = None
                 bn2 = None
             else:
-                if i in [1, 2, 3]:
-                    padding = 0
-                else:
-                    padding = self.kernel_size // 2
+                stride_i = self.encoder_strides[i]
                 conv_down = nn.Conv1d(
                     filters,
                     filters,
-                    self.kernel_size,
-                    self.stride,
-                    padding=padding,
+                    kernel_i,
+                    stride_i,
+                    padding=0,
+                    dilation=dilation_i,
                     bias=False,
                 )
                 bn2 = nn.BatchNorm1d(filters, eps=1e-3)
@@ -470,7 +497,7 @@ class MuSSeg(nn.Module):
             channels = int(2**level * self.filters_root)
             self.station_message_blocks[str(level)] = StationPairMessageBlock(
                 channels=channels,
-                kernel_size=self.kernel_size,
+                kernel_size=self.encoder_kernel_sizes[level],
                 aggregation=self.station_message_aggregation,
                 dropout_p=0.0,
                 station_message_ratio=self.station_message_ratio,
@@ -573,13 +600,22 @@ class MuSSeg(nn.Module):
 
         for i in range(self.depth - 1):
             filters = int(2 ** (self.depth - 2 - i) * self.filters_root)
+            stride_up = self.decoder_strides[i]
             conv_up = nn.ConvTranspose1d(
-                last_filters, filters, self.kernel_size, self.stride, bias=False
+                last_filters,
+                filters,
+                self.decoder_kernel_size,
+                stride_up,
+                bias=False,
             )
             last_filters = filters
             bn1 = nn.BatchNorm1d(filters, eps=1e-3)
             conv_same = nn.Conv1d(
-                2 * filters, filters, self.kernel_size, padding="same", bias=False
+                2 * filters,
+                filters,
+                self.decoder_kernel_size,
+                padding="same",
+                bias=False,
             )
             bn2 = nn.BatchNorm1d(filters, eps=1e-3)
 
@@ -587,6 +623,38 @@ class MuSSeg(nn.Module):
 
         self.out = nn.Conv1d(last_filters, self.classes, 1, padding="same")
         self.softmax = torch.nn.Softmax(dim=1)
+
+    @staticmethod
+    def _broadcast_level_param(
+        name: str,
+        value: int | Sequence[int],
+        num_levels: int,
+    ) -> list[int]:
+        if num_levels < 0:
+            raise ValueError(f"num_levels for {name} must be >= 0. Got: {num_levels}.")
+        if num_levels == 0:
+            return []
+
+        if isinstance(value, int):
+            values = [int(value)] * num_levels
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            values = [int(v) for v in value]
+            if len(values) != num_levels:
+                raise ValueError(
+                    f"{name} list must have length {num_levels}. "
+                    f"Got length {len(values)} with value={value}."
+                )
+        else:
+            raise TypeError(
+                f"{name} must be an int or a list/tuple of ints. "
+                f"Got type {type(value).__name__}."
+            )
+
+        invalid = [v for v in values if v <= 0]
+        if invalid:
+            raise ValueError(f"{name} values must be positive integers. Got: {values}.")
+
+        return values
 
     def _apply_bottleneck_attention(self, x: torch.Tensor) -> torch.Tensor:
         # Convert [N, C, T] -> [N, T, C] for batch_first attention.
@@ -740,17 +808,25 @@ class MuSSeg(nn.Module):
         y = self.feature_dropout(y)
         return y.reshape(bsz, n_stations, y.shape[1], y.shape[2])
 
-    def _pad_shared_downsample(self, x: torch.Tensor, level: int) -> torch.Tensor:
-        if level not in {1, 2, 3}:
-            return x
+    def _pad_shared_downsample(
+        self,
+        x: torch.Tensor,
+        *,
+        kernel_size: int,
+        stride: int,
+        dilation: int,
+    ) -> torch.Tensor:
         bsz, n_stations, channels, t_len = x.shape
+        out_len = int(np.ceil(float(t_len) / float(stride)))
+        effective_kernel = dilation * (kernel_size - 1) + 1
+        total_pad = max(0, (out_len - 1) * stride + effective_kernel - t_len)
+        if total_pad == 0:
+            return x
+        pad_left = total_pad // 2
+        pad_right = total_pad - pad_left
+
         y = x.reshape(bsz * n_stations, channels, t_len)
-        if level == 1:
-            y = F.pad(y, (2, 3), "constant", 0)
-        elif level == 2:
-            y = F.pad(y, (1, 3), "constant", 0)
-        elif level == 3:
-            y = F.pad(y, (2, 3), "constant", 0)
+        y = F.pad(y, (pad_left, pad_right), "constant", 0)
         return y.reshape(bsz, n_stations, channels, y.shape[-1])
 
     def forward(self, x: torch.Tensor, logits: bool = True) -> torch.Tensor:
@@ -802,7 +878,12 @@ class MuSSeg(nn.Module):
 
             if conv_down is not None:
                 skips.append(x if store_station_skips else self._station_max(x))
-                x = self._pad_shared_downsample(x, level)
+                x = self._pad_shared_downsample(
+                    x,
+                    kernel_size=self.encoder_kernel_sizes[level],
+                    stride=self.encoder_strides[level],
+                    dilation=self.encoder_dilations[level],
+                )
                 x = self._apply_station_conv(x, conv_down, bn2)
 
         collapsed_before_bottleneck = False

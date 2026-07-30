@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--folds",
         type=str,
-        default="1,2,4",
+        default="1",
         help=(
             "Comma-separated folds to run (e.g. '1,3' or '01,03'). "
             "Use 'all' for all folds. Default: all folds."
@@ -132,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lr-scale-alpha",
         type=float,
-        default=LR_SCALE_ALPHA,
+        default=1,  # LR_SCALE_ALPHA,
         help=(
             "Exponent for LR scaling by batch size. "
             "Use 0 to disable scaling, 0.5 for sqrt scaling."
@@ -141,7 +141,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def compute_scaled_lr(base_lr: float, batch_size: int, ref_batch: float, alpha: float) -> float:
+def compute_scaled_lr(
+    base_lr: float, batch_size: int, ref_batch: float, alpha: float
+) -> float:
     if ref_batch <= 0:
         raise ValueError("--lr-scale-ref-batch must be > 0.")
     if batch_size <= 0:
