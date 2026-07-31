@@ -669,10 +669,10 @@ class MuSSeg(nn.Module):
 
     @staticmethod
     def _merge_skip(skip, x):
-        offset = (x.shape[-1] - skip.shape[-1]) // 2
-        x_resize = x[:, :, offset : offset + skip.shape[-1]]
-
-        return torch.cat([skip, x_resize], dim=1)
+        target_len = int(skip.shape[-1])
+        if int(x.shape[-1]) != target_len:
+            x = F.interpolate(x, size=target_len, mode="linear", align_corners=False)
+        return torch.cat([skip, x], dim=1)
 
     @staticmethod
     def _station_max(x: torch.Tensor) -> torch.Tensor:
@@ -931,7 +931,6 @@ class MuSSeg(nn.Module):
         for (conv_up, bn1, conv_same, bn2), skip in zip(self.up_branch, skips[::-1]):
             x = self.activation(bn1(conv_up(x)))
             x = self.feature_dropout(x)
-            x = x[:, :, 1:-2]
 
             if skip.ndim == 4:
                 if self.use_station_weighted_skips:
