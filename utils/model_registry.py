@@ -66,137 +66,134 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # ===================================================================
     # ACTIVE: 5-FOLD SELECTION
     # ===================================================================
-
     # ---- Tier A: winners / UNet-parity ----
-    "musseg_d4_r16_s222_k127": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "musseg_d4_r16_s222_k127",
-        "model_cls": MuSSeg,
-        "model_kwargs": {
-            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
-            "depth": 4,
-            "filters_root": 16,
-            "stride": [2, 2, 2],
-            "kernel_size": 127,
-            "dilation": [1, 1, 1, 1],
-        },
-        "batch_size": 32,
-        "sort_order": 100,
-        "enabled": True,
-        "aliases": (),
-    },
-    "musseg_d4_r16_s222_k127_d1248": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "musseg_d4_r16_s222_k127_d1248",
-        "model_cls": MuSSeg,
-        "model_kwargs": {
-            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
-            "depth": 4,
-            "filters_root": 16,
-            "stride": [2, 2, 2],
-            "kernel_size": 127,
-            "dilation": [1, 2, 4, 8],
-        },
-        "batch_size": 32,
-        "sort_order": 101,
-        "enabled": True,
-        "aliases": (),
-    },
-    "musseg_d4_r16_s124_k127": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "musseg_d4_r16_s124_k127",
-        "model_cls": MuSSeg,
-        "model_kwargs": {
-            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
-            "depth": 4,
-            "filters_root": 16,
-            "stride": [1, 2, 4],
-            "kernel_size": 127,
-            "dilation": [1, 1, 1, 1],
-        },
-        "batch_size": 24,
-        "sort_order": 102,
-        "enabled": True,
-        "aliases": (),
-    },
-    "musseg_d4_r16_s222_k71": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "musseg_d4_r16_s222_k71",
-        "model_cls": MuSSeg,
-        "model_kwargs": {
-            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
-            "depth": 4,
-            "filters_root": 16,
-            "stride": [2, 2, 2],
-            "kernel_size": 71,
-            "dilation": [1, 1, 1, 1],
-        },
-        "batch_size": 32,
-        "sort_order": 103,
-        "enabled": True,
-        "aliases": (),
-    },
-
-    # ---- Tier C: kernel-size curve + efficiency sweet spot ----
-    "musseg_d4_r16_s222_k51": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "musseg_d4_r16_s222_k51",
-        "model_cls": MuSSeg,
-        "model_kwargs": {
-            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
-            "depth": 4,
-            "filters_root": 16,
-            "stride": [2, 2, 2],
-            "kernel_size": 51,
-            "dilation": [1, 1, 1, 1],
-        },
-        "batch_size": 32,
-        "sort_order": 104,
-        "enabled": True,
-        "aliases": (),
-    },
-    "musseg_d4_r16_s222_k31": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "musseg_d4_r16_s222_k31",
-        "model_cls": MuSSeg,
-        "model_kwargs": {
-            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
-            "depth": 4,
-            "filters_root": 16,
-            "stride": [2, 2, 2],
-            "kernel_size": 31,
-            "dilation": [1, 1, 1, 1],
-        },
-        "batch_size": 32,
-        "sort_order": 105,
-        "enabled": True,
-        "aliases": (),
-    },
-    "musseg_d4_r16_s222_k51_31_21_11": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "musseg_d4_r16_s222_k51_31_21_11",
-        "model_cls": MuSSeg,
-        "model_kwargs": {
-            **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
-            "depth": 4,
-            "filters_root": 16,
-            "stride": [2, 2, 2],
-            "kernel_size": [51, 31, 21, 11],
-            "dilation": [1, 1, 1, 1],
-        },
-        "batch_size": 32,
-        "sort_order": 106,
-        "enabled": True,
-        "aliases": (),
-    },
-
+    # "musseg_d4_r16_s222_k127": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "musseg_d4_r16_s222_k127",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "depth": 4,
+    #         "filters_root": 16,
+    #         "stride": [2, 2, 2],
+    #         "kernel_size": 127,
+    #         "dilation": [1, 1, 1, 1],
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 100,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "musseg_d4_r16_s222_k127_d1248": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "musseg_d4_r16_s222_k127_d1248",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "depth": 4,
+    #         "filters_root": 16,
+    #         "stride": [2, 2, 2],
+    #         "kernel_size": 127,
+    #         "dilation": [1, 2, 4, 8],
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 101,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "musseg_d4_r16_s124_k127": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "musseg_d4_r16_s124_k127",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "depth": 4,
+    #         "filters_root": 16,
+    #         "stride": [1, 2, 4],
+    #         "kernel_size": 127,
+    #         "dilation": [1, 1, 1, 1],
+    #     },
+    #     "batch_size": 24,
+    #     "sort_order": 102,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "musseg_d4_r16_s222_k71": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "musseg_d4_r16_s222_k71",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "depth": 4,
+    #         "filters_root": 16,
+    #         "stride": [2, 2, 2],
+    #         "kernel_size": 71,
+    #         "dilation": [1, 1, 1, 1],
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 103,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # # ---- Tier C: kernel-size curve + efficiency sweet spot ----
+    # "musseg_d4_r16_s222_k51": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "musseg_d4_r16_s222_k51",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "depth": 4,
+    #         "filters_root": 16,
+    #         "stride": [2, 2, 2],
+    #         "kernel_size": 51,
+    #         "dilation": [1, 1, 1, 1],
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 104,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "musseg_d4_r16_s222_k31": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "musseg_d4_r16_s222_k31",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "depth": 4,
+    #         "filters_root": 16,
+    #         "stride": [2, 2, 2],
+    #         "kernel_size": 31,
+    #         "dilation": [1, 1, 1, 1],
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 105,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "musseg_d4_r16_s222_k51_31_21_11": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "musseg_d4_r16_s222_k51_31_21_11",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSEG_PI_SE_LSA_BA_BASE_KWARGS),
+    #         "depth": 4,
+    #         "filters_root": 16,
+    #         "stride": [2, 2, 2],
+    #         "kernel_size": [51, 31, 21, 11],
+    #         "dilation": [1, 1, 1, 1],
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 106,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
     # ---- Tier D: new probes ----
     # Kernel ceiling test: confirm k127 is the plateau, not still climbing.
     "musseg_d4_r16_s222_k159": {
@@ -212,7 +209,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "kernel_size": 159,
             "dilation": [1, 1, 1, 1],
         },
-        "batch_size": 24,
+        "batch_size": 32,
         "sort_order": 107,
         "enabled": True,
         "aliases": (),
@@ -233,7 +230,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "use_distance_attn_bias": True,
             "use_distance_bottleneck_emb": True,
         },
-        "batch_size": 24,
+        "batch_size": 32,
         "sort_order": 108,
         "enabled": True,
         "aliases": (),
@@ -252,76 +249,73 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "dilation": [1, 1, 1, 1],
             "use_station_weighted_skips": True,
         },
-        "batch_size": 24,
+        "batch_size": 32,
         "sort_order": 109,
         "enabled": True,
         "aliases": (),
     },
-
     # ---- Tier B: baselines ----
-    "unet": {
-        "family": "unet",
-        "trainer_kind": "2d",
-        "display_name": "UNet",
-        "model_cls": UNet,
-        "model_kwargs": {
-            "in_channels": 1,
-            "out_channels": 6,
-            "init_features": 16,
-            "depth": 5,
-        },
-        "batch_size": 32,
-        "sort_order": 5,
-        "enabled": True,
-        "aliases": (),
-    },
-    "unet_attention": {
-        "family": "unet",
-        "trainer_kind": "2d",
-        "display_name": "UNetBottleneckAttention",
-        "model_cls": UNetBottleneckAttention,
-        "model_kwargs": {
-            "in_channels": 1,
-            "out_channels": 6,
-            "init_features": 16,
-            "depth": 5,
-            "bottleneck_attn_heads": 4,
-            "bottleneck_attn_dropout": 0.2,
-            "bottleneck_attn_ff_mult": 2,
-            "feature_dropout": 0.2,
-        },
-        "batch_size": 32,
-        "sort_order": 6,
-        "enabled": True,
-        "aliases": (),
-    },
-    "phasenet": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "PhaseNet",
-        "model_cls": PhaseNet,
-        "model_kwargs": deepcopy(PHASENET_BASE_KWARGS),
-        "batch_size": 64,
-        "sort_order": 10,
-        "enabled": True,
-        "aliases": (),
-    },
-    "phasenet_bottleneck_attention": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "display_name": "PhaseNetBottleneckAttention",
-        "model_cls": PhaseNetBottleneckAttention,
-        "model_kwargs": deepcopy(PHASENET_BOTTLENECK_ATTENTION_BASE_KWARGS),
-        "batch_size": 64,
-        "sort_order": 13,
-        "enabled": True,
-        "aliases": ("phasenet_ba",),
-    },
-
+    # "unet": {
+    #     "family": "unet",
+    #     "trainer_kind": "2d",
+    #     "display_name": "UNet",
+    #     "model_cls": UNet,
+    #     "model_kwargs": {
+    #         "in_channels": 1,
+    #         "out_channels": 6,
+    #         "init_features": 16,
+    #         "depth": 5,
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 5,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "unet_attention": {
+    #     "family": "unet",
+    #     "trainer_kind": "2d",
+    #     "display_name": "UNetBottleneckAttention",
+    #     "model_cls": UNetBottleneckAttention,
+    #     "model_kwargs": {
+    #         "in_channels": 1,
+    #         "out_channels": 6,
+    #         "init_features": 16,
+    #         "depth": 5,
+    #         "bottleneck_attn_heads": 4,
+    #         "bottleneck_attn_dropout": 0.2,
+    #         "bottleneck_attn_ff_mult": 2,
+    #         "feature_dropout": 0.2,
+    #     },
+    #     "batch_size": 32,
+    #     "sort_order": 6,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "phasenet": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "PhaseNet",
+    #     "model_cls": PhaseNet,
+    #     "model_kwargs": deepcopy(PHASENET_BASE_KWARGS),
+    #     "batch_size": 64,
+    #     "sort_order": 10,
+    #     "enabled": True,
+    #     "aliases": (),
+    # },
+    # "phasenet_bottleneck_attention": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "1d",
+    #     "display_name": "PhaseNetBottleneckAttention",
+    #     "model_cls": PhaseNetBottleneckAttention,
+    #     "model_kwargs": deepcopy(PHASENET_BOTTLENECK_ATTENTION_BASE_KWARGS),
+    #     "batch_size": 64,
+    #     "sort_order": 13,
+    #     "enabled": True,
+    #     "aliases": ("phasenet_ba",),
+    # },
     # ===================================================================
     # INACTIVE: previously tested ablations (kept for reference)
     # ===================================================================
-
     # ---- stride / early-downsample variants ----
     # "musseg_d4_r16_s122": {
     #     "family": "phasenet",
@@ -391,7 +385,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     "enabled": True,
     #     "aliases": (),
     # },
-
     # ---- kernel-size sweep (remaining points) ----
     # "musseg_d4_r16_s222_k91": {
     #     "family": "phasenet",
@@ -483,7 +476,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     "enabled": True,
     #     "aliases": (),
     # },
-
     # ---- dilation / increasing-kernel-with-depth variants ----
     # "musseg_d4_r16_s222_k51_d2": {
     #     "family": "phasenet",
@@ -557,7 +549,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     "enabled": True,
     #     "aliases": (),
     # },
-
     # ---- depth / root capacity sweep ----
     # "musseg_pi_se_lsa_ba_depth_6_root_8": {
     #     "family": "phasenet",
@@ -649,7 +640,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     "enabled": True,
     #     "aliases": (),
     # },
-
     # ---- distance / weighted-skip variants (on old backbone) ----
     # "musseg_pi_se_lsa_ba_dist_both": {
     #     "family": "phasenet",
@@ -749,7 +739,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     "enabled": True,
     #     "aliases": (),
     # },
-
     # ---- station-interaction / merge variants ----
     # "musseg_pi_se_ba": {
     #     "family": "phasenet",
@@ -873,7 +862,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     "enabled": True,
     #     "aliases": (),
     # },
-
     # ---- PhaseNO (disabled, import commented at top) ----
     # "phaseno": {
     #     "family": "phasenet",
@@ -892,6 +880,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     "aliases": (),
     # },
 }
+
 
 def get_model_spec(model_key: str) -> dict[str, Any]:
     if model_key in MODEL_REGISTRY:
