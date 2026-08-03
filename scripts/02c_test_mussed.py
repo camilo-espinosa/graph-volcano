@@ -8,13 +8,15 @@ Implements:
 - Phase 3 training loop
 - Full training pipeline with validation and checkpointing
 
+Features:
+- Displays batch progress during training (Epoch X [Batch Y/Z])
+- Tracks Mean F1 Score and Mean IoU on validation set
+- Automatic best model checkpointing based on mAP
+
 Usage:
-    python scripts/02c_test_mussed.py \
-        --train-npz path/to/train.npz \
-        --val-npz path/to/val.npz \
-        --epochs 50 \
-        --batch-size 16 \
-        --output-dir results/mussed
+    python scripts/02c_test_mussed.py                    # Uses NVCHVC fold_01 defaults
+    python scripts/02c_test_mussed.py --epochs 100       # Custom epochs
+    python scripts/02c_test_mussed.py --batch-size 16    # Custom batch size
 """
 
 from __future__ import annotations
@@ -41,37 +43,34 @@ from utils.trainer_detr_1d import DETRTrainer
 # ================================ CONFIG ================================
 # Best ablation from model registry: musseg_d4_r16_s222_k127
 # Configured as encoder for MuSSED with late attention and bottleneck attention
+# Note: use_temporal_projection=False passes bottleneck features directly to decoder
+#       with only positional encoding (more efficient)
 
 MUSSED_CONFIG = {
     # Encoder (best MuSSeg ablation: musseg_d4_r16_s222_k127)
-    "in_channels": 8,
     "num_classes": 6,
     "depth": 4,
     "kernel_size": 127,
     "stride": [2, 2, 2],
     "dilation": [1, 1, 1, 1],
-    "filters_root": 16,
-    "norm": "std",
-    "feature_dropout": 0.0,
+    "filters_root": 16,  # encoder output channels = 16 * 2^3 = 128
     "bottleneck_attention": True,
-    # Station interaction: always late_attention at final encoder level (automatic)
+    # Station interaction: always late attention at the final encoder level
     "bottleneck_attn_heads": 4,
-    "bottleneck_attn_dropout": 0.0,
     "bottleneck_attn_ff_mult": 2,
     "station_attn_heads": 4,
-    "station_attn_dropout": 0.0,
     "station_attn_ff_mult": 2,
-    "volcano_name": "NVCHVC",
-    "use_distance_attn_bias": False,
-    "use_distance_bottleneck_emb": False,
-    "use_station_weighted_skips": False,
     # Detection head
-    "num_queries": 3,
-    "query_dim": 128,
+    "num_queries": 10,
+    "query_dim": 128,  # Must match encoder output channels when use_temporal_projection=False
     "hidden_dim": 256,
     "num_decoder_heads": 4,
     "num_decoder_layers": 2,
     "decoder_dropout": 0.1,
+    # Decoder optimization: skip unnecessary projection layer
+    "use_temporal_projection": False,
+    # Constrained interval regression (0 <= start <= center <= end <= 1)
+    "constrain_intervals": True,
 }
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -186,6 +185,7 @@ def main(args):
         output_dir=output_dir,
         checkpoint_interval=args.checkpoint_interval,
         confidence_threshold=args.confidence_threshold,
+        lines_per_epoch=args.lines_per_epoch,
     )
 
     print("\n" + "=" * 80)
@@ -205,13 +205,13 @@ def parse_args():
     parser.add_argument(
         "--train-npz",
         type=str,
-        required=True,
+        default="data/prepared_data/NVCHVC/cv_5fold/fold_01/train.npz",
         help="Path to training data NPZ file",
     )
     parser.add_argument(
         "--val-npz",
         type=str,
-        default=None,
+        default="data/prepared_data/NVCHVC/cv_5fold/fold_01/val.npz",
         help="Path to validation data NPZ file (optional)",
     )
 
@@ -225,7 +225,7 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
+        default=40,
         help="Training batch size",
     )
     parser.add_argument(
@@ -257,6 +257,12 @@ def parse_args():
         type=float,
         default=0.5,
         help="Confidence threshold for evaluation",
+    )
+    parser.add_argument(
+        "--lines-per-epoch",
+        type=int,
+        default=5,
+        help="Number of progress lines to print per epoch",
     )
 
     # Output

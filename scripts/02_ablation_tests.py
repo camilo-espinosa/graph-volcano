@@ -45,9 +45,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.train_utils import (
     cleanup_gpu_cache,
     ensure_fold_data_exists,
-    train_one_unet_fold,
-    train_one_ablation_fold,
 )
+from utils.trainer_segmentation import train_one_segmentation_fold
+from utils.trainer_detection import train_one_event_detection_fold
 from utils.fold_io_utils import is_training_fold_complete
 from utils.model_registry import MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
@@ -228,7 +228,7 @@ def main() -> None:
         "folds_to_run": [int(f) for f in selected_folds],
         "model_specs": {
             name: {
-                "display_name": spec["display_name"],
+                "display_name": name,
                 "trainer_kind": spec["trainer_kind"],
                 "batch_size": spec["batch_size"],
                 "model_kwargs": spec["model_kwargs"],
@@ -326,9 +326,23 @@ def main() -> None:
             ensure_fold_data_exists(fold_data_dir)
 
             fold_out_dir = model_root / f"fold_{fold_id:02d}"
-            if spec["trainer_kind"] == "2d":
-                train_one_unet_fold(
-                    model_key=model_key,
+            trainer_kind = spec["trainer_kind"]
+
+            if trainer_kind in ("2d", "1d"):
+                # Unified segmentation trainer for both 2D and 1D models
+                train_one_segmentation_fold(
+                    trainer_kind=trainer_kind,
+                    model_key_or_kwargs=model_key,
+                    fold_id=fold_id,
+                    fold_data_dir=fold_data_dir,
+                    fold_out_dir=fold_out_dir,
+                    device=device,
+                    config=model_config,
+                )
+            elif trainer_kind == "detr":
+                # Event detection trainer for MuSSED
+                train_one_event_detection_fold(
+                    model_key_or_kwargs=model_key,
                     fold_id=fold_id,
                     fold_data_dir=fold_data_dir,
                     fold_out_dir=fold_out_dir,
@@ -336,17 +350,9 @@ def main() -> None:
                     config=model_config,
                 )
             else:
-                train_one_ablation_fold(
-                    ablation_name=model_key,
-                    model_kwargs={
-                        "_model_cls": spec["model_cls"],
-                        **spec["model_kwargs"],
-                    },
-                    fold_id=fold_id,
-                    fold_data_dir=fold_data_dir,
-                    fold_out_dir=fold_out_dir,
-                    device=device,
-                    config=model_config,
+                raise ValueError(
+                    f"Unknown trainer_kind '{trainer_kind}' for model {model_key}. "
+                    f"Expected one of: '2d', '1d', 'detr'."
                 )
         cleanup_gpu_cache()
 

@@ -92,6 +92,7 @@ class DETRTrainer:
         self,
         train_loader: DataLoader,
         epoch: int = 0,
+        lines_per_epoch: int = 5,
     ) -> Dict[str, float]:
         """
         Train for one epoch.
@@ -99,6 +100,7 @@ class DETRTrainer:
         Args:
             train_loader: Training data loader
             epoch: Epoch number (for logging)
+            lines_per_epoch: Number of progress lines to print per epoch
 
         Returns:
             Dict with training metrics
@@ -110,15 +112,9 @@ class DETRTrainer:
         total_loss_conf = 0.0
 
         num_batches = len(train_loader)
+        print_interval = max(1, num_batches // lines_per_epoch)
 
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch} [Train]",
-            total=num_batches,
-            leave=False,
-        )
-
-        for batch_idx, batch in enumerate(pbar):
+        for batch_idx, batch in enumerate(train_loader):
             # Move batch to device
             batch = self._move_batch_to_device(batch)
 
@@ -148,8 +144,12 @@ class DETRTrainer:
             total_loss_bbox += loss_dict["loss_bbox"].item()
             total_loss_conf += loss_dict["loss_conf"].item()
 
-            pbar.update(1)
-            pbar.set_postfix({"loss": loss.item()})
+            # Print progress
+            if (batch_idx + 1) % print_interval == 0 or batch_idx == 0:
+                print(
+                    f"  [Epoch {epoch}] Batch {batch_idx + 1}/{num_batches} | "
+                    f"Loss: {loss.item():.4f}"
+                )
 
         # Average over batch
         return {
@@ -164,6 +164,7 @@ class DETRTrainer:
         val_loader: DataLoader,
         epoch: int = 0,
         confidence_threshold: float = 0.5,
+        lines_per_epoch: int = 5,
     ) -> Dict[str, float]:
         """
         Evaluate on validation set.
@@ -172,6 +173,7 @@ class DETRTrainer:
             val_loader: Validation data loader
             epoch: Epoch number (for logging)
             confidence_threshold: Confidence threshold for predictions
+            lines_per_epoch: Number of progress lines to print per epoch
 
         Returns:
             Dict with validation metrics
@@ -189,16 +191,10 @@ class DETRTrainer:
         all_targets = []
 
         num_batches = len(val_loader)
-
-        pbar = tqdm(
-            val_loader,
-            desc=f"Epoch {epoch} [Val]",
-            total=num_batches,
-            leave=False,
-        )
+        print_interval = max(1, num_batches // lines_per_epoch)
 
         with torch.no_grad():
-            for batch in pbar:
+            for batch_idx, batch in enumerate(val_loader):
                 batch = self._move_batch_to_device(batch)
 
                 # Forward pass
@@ -218,7 +214,9 @@ class DETRTrainer:
                         predictions[key].detach().cpu().numpy()
                     )
 
-                pbar.update(1)
+                # Print progress
+                if (batch_idx + 1) % print_interval == 0 or batch_idx == 0:
+                    print(f"  [Epoch {epoch}] Val Batch {batch_idx + 1}/{num_batches}")
 
         # Concatenate predictions
         predictions_for_metrics = {}
@@ -234,6 +232,15 @@ class DETRTrainer:
             confidence_threshold=confidence_threshold,
         )
 
+        # Compute F1 at IoU=0.5 and mean IoU
+        f1_score = self.metrics_fn.compute_f1(
+            predictions_for_metrics,
+            all_targets,
+            iou_threshold=0.5,
+            confidence_threshold=confidence_threshold,
+        )
+        metrics_dict["F1@0.5"] = f1_score
+
         # Add loss to metrics
         metrics_dict["loss_val"] = total_loss / num_batches
 
@@ -247,6 +254,7 @@ class DETRTrainer:
         output_dir: Path | str = "results/mussed",
         checkpoint_interval: int = 1,
         confidence_threshold: float = 0.5,
+        lines_per_epoch: int = 5,
     ) -> Dict[str, list]:
         """
         Full training loop.
@@ -258,6 +266,7 @@ class DETRTrainer:
             output_dir: Directory to save checkpoints and logs
             checkpoint_interval: Save checkpoint every N epochs
             confidence_threshold: Confidence threshold for evaluation
+            lines_per_epoch: Number of progress lines to print per epoch
 
         Returns:
             Dict with training history
@@ -281,15 +290,17 @@ class DETRTrainer:
 
         for epoch in range(num_epochs):
             # Training
-            train_metrics = self.train_epoch(train_loader, epoch=epoch)
+            train_metrics = self.train_epoch(
+                train_loader, epoch=epoch + 1, lines_per_epoch=lines_per_epoch
+            )
             history["train_loss"].append(train_metrics["loss_total"])
             history["train_loss_class"].append(train_metrics["loss_class"])
             history["train_loss_bbox"].append(train_metrics["loss_bbox"])
             history["train_loss_conf"].append(train_metrics["loss_conf"])
 
             print(
-                f"Epoch {epoch + 1}/{num_epochs} | "
-                f"Loss: {train_metrics['loss_total']:.4f} | "
+                f"[Epoch {epoch + 1}/{num_epochs}] "
+                f"Train Loss: {train_metrics['loss_total']:.4f} | "
                 f"Class: {train_metrics['loss_class']:.4f} | "
                 f"BBox: {train_metrics['loss_bbox']:.4f} | "
                 f"Conf: {train_metrics['loss_conf']:.4f}"
@@ -299,14 +310,24 @@ class DETRTrainer:
             if val_loader is not None:
                 val_metrics = self.evaluate(
                     val_loader,
-                    epoch=epoch,
+                    epoch=epoch + 1,
                     confidence_threshold=confidence_threshold,
+                    lines_per_epoch=lines_per_epoch,
                 )
                 history["val_metrics"].append(val_metrics)
 
                 current_map = val_metrics.get("mAP", 0.0)
+                f1_score = val_metrics.get("F1@0.5", 0.0)
+                mean_iou = np.mean(
+                    [
+                        val_metrics.get(f"mAP@{t:.1f}", 0.0)
+                        for t in self.metrics_fn.iou_thresholds
+                    ]
+                )
+
                 print(
-                    f"  Val Loss: {val_metrics['loss_val']:.4f} | mAP: {current_map:.4f}"
+                    f"  Val Loss: {val_metrics['loss_val']:.4f} | "
+                    f"mAP: {current_map:.4f} | F1@0.5: {f1_score:.4f} | Mean IoU: {mean_iou:.4f}"
                 )
 
                 # Save best checkpoint
@@ -315,7 +336,7 @@ class DETRTrainer:
                     best_epoch = epoch
                     best_checkpoint_path = output_dir / "best_model.pt"
                     self.save_checkpoint(best_checkpoint_path)
-                    print(f"  Saved best model to {best_checkpoint_path}")
+                    print(f"  → Saved best model to {best_checkpoint_path}")
 
             # Save periodic checkpoint
             if (epoch + 1) % checkpoint_interval == 0:

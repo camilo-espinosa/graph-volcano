@@ -147,12 +147,11 @@ encoder_features = self.encoder(x)  # [B, C, T']
 1. **Reshape for station processing**: `[B, S, T] → [B, S, 1, T]`
    - Each station is processed independently initially
    
-2. **Downsampling path** (U-Net encoder):
+2. **Downsampling path** (CNN encoder):
    - Apply shared convolution: `[B, S, 1, T] → [B, S, F₀, T]`
    - For each of `depth` levels:
      - Apply station-wise convolution (same size)
      - Apply station attention at the final level (depth-1)
-     - Store skip connection
      - Downsample: `[B, S, Fᵢ, T] → [B, S, Fᵢ₊₁, T/2ⁱ]`
 
 3. **Bottleneck** (final level):
@@ -390,13 +389,12 @@ def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
 
 ### 1. TemporalEncoder (The Backbone)
 
-**Based on**: MuSSeg (U-Net-like encoder-decoder)
+**Based on**: MuSSeg architecture (temporal CNN encoder with station awareness)
 
 **Key Features**:
 - **Station-Aware**: Can process 2-20 stations in a single forward pass
 - **Late Station Attention**: At the final encoder level (depth-1), stations attend to each other
 - **Bottleneck Attention**: Optional temporal attention at the bottleneck
-- **Skip Connections**: Preserved and merged on upsampling
 - **Distance Priors**: Optional station distance biases
 
 **Configuration (Best Ablation)**:

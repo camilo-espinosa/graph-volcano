@@ -246,8 +246,8 @@ class DETREventLoss(torch.nn.Module):
         # Focal weight: (1 - p_t)^gamma
         focal_weight = (1.0 - probs) ** self.focal_gamma
 
-        # Alpha weight
-        alpha = self.focal_alpha if targets != 0 else (1 - self.focal_alpha)
+        # Alpha weight - apply element-wise based on whether target is 0 (background)
+        alpha = torch.where(targets == 0, 1.0 - self.focal_alpha, self.focal_alpha)
 
         focal_loss = -alpha * focal_weight * log_probs_per_sample
 
