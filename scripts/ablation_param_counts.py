@@ -44,7 +44,6 @@ def main() -> None:
         rows.append(
             {
                 "model_key": model_key,
-                "display_name": spec["display_name"],
                 "family": spec["family"],
                 "trainer_kind": spec["trainer_kind"],
                 "total_params": total,

@@ -68,11 +68,35 @@ class StationAttentionBlock(nn.Module):
             nn.GELU(),
             nn.Linear(channels * ff_mult, channels),
         )
+        self.last_attn_weights: torch.Tensor | None = None
+        self.capture_attention_weights = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        station_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         pooled = x.mean(dim=-1)  # [B, S, C]
         normed = self.norm1(pooled)
-        attn_out, _ = self.attn(normed, normed, normed, need_weights=False)
+        if self.capture_attention_weights:
+            attn_out, attn_weights = self.attn(
+                normed,
+                normed,
+                normed,
+                need_weights=True,
+                average_attn_weights=False,
+                key_padding_mask=station_key_padding_mask,
+            )
+            self.last_attn_weights = attn_weights.detach()
+        else:
+            attn_out, _ = self.attn(
+                normed,
+                normed,
+                normed,
+                need_weights=False,
+                key_padding_mask=station_key_padding_mask,
+            )
+            self.last_attn_weights = None
         pooled = pooled + attn_out
         pooled = pooled + self.ff(self.norm2(pooled))
         return x + pooled[:, :, :, None]
@@ -102,11 +126,24 @@ class TemporalBottleneckAttention(nn.Module):
             nn.GELU(),
             nn.Linear(channels * ff_mult, channels),
         )
+        self.last_attn_weights: torch.Tensor | None = None
+        self.capture_attention_weights = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2)  # [N, T, C]
         normed = self.norm1(x)
-        attn_out, _ = self.attn(normed, normed, normed, need_weights=False)
+        if self.capture_attention_weights:
+            attn_out, attn_weights = self.attn(
+                normed,
+                normed,
+                normed,
+                need_weights=True,
+                average_attn_weights=True,
+            )
+            self.last_attn_weights = attn_weights.detach()
+        else:
+            attn_out, _ = self.attn(normed, normed, normed, need_weights=False)
+            self.last_attn_weights = None
         x = x + attn_out
         x = x + self.ff(self.norm2(x))
         return x.transpose(1, 2)  # [N, C, T]
@@ -239,13 +276,26 @@ class MultiStationTemporalEncoder(nn.Module):
                 f"encoder expects [B, S, T] or [B, S, 1, T], got {tuple(x.shape)}."
             )
 
+        # Zero-valued stations encode missingness and must be masked out.
+        station_missing_mask = x.eq(0).all(dim=-1)  # [B, S], True means missing
+        if station_missing_mask.all(dim=1).any():
+            raise RuntimeError(
+                "Encountered sample(s) with all stations missing (all-zero waveforms)."
+            )
+        station_valid_scale = (~station_missing_mask).to(x.dtype)[:, :, None, None]
+
         x = x[:, :, None, :]  # [B, S, 1, T]
         x = self._station_conv(x, self.stem_conv, self.stem_bn)
+        x = x * station_valid_scale
 
         for level, (conv_same, bn_same, conv_down, bn_down) in enumerate(self.levels):
             x = self._station_conv(x, conv_same, bn_same)
+            x = x * station_valid_scale
             if level == self.depth - 1:
-                x = self.station_attention(x)
+                x = self.station_attention(
+                    x, station_key_padding_mask=station_missing_mask
+                )
+                x = x * station_valid_scale
             if conv_down is not None:
                 x = self._pad_for_downsample(
                     x,
@@ -254,12 +304,14 @@ class MultiStationTemporalEncoder(nn.Module):
                     dilation=self.dilations[level],
                 )
                 x = self._station_conv(x, conv_down, bn_down)
+                x = x * station_valid_scale
 
         if self.bottleneck_attention is not None:
             bsz, n_stations, channels, t_len = x.shape
             x = x.reshape(bsz * n_stations, channels, t_len)
             x = self.bottleneck_attention(x)
             x = x.reshape(bsz, n_stations, channels, t_len)
+            x = x * station_valid_scale
 
         # Permutation-invariant station merge.
         return x.max(dim=1).values  # [B, C, T']

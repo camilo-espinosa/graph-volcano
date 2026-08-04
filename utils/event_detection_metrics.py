@@ -221,6 +221,10 @@ class EventDetectionMetrics:
 
                     t_start, t_end, t_b, _ = target
 
+                    # Predictions can only match targets from the same sample.
+                    if pred_b != t_b:
+                        continue
+
                     # Compute temporal IoU
                     iou = self._temporal_iou(pred_start, pred_end, t_start, t_end)
 
@@ -283,6 +287,158 @@ class EventDetectionMetrics:
 
         return float(inter_len / union_len)
 
+    def compute_detection_summary(
+        self,
+        predictions: Dict[str, np.ndarray],
+        targets: list[list[EventInterval]],
+        iou_threshold: float = 0.5,
+        confidence_threshold: float = 0.5,
+    ) -> Dict[str, object]:
+        """
+        Compute confusion matrix and per-class metrics from one shared matching pass.
+
+        Confusion matrix convention:
+        - Rows: true class (0 = No Event)
+        - Cols: predicted class (0 = No Detection)
+        - Unmatched GT event => (true=class_id, pred=0)
+        - Unmatched predicted event => (true=0, pred=class_id)
+        """
+        class_logits = np.asarray(predictions["class_logits"])
+        pred_starts = np.asarray(predictions["start"])
+        pred_ends = np.asarray(predictions["end"])
+        pred_conf_logits = np.asarray(predictions["confidence"])
+
+        if class_logits.ndim != 3:
+            raise ValueError(
+                f"Expected class_logits to be [B, Nq, C], got shape {class_logits.shape}."
+            )
+        if pred_starts.shape[:2] != class_logits.shape[:2]:
+            raise ValueError(
+                f"Start shape mismatch: starts {pred_starts.shape} vs class_logits {class_logits.shape}."
+            )
+        if pred_ends.shape[:2] != class_logits.shape[:2]:
+            raise ValueError(
+                f"End shape mismatch: ends {pred_ends.shape} vs class_logits {class_logits.shape}."
+            )
+        if pred_conf_logits.shape[:2] != class_logits.shape[:2]:
+            raise ValueError(
+                f"Confidence shape mismatch: confidence {pred_conf_logits.shape} vs class_logits {class_logits.shape}."
+            )
+
+        batch_size, n_queries, _ = class_logits.shape
+        if len(targets) != batch_size:
+            raise ValueError(
+                f"Target length mismatch: targets={len(targets)} vs predictions batch={batch_size}."
+            )
+
+        cm = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
+
+        per_class_target_count = {c: 0 for c in range(1, self.num_classes)}
+        per_class_iou_sum = {c: 0.0 for c in range(1, self.num_classes)}
+
+        for b in range(batch_size):
+            probs = softmax(class_logits[b], axis=-1)  # [Nq, C]
+            conf_sigmoid = 1.0 / (1.0 + np.exp(-pred_conf_logits[b, :, 0]))  # [Nq]
+
+            sample_preds = []
+            for q in range(n_queries):
+                pred_class = int(np.argmax(probs[q, 1:]) + 1)
+                pred_score = float(probs[q, pred_class] * conf_sigmoid[q])
+                if pred_score < confidence_threshold:
+                    continue
+
+                sample_preds.append(
+                    {
+                        "class_id": pred_class,
+                        "start": float(np.clip(pred_starts[b, q, 0], 0.0, 1.0)),
+                        "end": float(np.clip(pred_ends[b, q, 0], 0.0, 1.0)),
+                        "score": pred_score,
+                    }
+                )
+
+            sample_preds.sort(key=lambda item: item["score"], reverse=True)
+            matched_pred = np.zeros(len(sample_preds), dtype=bool)
+
+            for target in targets[b]:
+                if target.class_id == 0:
+                    continue
+
+                true_class = int(target.class_id)
+                per_class_target_count[true_class] += 1
+
+                best_pred_idx = -1
+                best_iou = 0.0
+
+                for p_idx, pred in enumerate(sample_preds):
+                    if matched_pred[p_idx]:
+                        continue
+
+                    iou = self._temporal_iou(
+                        pred["start"],
+                        pred["end"],
+                        target.start_norm,
+                        target.end_norm,
+                    )
+
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_pred_idx = p_idx
+
+                if best_pred_idx >= 0 and best_iou >= iou_threshold:
+                    matched_pred[best_pred_idx] = True
+                    pred_class = int(sample_preds[best_pred_idx]["class_id"])
+                    cm[true_class, pred_class] += 1
+                    if pred_class == true_class:
+                        per_class_iou_sum[true_class] += float(best_iou)
+                else:
+                    # Missed detection for this true event.
+                    cm[true_class, 0] += 1
+
+            # Unmatched predictions become false positives against true "No Event".
+            for p_idx, pred in enumerate(sample_preds):
+                if matched_pred[p_idx]:
+                    continue
+                cm[0, int(pred["class_id"])] += 1
+
+        per_class_stats: Dict[int, Dict[str, float]] = {}
+        per_class_f1: Dict[int, float] = {}
+        per_class_iou: Dict[int, float] = {}
+
+        for class_id in range(1, self.num_classes):
+            tp = int(cm[class_id, class_id])
+            fp = int(np.sum(cm[:, class_id]) - tp)
+            fn = int(np.sum(cm[class_id, :]) - tp)
+
+            precision = float(tp / max(1, tp + fp))
+            recall = float(tp / max(1, tp + fn))
+            f1 = float(2 * precision * recall / max(1e-7, precision + recall))
+
+            iou_avg = (
+                float(per_class_iou_sum[class_id] / per_class_target_count[class_id])
+                if per_class_target_count[class_id] > 0
+                else 0.0
+            )
+
+            per_class_stats[class_id] = {
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "iou": iou_avg,
+                "target_count": int(per_class_target_count[class_id]),
+            }
+            per_class_f1[class_id] = f1
+            per_class_iou[class_id] = iou_avg
+
+        return {
+            "confusion_matrix": cm,
+            "per_class": per_class_stats,
+            "per_class_f1": per_class_f1,
+            "per_class_iou": per_class_iou,
+        }
+
     def compute_f1(
         self,
         predictions: Dict[str, np.ndarray],
@@ -295,15 +451,15 @@ class EventDetectionMetrics:
         """
         batch_size = predictions["class_logits"].shape[0]
 
-        # Collect all predictions and targets
-        all_predictions = []
-        all_targets = []
+        # Collect all predictions and targets with sample indices.
+        all_predictions: list[tuple[int, EventInterval, float]] = []
+        all_targets: list[tuple[int, EventInterval]] = []
 
         for b in range(batch_size):
             target_list = targets[b]
 
             # Add targets
-            all_targets.extend(target_list)
+            all_targets.extend((b, target) for target in target_list)
 
             # Extract predictions
             class_logits = predictions["class_logits"]
@@ -337,7 +493,7 @@ class EventDetectionMetrics:
                         start_frame=int(start[b, q, 0]),
                         end_frame=int(end[b, q, 0]),
                     )
-                    all_predictions.append(event)
+                    all_predictions.append((b, event, float(pred_conf)))
 
         if len(all_predictions) == 0 and len(all_targets) == 0:
             return 1.0  # Perfect score if both empty
@@ -345,16 +501,20 @@ class EventDetectionMetrics:
         if len(all_predictions) == 0 or len(all_targets) == 0:
             return 0.0  # No predictions or no targets
 
-        # Match predictions to targets
+        # Match predictions to targets (same class and same sample only)
         matched = np.zeros(len(all_targets), dtype=bool)
         tp = 0
 
-        for pred in all_predictions:
+        all_predictions = sorted(all_predictions, key=lambda x: x[2], reverse=True)
+
+        for pred_sample_idx, pred, _ in all_predictions:
             best_iou = 0.0
             best_target_idx = -1
 
-            for t_idx, target in enumerate(all_targets):
+            for t_idx, (target_sample_idx, target) in enumerate(all_targets):
                 if matched[t_idx] or pred.class_id != target.class_id:
+                    continue
+                if pred_sample_idx != target_sample_idx:
                     continue
 
                 iou = self._temporal_iou(
@@ -380,3 +540,46 @@ class EventDetectionMetrics:
         f1 = 2 * precision * recall / max(1e-7, precision + recall)
 
         return float(f1)
+
+    def compute_per_class_f1(
+        self,
+        predictions: Dict[str, np.ndarray],
+        targets: list[list[EventInterval]],
+        iou_threshold: float = 0.5,
+        confidence_threshold: float = 0.5,
+    ) -> Dict[int, float]:
+        """
+        Compute per-class F1 scores at a specific IoU threshold.
+
+        Returns:
+            Dict[class_id] -> F1 score for each class (1-5, skipping background=0)
+        """
+        summary = self.compute_detection_summary(
+            predictions=predictions,
+            targets=targets,
+            iou_threshold=iou_threshold,
+            confidence_threshold=confidence_threshold,
+        )
+
+        return dict(summary["per_class_f1"])
+
+    def compute_per_class_iou(
+        self,
+        predictions: Dict[str, np.ndarray],
+        targets: list[list[EventInterval]],
+        iou_threshold: float = 0.5,
+        confidence_threshold: float = 0.5,
+    ) -> Dict[int, float]:
+        """
+        Compute per-class IoU scores (average IoU of matched predictions per class).
+
+        Returns:
+            Dict[class_id] -> average IoU for matched predictions in each class
+        """
+        summary = self.compute_detection_summary(
+            predictions=predictions,
+            targets=targets,
+            iou_threshold=iou_threshold,
+            confidence_threshold=confidence_threshold,
+        )
+        return dict(summary["per_class_iou"])

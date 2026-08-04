@@ -7,17 +7,23 @@ Handles:
 - Attention weight extraction (station and temporal)
 """
 
+import gc
 from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
 import matplotlib
+from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.patches import Rectangle
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 
 from utils import data_utils
+
+# Keep delivered attention artifacts compact for plotting diagnostics.
+MAX_TEMPORAL_ATTN_POINTS = 256
 
 
 def plot_segmentation_validation(
@@ -52,7 +58,7 @@ def plot_segmentation_validation(
     model.eval()
     plot_count = 0
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, batch in enumerate(dataloader):
             if len(batch) == 2:
                 xb, y_onehot = batch
@@ -61,7 +67,6 @@ def plot_segmentation_validation(
                 xb, y_onehot, _y_idx = batch
 
             xb = xb.to(device)
-            y_onehot = y_onehot.to(device)
 
             outputs = model(xb)
 
@@ -97,6 +102,8 @@ def plot_segmentation_validation(
             if plot_count >= max_samples:
                 break
 
+            del xb, y_onehot, outputs
+
     return plot_count
 
 
@@ -127,7 +134,7 @@ def plot_segmentation_sample(
     # - Ground truth labels
     # - Raw predictions (softmax activations)
     # - Post-processed predictions
-    pass
+    pass  # Placeholder: Segmentation visualization to be implemented separately
 
 
 def plot_event_validation(
@@ -166,55 +173,108 @@ def plot_event_validation(
     if class_names is None:
         class_names = ["BG", "VT", "LP", "TR", "AV", "IC"]
 
+    if not extract_attention:
+        raise ValueError(
+            "extract_attention must be True for event detection plots. "
+            "Attention visualization is required for MuSSED validation."
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
     plot_count = 0
 
-    # TODO: Hook attention modules for extraction
-    # station_attention_hook = attach_station_attention_hook(model)
-    # temporal_attention_hook = attach_temporal_attention_hook(model)
+    # Setup attention hooks (fail fast if modules not found)
+    station_hook = try_attach_station_attention_hook(model)
+    temporal_hook = try_attach_temporal_attention_hook(model)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, batch in enumerate(dataloader):
-            xb, y_onehot = batch[0], batch[1]
+            remaining = max_samples - plot_count
+            if remaining <= 0:
+                break
+
+            xb, y_onehot = batch[0][:remaining], batch[1][:remaining]
             xb = xb.to(device)
-            y_onehot = y_onehot.to(device)
 
-            # TODO: Forward pass through MuSSED
-            # outputs = model(xb)
-            # Extract:
-            # - class_logits: [B, Nq, C]
-            # - centers, starts, ends: [B, Nq]
-            # - confidence: [B, Nq]
+            # Forward pass through MuSSED
+            outputs = model(xb)
 
-            # TODO: Extract attention weights if hooks attached
-            # station_attn = station_attention_hook.get_attention()  # [B, S] normalized
-            # temporal_attn = temporal_attention_hook.get_attention()  # [B, T] normalized
+            # Extract attention weights from hooks
+            station_attn_batch = station_hook.get_attention()  # [B, S] normalized
+            temporal_attn_batch = temporal_hook.get_attention(
+                batch_size=xb.shape[0], n_stations=xb.shape[1]
+            )  # [B, T] normalized
+            if station_attn_batch is None:
+                raise RuntimeError(
+                    "Station attention weights were not captured. "
+                    "Check station-attention extraction."
+                )
+            if temporal_attn_batch is None:
+                raise RuntimeError(
+                    "Temporal attention weights were not captured. "
+                    "Check temporal-attention extraction."
+                )
+            if station_attn_batch.shape != (xb.shape[0], xb.shape[1]):
+                raise RuntimeError(
+                    f"Station attention shape mismatch: expected {(xb.shape[0], xb.shape[1])}, got {station_attn_batch.shape}."
+                )
+            if temporal_attn_batch.shape[0] != xb.shape[0]:
+                raise RuntimeError(
+                    f"Temporal attention batch mismatch: expected {xb.shape[0]}, got {temporal_attn_batch.shape[0]}."
+                )
 
-            # TODO: Convert segmentation to events
-            # events_gt = segmentation_to_events(y_onehot, normalize=True)
+            # Ground-truth events are extracted inside plot_event_sample.
 
             # Plot each sample
             for sample_idx in range(min(len(xb), max_samples - plot_count)):
+                station_attn = station_attn_batch[sample_idx]
+                temporal_attn = temporal_attn_batch[sample_idx]
+
+                # Extract sample-level outputs
+                # Note: MuSSED outputs use singular names: center, start, end (not centers, starts, ends)
+                outputs_sample = {}
+                key_mapping = {
+                    "class_logits": "class_logits",
+                    "centers": "center",  # MuSSED uses singular
+                    "starts": "start",  # MuSSED uses singular
+                    "ends": "end",  # MuSSED uses singular
+                    "confidence": "confidence",
+                }
+                for plot_key, model_key in key_mapping.items():
+                    if model_key in outputs:
+                        outputs_sample[plot_key] = (
+                            outputs[model_key][sample_idx].cpu().numpy()
+                        )
+
                 plot_event_sample(
                     x=xb[sample_idx].cpu().numpy(),
-                    y_true=y_onehot[sample_idx].cpu().numpy(),
-                    outputs=None,  # TODO: Extract from batch
+                    y_true=y_onehot[sample_idx].numpy(),
+                    outputs=outputs_sample,
                     output_dir=output_dir,
                     epoch=epoch,
                     sample_id=batch_idx * len(xb) + sample_idx,
                     class_names=class_names,
-                    station_attn=None,  # TODO
-                    temporal_attn=None,  # TODO
+                    station_attn=station_attn,
+                    temporal_attn=temporal_attn,
                 )
                 plot_count += 1
 
                 if plot_count >= max_samples:
                     break
 
+            del xb, y_onehot, outputs, station_attn_batch, temporal_attn_batch
             if plot_count >= max_samples:
                 break
+
+    # Clean up hooks
+    station_hook.detach()
+    temporal_hook.detach()
+
+    # Explicitly release cached CUDA blocks used during attention plotting.
+    if device.type == "cuda" and torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
 
     return plot_count
 
@@ -234,8 +294,8 @@ def plot_event_sample(
     Plot a single event detection sample.
 
     Args:
-        x: Input waveforms [S, T]
-        y_true: Ground truth segmentation [C, T]
+        x: Input waveforms [S, T] where S=8 stations
+        y_true: Ground truth segmentation [C, T] one-hot
         outputs: Dict with predicted events (class_logits, centers, starts, ends, confidence)
         output_dir: Output directory
         epoch: Epoch number
@@ -245,19 +305,297 @@ def plot_event_sample(
         temporal_attn: Temporal importance weights [T], normalized to [0, 1]
 
     Plot layout:
-        - Panels 0-7: Station waveforms with opacity encoding station attention
-        - Panel 8: Ground-truth events (red dashed lines)
-        - Panel 9: Predicted events (colored intervals with confidence)
-        - Background: Temporal attention encoded as blue saturation
+        - Panels 0-7: Station waveforms with strong station-attention visual encoding
+        - Temporal attention: Blue background heatmap varying by time
+        - Ground-truth and predicted event intervals (top/bottom tracks)
+        - Final panel: Ground-truth segmentation strip (class per timestep)
     """
-    # TODO: Implement event plot visualization
-    # Should show:
-    # - 8 waveform panels (stations)
-    # - Ground truth events (horizontal bars with class colors)
-    # - Predicted events (intervals with confidence alpha)
-    # - Station attention: opacity variation per station
-    # - Temporal attention: blue background saturation varying by time
-    pass
+    if class_names is None:
+        class_names = ["BG", "VT", "LP", "TR", "AV", "IC"]
+
+    # Class colors (skip background)
+    # Using hex palette: VT=#df8d5e, LP=#2ca02c, TR=#d62728, AV=#9467bd, IC=#8c564b
+    class_colors = {
+        0: (0.5, 0.5, 0.5),  # BG: gray
+        1: (0.875, 0.553, 0.369),  # VT: #df8d5e (tan/burnt orange)
+        2: (0.173, 0.627, 0.173),  # LP: #2ca02c (green)
+        3: (0.839, 0.153, 0.157),  # TR: #d62728 (red)
+        4: (0.580, 0.404, 0.741),  # AV: #9467bd (purple)
+        5: (0.549, 0.337, 0.294),  # IC: #8c564b (brown)
+    }
+
+    # Normalize attention weights if provided
+    if station_attn is not None:
+        station_attn = np.clip(station_attn.astype(float), 0, 1)
+    if temporal_attn is not None:
+        temporal_attn = np.clip(temporal_attn.astype(float), 0, 1)
+
+    # Extract ground truth events
+    from utils.event_targets import segmentation_to_events
+
+    events_gt = segmentation_to_events(torch.from_numpy(y_true), normalize=True)
+
+    # Get time dimension for interpolation
+    T = y_true.shape[1]
+
+    # Interpolate temporal attention to match waveform time dimension
+    if temporal_attn is not None and len(temporal_attn) != T:
+        # Interpolate from attention resolution to full waveform resolution
+        temporal_attn_interp = np.interp(
+            np.linspace(0, 1, T), np.linspace(0, 1, len(temporal_attn)), temporal_attn
+        )
+        temporal_attn = temporal_attn_interp
+
+    # Extract predicted events (if available)
+    events_pred = []
+    if outputs:
+        required_pred_keys = {
+            "centers",
+            "starts",
+            "ends",
+            "confidence",
+            "class_logits",
+        }
+        missing_keys = required_pred_keys - set(outputs.keys())
+        if missing_keys:
+            raise ValueError(
+                f"Missing required prediction keys for event plotting: {sorted(missing_keys)}"
+            )
+
+        centers = outputs["centers"]  # [Nq]
+        starts = outputs["starts"]  # [Nq]
+        ends = outputs["ends"]  # [Nq]
+        confidence = outputs["confidence"]  # [Nq]
+        class_logits = outputs["class_logits"]  # [Nq, C]
+
+        for q_idx in range(len(centers)):
+            conf = float(confidence[q_idx])
+            if conf > 0.0:
+                class_id = (
+                    int(np.argmax(class_logits[q_idx]))
+                    if class_logits is not None
+                    else 1
+                )
+                if class_id == 0:
+                    continue
+                events_pred.append(
+                    {
+                        "class_id": class_id,
+                        "start": float(starts[q_idx]),
+                        "end": float(ends[q_idx]),
+                        "center": float(centers[q_idx]),
+                        "confidence": conf,
+                    }
+                )
+
+    # Create figure
+    n_stations = min(x.shape[0], 8)  # Max 8 stations
+    fig_height = max(11, 1.4 * n_stations)
+    fig, axes = plt.subplots(
+        n_stations,
+        1,
+        figsize=(14, fig_height),
+        sharex=True,
+    )
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+    station_axes = axes
+
+    # Time axis in seconds (sampling rate = 100 Hz)
+    SAMPLING_RATE_HZ = 100.0
+    duration_seconds = T / SAMPLING_RATE_HZ
+    time_axis = np.linspace(0, duration_seconds, T)
+
+    # Build high-contrast station attention for visibility.
+    if station_attn is not None:
+        station_vis = station_attn[:n_stations]
+        s_min = float(np.min(station_vis))
+        s_max = float(np.max(station_vis))
+        station_vis = (station_vis - s_min) / (s_max - s_min + 1e-8)
+    else:
+        station_vis = np.ones(n_stations)
+
+    # Build high-contrast temporal attention map.
+    if temporal_attn is not None:
+        t_min = float(np.min(temporal_attn))
+        t_max = float(np.max(temporal_attn))
+        temporal_vis = (temporal_attn - t_min) / (t_max - t_min + 1e-8)
+        temporal_img = temporal_vis[np.newaxis, :]
+    else:
+        temporal_img = None
+
+    # Plot waveforms for each station
+    for s_idx in range(n_stations):
+        ax = station_axes[s_idx]
+        waveform = x[s_idx]
+
+        # Use original waveform values (no normalization)
+        waveform_norm = waveform.copy()
+
+        # Fixed y-limits: [-1.1, 1.1] for all plots
+        # This allows comparing actual amplitudes across stations
+        y_lim_min, y_lim_max = -1.1, 1.1
+
+        # Temporal attention as one rasterized heatmap (fast).
+        # Station attention modulates heatmap opacity
+        if temporal_img is not None:
+            heatmap_alpha = float(
+                0.15 + 0.50 * station_vis[s_idx]
+            )  # Station attention controls heatmap opacity
+            ax.imshow(
+                temporal_img,
+                aspect="auto",
+                extent=[0, duration_seconds, y_lim_min, y_lim_max],
+                cmap="Blues",
+                interpolation="nearest",
+                vmin=0.0,
+                vmax=1.0,
+                alpha=heatmap_alpha,
+                origin="lower",
+                zorder=0,
+            )
+
+        # Store waveform for drawing on top later (always 100% opacity)
+        waveform_to_plot = {
+            "time_axis": time_axis,
+            "waveform_norm": waveform_norm,
+            "lw_station": float(1.0),  # Constant linewidth
+        }
+
+        # Compute event box positions relative to y-limits
+        # GT boxes: below y=0 center
+        # Predicted boxes: above y=0 center
+        y_range = y_lim_max - y_lim_min
+        y_center = (y_lim_max + y_lim_min) / 2.0
+        box_height = y_range * 0.25  # Quarter of visible range
+
+        gt_y_top = y_center  # y=0 equivalent
+        gt_y_bottom = gt_y_top - box_height
+
+        pred_y_bottom = y_center  # y=0 equivalent
+        pred_y_top = pred_y_bottom + box_height
+
+        # Ground-truth event track (hollow rectangles with border only)
+        for event in events_gt:
+            if event.class_id > 0:  # Skip background
+                color = class_colors.get(event.class_id, (0, 0, 0))
+                # Convert normalized coordinates to seconds
+                start_sec = event.start_norm * duration_seconds
+                end_sec = event.end_norm * duration_seconds
+                # Draw hollow rectangle from gt_y_bottom to gt_y_top
+                rect = Rectangle(
+                    (start_sec, gt_y_bottom),
+                    end_sec - start_sec,
+                    box_height,
+                    linewidth=3.0,
+                    edgecolor=color,
+                    facecolor="none",
+                    alpha=0.9,
+                    zorder=10,
+                )
+                ax.add_patch(rect)
+
+        # Predicted event track (hollow rectangles with border only)
+        if events_pred:
+            for event_pred in events_pred:
+                class_id = event_pred["class_id"]
+                color = class_colors.get(class_id, (0, 0, 0))
+                conf = event_pred["confidence"]
+                pred_alpha = float(min(1.0, 0.2 + 0.8 * conf))
+                # Convert normalized coordinates to seconds
+                start_sec = event_pred["start"] * duration_seconds
+                end_sec = event_pred["end"] * duration_seconds
+                center_sec = event_pred["center"] * duration_seconds
+                # Draw hollow rectangle from pred_y_bottom to pred_y_top
+                rect = Rectangle(
+                    (start_sec, pred_y_bottom),
+                    end_sec - start_sec,
+                    box_height,
+                    linewidth=3.0,
+                    edgecolor=color,
+                    facecolor="none",
+                    linestyle="--",
+                    alpha=pred_alpha,
+                    zorder=10,
+                )
+                ax.add_patch(rect)
+                # Center marker at middle of box
+                marker_y = (pred_y_bottom + pred_y_top) / 2.0
+                ax.plot(
+                    center_sec,
+                    marker_y,
+                    marker="o",
+                    color=color,
+                    markersize=6,
+                    alpha=pred_alpha,
+                    zorder=15,
+                )
+
+        # Draw waveform on top of everything (after all events/heatmaps)
+        # Always 100% opacity (alpha=1.0)
+        ax.plot(
+            waveform_to_plot["time_axis"],
+            waveform_to_plot["waveform_norm"],
+            color="black",
+            linewidth=waveform_to_plot["lw_station"],
+            alpha=1.0,
+            zorder=200,
+        )
+
+        # Labels and formatting
+        ax.set_ylim(y_lim_min, y_lim_max)
+        if station_attn is not None:
+            ax.set_ylabel(
+                f"S{s_idx} a={station_attn[s_idx]:.2f}",
+                fontsize=11,
+                fontweight="bold",
+                rotation=0,
+            )
+        else:
+            ax.set_ylabel(f"S{s_idx}", fontsize=11, fontweight="bold", rotation=0)
+        ax.yaxis.set_label_coords(-0.08, 0.5)
+        ax.grid(True, alpha=0.2, zorder=0)
+        ax.tick_params(axis="y", labelsize=10)
+        ax.set_xlim(0, duration_seconds)
+        ax.set_xlabel("Time (seconds)", fontsize=10)
+
+    # Title with metadata
+    title_parts = [f"Epoch {epoch} | Fold Sample {sample_id}"]
+
+    # Extract ground truth class names
+    if events_gt:
+        gt_classes = sorted(
+            set(event.class_id for event in events_gt if event.class_id > 0)
+        )
+        gt_class_names = [
+            class_names[c_id] for c_id in gt_classes if c_id < len(class_names)
+        ]
+        title_parts.append(f"GT Classes: {', '.join(gt_class_names)}")
+
+    # Extract predicted class names
+    if events_pred:
+        pred_classes = sorted(set(event["class_id"] for event in events_pred))
+        pred_class_names = [
+            class_names[c_id] for c_id in pred_classes if c_id < len(class_names)
+        ]
+        title_parts.append(f"Pred Classes: {', '.join(pred_class_names)}")
+
+    if station_attn is not None:
+        title_parts.append(
+            f"Station attn spread: {float(np.max(station_attn) - np.min(station_attn)):.3f}"
+        )
+    plt.suptitle(" | ".join(title_parts), fontsize=11, fontweight="bold")
+
+    # X-axis label on last subplot
+    axes[-1].set_xlabel("Normalized Time [0-1]", fontsize=10)
+
+    plt.tight_layout()
+
+    # Save
+    plot_filename = f"epoch_{epoch:03d}_sample_{sample_id:04d}_events.png"
+    plot_path = output_dir / plot_filename
+    plt.savefig(plot_path, dpi=80, bbox_inches="tight")
+    plt.close()
 
 
 def extract_station_attention_weights(
@@ -280,13 +618,18 @@ def extract_station_attention_weights(
     Returns:
         Station attention weights [S] normalized to [0, 1]
     """
-    # TODO: Implement attention hook attachment
-    # Hook into model.encoder.station_attention_block
-    # Extract [B, num_heads, S, S], average over B and num_heads
-    # Normalize to [0, 1]
-    raise NotImplementedError(
-        "Station attention extraction requires MuSSED model structure definition."
-    )
+    hook = try_attach_station_attention_hook(model)
+
+    model.eval()
+    with torch.no_grad():
+        for batch in dataloader:
+            xb = batch[0].to(device)
+            _ = model(xb)
+            attn = hook.get_attention()
+            hook.detach()
+            if attn is not None and len(attn) > sample_idx:
+                return attn[sample_idx]
+    raise RuntimeError("Station attention weights could not be extracted.")
 
 
 def extract_temporal_attention_weights(
@@ -309,26 +652,96 @@ def extract_temporal_attention_weights(
     Returns:
         Temporal attention weights [T] normalized to [0, 1]
     """
-    # TODO: Implement attention hook attachment
-    # Hook into model.encoder.temporal_attention_block
-    # Extract [B, num_heads, T, T], average over B and num_heads
-    # Normalize to [0, 1]
-    raise NotImplementedError(
-        "Temporal attention extraction requires MuSSED model structure definition."
+    hook = try_attach_temporal_attention_hook(model)
+
+    model.eval()
+    with torch.no_grad():
+        for batch in dataloader:
+            xb = batch[0].to(device)
+            _ = model(xb)
+            attn = hook.get_attention(batch_size=xb.shape[0], n_stations=xb.shape[1])
+            hook.detach()
+            if attn is not None and len(attn) > sample_idx:
+                return attn[sample_idx]
+    raise RuntimeError("Temporal attention weights could not be extracted.")
+
+
+def try_attach_station_attention_hook(
+    model: torch.nn.Module,
+) -> "StationAttentionHook":
+    """
+    Attach a hook to the station attention module in MuSSED encoder.
+    Fails fast if module not found.
+
+    Returns:
+        StationAttentionHook
+
+    Raises:
+        RuntimeError: If station attention module cannot be found
+    """
+    # Try common naming patterns for station attention module
+    for module_name in [
+        "encoder.station_attention",
+        "encoder.station_attention_block",
+        "encoder.attention_station",
+        "station_attention",
+    ]:
+        try:
+            module = dict(model.named_modules())[module_name]
+            return StationAttentionHook(module)
+        except KeyError:
+            continue
+    raise RuntimeError(
+        "Station attention module not found in model. "
+        "Tried: encoder.station_attention, encoder.station_attention_block, "
+        "encoder.attention_station, station_attention"
+    )
+
+
+def try_attach_temporal_attention_hook(
+    model: torch.nn.Module,
+) -> "TemporalAttentionHook":
+    """
+    Attach a hook to the temporal attention module in MuSSED encoder.
+    Fails fast if module not found.
+
+    Returns:
+        TemporalAttentionHook
+
+    Raises:
+        RuntimeError: If temporal attention module cannot be found
+    """
+    # Try common naming patterns for temporal attention module
+    for module_name in [
+        "encoder.temporal_attention",
+        "encoder.temporal_bottleneck_attention",
+        "encoder.bottleneck_attention",
+        "temporal_attention",
+    ]:
+        try:
+            module = dict(model.named_modules())[module_name]
+            return TemporalAttentionHook(module)
+        except KeyError:
+            continue
+    raise RuntimeError(
+        "Temporal attention module not found in model. "
+        "Tried: encoder.temporal_attention, encoder.temporal_bottleneck_attention, "
+        "encoder.bottleneck_attention, temporal_attention"
     )
 
 
 class AttentionHook:
-    """Helper class to capture attention weights during forward pass."""
+    """Base helper class to capture attention weights during forward pass."""
 
     def __init__(self, module):
         self.module = module
         self.attention_weights = None
+        if hasattr(module, "capture_attention_weights"):
+            module.capture_attention_weights = True
         self.hook = module.register_forward_hook(self._hook_fn)
 
     def _hook_fn(self, module, input, output):
-        """Capture attention weights from module output."""
-        # TODO: Implement based on actual attention module structure
+        """Capture attention weights from module output. Override in subclasses."""
         pass
 
     def get_attention(self) -> Optional[np.ndarray]:
@@ -340,24 +753,97 @@ class AttentionHook:
     def detach(self):
         """Remove the hook."""
         self.hook.remove()
+        if hasattr(self.module, "capture_attention_weights"):
+            self.module.capture_attention_weights = False
 
 
-def segmentation_to_events(
-    y_onehot: torch.Tensor,
-    normalize: bool = True,
-) -> list:
-    """
-    Convert segmentation labels to event list.
+class StationAttentionHook(AttentionHook):
+    """Hook to capture station-level attention weights [B, S]."""
 
-    Args:
-        y_onehot: One-hot segmentation [C, T] or [B, C, T]
-        normalize: If True, normalize event times to [0, 1]
+    def _hook_fn(self, module, input, output):
+        """
+        Capture station attention from attention module.
+        Uses StationAttentionBlock.last_attn_weights with shape [B, H, S, S].
+        """
+        attn = getattr(module, "last_attn_weights", None)
+        if attn is None:
+            self.attention_weights = None
+            return
 
-    Returns:
-        List of events, each with format:
-            {"class": int, "start": float, "end": float, "confidence": 1.0}
-    """
-    # TODO: Implement segmentation-to-events conversion
-    # Use existing segmentation_to_events from event_targets.py if available
-    # Or implement here
-    raise NotImplementedError("segmentation_to_events requires event target utilities.")
+        if not isinstance(attn, torch.Tensor) or attn.ndim != 4:
+            raise RuntimeError(
+                "Station attention capture expected tensor [B, H, S, S]."
+            )
+
+        attn = attn.detach().cpu().mean(dim=1).mean(dim=1)  # [B, S]
+        attn_np = attn.numpy()
+        batch_min = attn_np.min(axis=-1, keepdims=True)
+        batch_max = attn_np.max(axis=-1, keepdims=True)
+        attn_np = (attn_np - batch_min) / (batch_max - batch_min + 1e-8)
+        self.attention_weights = np.clip(attn_np, 0.0, 1.0).astype(np.float16)
+        module.last_attn_weights = None
+
+
+class TemporalAttentionHook(AttentionHook):
+    """Hook to capture temporal attention weights [B, T]."""
+
+    def _hook_fn(self, module, input, output):
+        """
+        Capture temporal attention from attention module.
+        Uses TemporalBottleneckAttention.last_attn_weights with shape [N, H, T, T],
+        where N = B * S.
+        """
+        attn = getattr(module, "last_attn_weights", None)
+        if attn is None:
+            self.attention_weights = None
+            return
+
+        if not isinstance(attn, torch.Tensor) or attn.ndim not in (3, 4):
+            raise RuntimeError(
+                "Temporal attention capture expected tensor [N, H, T, T] or [N, T, T]."
+            )
+
+        if attn.ndim == 4:
+            attn = attn.detach().cpu().mean(dim=1).mean(dim=1)  # [N, T]
+        else:
+            attn = attn.detach().cpu().mean(dim=1)  # [N, T]
+        attn_np = attn.numpy()
+        row_min = attn_np.min(axis=-1, keepdims=True)
+        row_max = attn_np.max(axis=-1, keepdims=True)
+        attn_np = (attn_np - row_min) / (row_max - row_min + 1e-8)
+        attn_np = np.clip(attn_np, 0.0, 1.0)
+
+        # Downsample temporal attention traces for compact delivery to plotting.
+        if (
+            isinstance(MAX_TEMPORAL_ATTN_POINTS, int)
+            and MAX_TEMPORAL_ATTN_POINTS > 0
+            and attn_np.shape[1] > MAX_TEMPORAL_ATTN_POINTS
+        ):
+            idx = np.linspace(
+                0,
+                attn_np.shape[1] - 1,
+                num=MAX_TEMPORAL_ATTN_POINTS,
+                dtype=np.int64,
+            )
+            attn_np = attn_np[:, idx]
+
+        self.attention_weights = attn_np.astype(np.float16)
+        module.last_attn_weights = None
+
+    def get_attention(
+        self, batch_size: Optional[int] = None, n_stations: Optional[int] = None
+    ) -> Optional[np.ndarray]:
+        attn = super().get_attention()
+        if attn is None:
+            return None
+
+        if batch_size is None or n_stations is None:
+            return attn
+
+        expected_rows = batch_size * n_stations
+        if attn.shape[0] != expected_rows:
+            raise RuntimeError(
+                f"Temporal attention row mismatch: expected {expected_rows}, got {attn.shape[0]}."
+            )
+
+        return attn.reshape(batch_size, n_stations, attn.shape[1]).mean(axis=1)
