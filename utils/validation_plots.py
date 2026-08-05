@@ -475,10 +475,34 @@ def plot_event_sample(
                 f"Missing required prediction keys for event plotting: {sorted(missing_keys)}"
             )
 
-        centers = outputs["centers"]  # [Nq]
-        starts = outputs["starts"]  # [Nq]
-        ends = outputs["ends"]  # [Nq]
-        class_logits = outputs["class_logits"]  # [Nq, C]
+        def _as_query_vector(values: np.ndarray, name: str) -> np.ndarray:
+            array = np.asarray(values)
+            if array.ndim == 1:
+                return array
+            if array.ndim == 2 and array.shape[1] == 1:
+                return array[:, 0]
+            raise ValueError(
+                f"{name} must have shape [Nq] or [Nq, 1], got shape {array.shape}."
+            )
+
+        centers = _as_query_vector(outputs["centers"], "centers")
+        starts = _as_query_vector(outputs["starts"], "starts")
+        ends = _as_query_vector(outputs["ends"], "ends")
+
+        class_logits = np.asarray(outputs["class_logits"])
+        if class_logits.ndim != 2:
+            raise ValueError(
+                "class_logits must have shape [Nq, C], "
+                f"got shape {class_logits.shape}."
+            )
+
+        if not (len(centers) == len(starts) == len(ends) == class_logits.shape[0]):
+            raise ValueError(
+                "Prediction length mismatch: expected equal query counts for "
+                f"centers ({len(centers)}), starts ({len(starts)}), "
+                f"ends ({len(ends)}), and class_logits ({class_logits.shape[0]})."
+            )
+
         class_probs = torch.softmax(torch.from_numpy(class_logits), dim=-1).numpy()
 
         for q_idx in range(len(centers)):
