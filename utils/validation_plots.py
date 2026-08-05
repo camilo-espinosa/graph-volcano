@@ -24,7 +24,7 @@ from utils import data_utils
 from utils.detection_prediction_utils import normalize_prediction_intervals
 
 # Keep delivered attention artifacts compact for plotting diagnostics.
-MAX_TEMPORAL_ATTN_POINTS = 32
+MAX_TEMPORAL_ATTN_POINTS = 16
 
 
 def plot_segmentation_validation(
@@ -149,9 +149,11 @@ def plot_event_validation(
     device: torch.device,
     output_dir: Path,
     epoch: int,
-    samples_per_class: int = 1,
+    samples_per_class: int = 2,
     class_names: list = None,
     extract_attention: bool = True,
+    attention_mode: str = "full",
+    forward_batch_size: int = 5,
 ) -> int:
     """
     Generate validation plots for event detection models (MuSSED).
@@ -164,7 +166,9 @@ def plot_event_validation(
         epoch: Epoch number
         samples_per_class: Number of examples to save per non-background class
         class_names: List of class names
-        extract_attention: Whether to extract and visualize attention weights
+        extract_attention: Backward-compat flag. If False, attention_mode is forced to "none"
+        attention_mode: One of {"none", "station", "full"}
+        forward_batch_size: Max plotting forward micro-batch size
 
     Returns:
         Number of plots saved
@@ -180,107 +184,188 @@ def plot_event_validation(
         class_names = ["BG", "VT", "LP", "TR", "AV", "IC"]
 
     if not extract_attention:
+        attention_mode = "none"
+    allowed_attention_modes = {"none", "station", "full"}
+    if attention_mode not in allowed_attention_modes:
         raise ValueError(
-            "extract_attention must be True for event detection plots. "
-            "Attention visualization is required for MuSSED validation."
+            "attention_mode must be one of "
+            f"{sorted(allowed_attention_modes)}, got {attention_mode!r}."
         )
+    if forward_batch_size < 1:
+        raise ValueError(f"forward_batch_size must be >= 1, got {forward_batch_size}.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
     plot_count = 0
     class_counts: dict = {}  # {class_id: n_saved}
+    num_non_bg_classes: int | None = None
 
-    # Setup attention hooks (fail fast if modules not found)
-    station_hook = try_attach_station_attention_hook(model)
-    temporal_hook = try_attach_temporal_attention_hook(model)
+    need_station_attention = attention_mode in {"station", "full"}
+    need_temporal_attention = attention_mode == "full"
+
+    station_hook = (
+        try_attach_station_attention_hook(model) if need_station_attention else None
+    )
+    temporal_hook = (
+        try_attach_temporal_attention_hook(model) if need_temporal_attention else None
+    )
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(dataloader):
-            xb = batch[0].to(device)
             y_onehot = batch[1]
+            if num_non_bg_classes is None:
+                num_non_bg_classes = int(y_onehot.shape[1] - 1)
 
-            # Forward pass through MuSSED
-            outputs = model(xb)
+            remaining_classes = [
+                c
+                for c in range(1, y_onehot.shape[1])
+                if class_counts.get(c, 0) < samples_per_class
+            ]
+            if not remaining_classes:
+                break
 
-            # Extract attention weights from hooks
-            station_attn_batch = station_hook.get_attention()  # [B, S] normalized
-            temporal_attn_batch = temporal_hook.get_attention(
-                batch_size=xb.shape[0], n_stations=xb.shape[1]
-            )  # [B, T] normalized
-            if station_attn_batch is None:
-                raise RuntimeError(
-                    "Station attention weights were not captured. "
-                    "Check station-attention extraction."
-                )
-            if temporal_attn_batch is None:
-                raise RuntimeError(
-                    "Temporal attention weights were not captured. "
-                    "Check temporal-attention extraction."
-                )
-            if station_attn_batch.shape != (xb.shape[0], xb.shape[1]):
-                raise RuntimeError(
-                    f"Station attention shape mismatch: expected {(xb.shape[0], xb.shape[1])}, got {station_attn_batch.shape}."
-                )
-            if temporal_attn_batch.shape[0] != xb.shape[0]:
-                raise RuntimeError(
-                    f"Temporal attention batch mismatch: expected {xb.shape[0]}, got {temporal_attn_batch.shape[0]}."
-                )
-
-            # normalized_outputs computed once per batch
-            normalized_outputs = normalize_prediction_intervals(outputs)
-
-            # Plot each sample that contributes to an under-represented class
-            for sample_idx in range(len(xb)):
-                y_sample = y_onehot[sample_idx].numpy()  # [C, T]
-                sample_classes = [
-                    c for c in range(1, y_sample.shape[0]) if y_sample[c].any()
-                ]
-                if not sample_classes:
-                    continue
-                if not any(
-                    class_counts.get(c, 0) < samples_per_class for c in sample_classes
-                ):
-                    continue
-
-                station_attn = station_attn_batch[sample_idx]
-                temporal_attn = temporal_attn_batch[sample_idx]
-
-                # Note: MuSSED outputs use singular names: center, start, end
-                outputs_sample = {}
-                key_mapping = {
-                    "class_logits": "class_logits",
-                    "centers": "center",
-                    "starts": "start",
-                    "ends": "end",
-                    "confidence": "confidence",
+            # Forward only samples that can still contribute to the remaining quotas.
+            selected_indices: list[int] = []
+            y_onehot_np = y_onehot.numpy()
+            remaining_set = set(remaining_classes)
+            for sample_idx in range(y_onehot_np.shape[0]):
+                sample_classes = {
+                    c
+                    for c in range(1, y_onehot_np.shape[1])
+                    if y_onehot_np[sample_idx, c].any()
                 }
-                for plot_key, model_key in key_mapping.items():
-                    if model_key in normalized_outputs:
-                        outputs_sample[plot_key] = (
-                            normalized_outputs[model_key][sample_idx].cpu().numpy()
+                if sample_classes & remaining_set:
+                    selected_indices.append(sample_idx)
+
+            if not selected_indices:
+                continue
+
+            for chunk_start in range(0, len(selected_indices), forward_batch_size):
+                chunk_indices = selected_indices[
+                    chunk_start : chunk_start + forward_batch_size
+                ]
+                xb = batch[0][chunk_indices].to(device)
+                y_onehot_chunk = y_onehot[chunk_indices]
+
+                # Forward pass through MuSSED
+                outputs = model(xb)
+
+                station_attn_batch = None
+                temporal_attn_batch = None
+                if need_station_attention:
+                    station_attn_batch = station_hook.get_attention()  # [B, S]
+                    if station_attn_batch is None:
+                        raise RuntimeError(
+                            "Station attention weights were not captured. "
+                            "Check station-attention extraction."
+                        )
+                    if station_attn_batch.shape != (xb.shape[0], xb.shape[1]):
+                        raise RuntimeError(
+                            "Station attention shape mismatch: expected "
+                            f"{(xb.shape[0], xb.shape[1])}, got {station_attn_batch.shape}."
                         )
 
-                plot_event_sample(
-                    x=xb[sample_idx].cpu().numpy(),
-                    y_true=y_sample,
-                    outputs=outputs_sample,
-                    output_dir=output_dir,
-                    epoch=epoch,
-                    sample_id=batch_idx * len(xb) + sample_idx,
-                    class_names=class_names,
-                    station_attn=station_attn,
-                    temporal_attn=temporal_attn,
-                )
-                plot_count += 1
-                for c in sample_classes:
-                    class_counts[c] = class_counts.get(c, 0) + 1
+                if need_temporal_attention:
+                    temporal_attn_batch = temporal_hook.get_attention(
+                        batch_size=xb.shape[0],
+                        n_stations=xb.shape[1],
+                        collapse_stations=False,
+                    )  # [B, S, T]
+                    if temporal_attn_batch is None:
+                        raise RuntimeError(
+                            "Temporal attention weights were not captured. "
+                            "Check temporal-attention extraction."
+                        )
+                    if temporal_attn_batch.shape[:2] != (xb.shape[0], xb.shape[1]):
+                        raise RuntimeError(
+                            "Temporal attention shape mismatch: expected [B, S, T] "
+                            f"with B={xb.shape[0]}, S={xb.shape[1]}, got {temporal_attn_batch.shape}."
+                        )
 
-            del xb, y_onehot, outputs, station_attn_batch, temporal_attn_batch
+                # normalized_outputs computed once per chunk
+                normalized_outputs = normalize_prediction_intervals(outputs)
+
+                # Plot each sample that contributes to an under-represented class
+                for sample_idx in range(len(xb)):
+                    y_sample = y_onehot_chunk[sample_idx].numpy()  # [C, T]
+                    sample_classes = [
+                        c for c in range(1, y_sample.shape[0]) if y_sample[c].any()
+                    ]
+                    if not sample_classes:
+                        continue
+                    if not any(
+                        class_counts.get(c, 0) < samples_per_class
+                        for c in sample_classes
+                    ):
+                        continue
+
+                    station_attn = (
+                        station_attn_batch[sample_idx]
+                        if station_attn_batch is not None
+                        else None
+                    )
+                    temporal_attn = (
+                        temporal_attn_batch[sample_idx]
+                        if temporal_attn_batch is not None
+                        else None
+                    )
+
+                    outputs_sample = {}
+                    key_mapping = {
+                        "class_logits": "class_logits",
+                        "centers": "center",
+                        "starts": "start",
+                        "ends": "end",
+                        "confidence": "confidence",
+                    }
+                    for plot_key, model_key in key_mapping.items():
+                        if model_key in normalized_outputs:
+                            outputs_sample[plot_key] = (
+                                normalized_outputs[model_key][sample_idx].cpu().numpy()
+                            )
+
+                    plot_event_sample(
+                        x=xb[sample_idx].cpu().numpy(),
+                        y_true=y_sample,
+                        outputs=outputs_sample,
+                        output_dir=output_dir,
+                        epoch=epoch,
+                        sample_id=batch_idx * y_onehot_np.shape[0]
+                        + chunk_indices[sample_idx],
+                        class_names=class_names,
+                        station_attn=station_attn,
+                        temporal_attn=temporal_attn,
+                    )
+                    plot_count += 1
+                    for c in sample_classes:
+                        class_counts[c] = class_counts.get(c, 0) + 1
+
+                    if num_non_bg_classes is not None and all(
+                        class_counts.get(c, 0) >= samples_per_class
+                        for c in range(1, num_non_bg_classes + 1)
+                    ):
+                        break
+
+                del xb, y_onehot_chunk, outputs, station_attn_batch, temporal_attn_batch
+
+                if num_non_bg_classes is not None and all(
+                    class_counts.get(c, 0) >= samples_per_class
+                    for c in range(1, num_non_bg_classes + 1)
+                ):
+                    break
+
+            if num_non_bg_classes is not None and all(
+                class_counts.get(c, 0) >= samples_per_class
+                for c in range(1, num_non_bg_classes + 1)
+            ):
+                break
 
     # Clean up hooks
-    station_hook.detach()
-    temporal_hook.detach()
+    if station_hook is not None:
+        station_hook.detach()
+    if temporal_hook is not None:
+        temporal_hook.detach()
 
     # Explicitly release cached CUDA blocks used during attention plotting.
     if device.type == "cuda" and torch.cuda.is_available():
@@ -313,7 +398,7 @@ def plot_event_sample(
         sample_id: Sample index
         class_names: List of class names
         station_attn: Station importance weights [S], normalized to [0, 1]
-        temporal_attn: Temporal importance weights [T], normalized to [0, 1]
+        temporal_attn: Temporal importance weights [T] or [S, T], normalized to [0, 1]
 
     Plot layout:
         - Panels 0-7: Station waveforms with strong station-attention visual encoding
@@ -349,13 +434,32 @@ def plot_event_sample(
     # Get time dimension for interpolation
     T = y_true.shape[1]
 
-    # Interpolate temporal attention to match waveform time dimension
-    if temporal_attn is not None and len(temporal_attn) != T:
-        # Interpolate from attention resolution to full waveform resolution
-        temporal_attn_interp = np.interp(
-            np.linspace(0, 1, T), np.linspace(0, 1, len(temporal_attn)), temporal_attn
-        )
-        temporal_attn = temporal_attn_interp
+    # Interpolate temporal attention to match waveform time dimension.
+    # Supports a shared [T] trace or station-wise [S, T] traces.
+    if temporal_attn is not None:
+        if temporal_attn.ndim == 1:
+            if len(temporal_attn) != T:
+                temporal_attn = np.interp(
+                    np.linspace(0, 1, T),
+                    np.linspace(0, 1, len(temporal_attn)),
+                    temporal_attn,
+                )
+        elif temporal_attn.ndim == 2:
+            if temporal_attn.shape[1] != T:
+                temporal_interp = np.zeros(
+                    (temporal_attn.shape[0], T), dtype=temporal_attn.dtype
+                )
+                for s_idx in range(temporal_attn.shape[0]):
+                    temporal_interp[s_idx] = np.interp(
+                        np.linspace(0, 1, T),
+                        np.linspace(0, 1, temporal_attn.shape[1]),
+                        temporal_attn[s_idx],
+                    )
+                temporal_attn = temporal_interp
+        else:
+            raise ValueError(
+                f"temporal_attn must be 1D or 2D, got shape {temporal_attn.shape}."
+            )
 
     # Extract predicted events (if available)
     events_pred = []
@@ -426,14 +530,23 @@ def plot_event_sample(
     else:
         station_vis = np.ones(n_stations)
 
-    # Build high-contrast temporal attention map.
+    # Build high-contrast temporal attention map(s).
+    temporal_img = None
+    temporal_img_by_station = None
     if temporal_attn is not None:
-        t_min = float(np.min(temporal_attn))
-        t_max = float(np.max(temporal_attn))
-        temporal_vis = (temporal_attn - t_min) / (t_max - t_min + 1e-8)
-        temporal_img = temporal_vis[np.newaxis, :]
-    else:
-        temporal_img = None
+        if temporal_attn.ndim == 1:
+            t_min = float(np.min(temporal_attn))
+            t_max = float(np.max(temporal_attn))
+            temporal_vis = (temporal_attn - t_min) / (t_max - t_min + 1e-8)
+            temporal_img = temporal_vis[np.newaxis, :]
+        else:
+            temporal_img_by_station = []
+            for s_idx in range(min(n_stations, temporal_attn.shape[0])):
+                s_trace = temporal_attn[s_idx]
+                s_min = float(np.min(s_trace))
+                s_max = float(np.max(s_trace))
+                s_vis = (s_trace - s_min) / (s_max - s_min + 1e-8)
+                temporal_img_by_station.append(s_vis[np.newaxis, :])
 
     # Plot waveforms for each station
     for s_idx in range(n_stations):
@@ -450,12 +563,18 @@ def plot_event_sample(
 
         # Temporal attention as one rasterized heatmap (fast).
         # Station attention modulates heatmap opacity
-        if temporal_img is not None:
+        if temporal_img is not None or temporal_img_by_station is not None:
             heatmap_alpha = float(
                 0.15 + 0.50 * station_vis[s_idx]
             )  # Station attention controls heatmap opacity
+            img = (
+                temporal_img_by_station[s_idx]
+                if temporal_img_by_station is not None
+                and s_idx < len(temporal_img_by_station)
+                else temporal_img
+            )
             ax.imshow(
-                temporal_img,
+                img,
                 aspect="auto",
                 extent=[0, duration_seconds, y_lim_min, y_lim_max],
                 cmap="Blues",
@@ -848,7 +967,10 @@ class TemporalAttentionHook(AttentionHook):
         module.last_attn_weights = None
 
     def get_attention(
-        self, batch_size: Optional[int] = None, n_stations: Optional[int] = None
+        self,
+        batch_size: Optional[int] = None,
+        n_stations: Optional[int] = None,
+        collapse_stations: bool = True,
     ) -> Optional[np.ndarray]:
         attn = super().get_attention()
         if attn is None:
@@ -863,4 +985,7 @@ class TemporalAttentionHook(AttentionHook):
                 f"Temporal attention row mismatch: expected {expected_rows}, got {attn.shape[0]}."
             )
 
-        return attn.reshape(batch_size, n_stations, attn.shape[1]).mean(axis=1)
+        attn_by_station = attn.reshape(batch_size, n_stations, attn.shape[1])
+        if collapse_stations:
+            return attn_by_station.mean(axis=1)
+        return attn_by_station

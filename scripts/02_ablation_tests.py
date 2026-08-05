@@ -59,7 +59,7 @@ MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
 CONFIG = {
     "volcano": "NVCHVC",
     "batch_size": 16,
-    "epochs": 100,
+    "epochs": 2,
     "early_stop_patience": 20,
     "lr": 5e-4,
     "lr_final": 1e-6,
@@ -68,6 +68,10 @@ CONFIG = {
     "val_plot_events": 5,
     "save_confusion_matrix_each_epoch": True,
     "seed": 42,
+    "val_plot_samples_per_class": 2,
+    "val_plot_forward_batch_size": 5,
+    "best_epoch_attention_mode": "station",
+    "final_attention_mode": "full",
 }
 FOLDS = range(1, 6)
 

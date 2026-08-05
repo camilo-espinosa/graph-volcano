@@ -500,8 +500,10 @@ def train_one_event_detection_fold(
                 device=device,
                 output_dir=val_plot_dir,
                 epoch=epoch,
-                samples_per_class=config.get("val_plot_samples_per_class", 1),
+                samples_per_class=config.get("val_plot_samples_per_class", 2),
                 extract_attention=True,
+                attention_mode=config.get("best_epoch_attention_mode", "station"),
+                forward_batch_size=config.get("val_plot_forward_batch_size", 5),
             )
 
             # Confusion matrix from the same matching pass used for F1/IoU.
@@ -633,6 +635,23 @@ def train_one_event_detection_fold(
         )
         model.load_state_dict(checkpoint["model_state_dict"])
         print(f"Loaded best model from epoch {checkpoint['epoch'] + 1}")
+
+        # Full attention plotting once at end-of-training on best checkpoint.
+        final_attention_plot_count = plot_event_validation(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            output_dir=val_plot_dir / "best_checkpoint_full_attention",
+            epoch=int(checkpoint["epoch"]),
+            samples_per_class=config.get("val_plot_samples_per_class", 2),
+            extract_attention=True,
+            attention_mode=config.get("final_attention_mode", "full"),
+            forward_batch_size=config.get("val_plot_forward_batch_size", 5),
+        )
+        print(
+            "Final best-checkpoint attention plots saved: "
+            f"{final_attention_plot_count}"
+        )
 
     # Test set evaluation
     model.eval()
