@@ -99,7 +99,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "memory_levels": [0, 1, 2],
             "eval_memory_level_pool_to": 375,
         },
-        "batch_size": 24,
+        "batch_size": 16,
     },
     "mussed_search_dec1_q8": {
         "family": "detr",
@@ -113,7 +113,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "num_decoder_layers": 1,
             "num_queries": 8,
         },
-        "batch_size": 28,
+        "batch_size": 16,
     },
     "mussed_search_dec3_q8": {
         "family": "detr",
@@ -127,7 +127,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "num_decoder_layers": 3,
             "num_queries": 8,
         },
-        "batch_size": 20,
+        "batch_size": 16,
     },
     "mussed_search_q6_fast": {
         "family": "detr",
@@ -140,7 +140,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "eval_memory_level_pool_to": 375,
             "num_queries": 6,
         },
-        "batch_size": 32,
+        "batch_size": 16,
     },
     "mussed_search_q14_capacity": {
         "family": "detr",
@@ -153,7 +153,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "eval_memory_level_pool_to": 375,
             "num_queries": 14,
         },
-        "batch_size": 20,
+        "batch_size": 16,
     },
     "mussed_search_ffn192": {
         "family": "detr",
@@ -166,7 +166,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "eval_memory_level_pool_to": 375,
             "hidden_dim": 192,
         },
-        "batch_size": 28,
+        "batch_size": 16,
     },
     "mussed_search_ffn384": {
         "family": "detr",
@@ -179,7 +179,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "eval_memory_level_pool_to": 375,
             "hidden_dim": 384,
         },
-        "batch_size": 18,
+        "batch_size": 16,
     },
     "mussed_search_heads8": {
         "family": "detr",
@@ -193,7 +193,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "num_decoder_heads": 8,
             "num_queries": 8,
         },
-        "batch_size": 20,
+        "batch_size": 16,
     },
     "mussed_search_dropout005": {
         "family": "detr",
@@ -206,7 +206,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "eval_memory_level_pool_to": 375,
             "decoder_dropout": 0.05,
         },
-        "batch_size": 24,
+        "batch_size": 16,
     },
     "mussed_search_evalpool256": {
         "family": "detr",
@@ -218,7 +218,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "memory_levels": [0, 1, 2],
             "eval_memory_level_pool_to": 256,
         },
-        "batch_size": 24,
+        "batch_size": 16,
     },
     "mussed_d4_r16_s222_k127_no_bottleneck": {
         "family": "detr",
