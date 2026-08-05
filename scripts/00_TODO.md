@@ -17,7 +17,7 @@
 
 **Status:** In progress (decoder lightweight optimization phase)
 
-**Recommended Baseline:** num_decoder_layers=1, num_decoder_heads=4, hidden_dim=128, num_queries=(data-dependent), use_temporal_projection=False, constrain_intervals=True
+**Recommended Baseline:** num_decoder_layers=1, num_decoder_heads=4, hidden_dim=128, num_queries=(data-dependent), use_temporal_projection=False, interval_output_format=start_end
 
 | Hyperparameter | Ablation Values | Rationale |
 |---|---|---|
@@ -27,8 +27,8 @@
 | **num_queries** | {3, 5, 8, data_floor+2} | Event prediction slots. Must be ≥ max events per training window. Baseline: 3. |
 | **decoder_dropout** | {0.0, 0.1} | Regularization. Baseline (current): 0.1. |
 | **use_temporal_projection** | {False, True} | Whether to project encoder output before decoder. False (current): more efficient. True: adds learnable projection. |
-| **constrain_intervals** | {True} | Enforce 0 ≤ start ≤ center ≤ end ≤ 1. Currently: True (recommended). |
-| **interval_parameterization** | {center+width (current), direct} | Regress (center, half_width) vs (start, center, end). Current: center+width (guarantees ordering). |
+| **interval_output_format** | {start_end, center_duration} | Same constrained interval prediction, different returned keys for downstream ablations. |
+| **interval_parameterization** | {center+width (fixed)} | Regress (center, half_width), then derive ordered boundaries. This is now always on. |
 
 ### Phase 1: Lightweight Baseline
 **Goal:** Establish smallest decoder that maintains >90% of full-capacity F1.
@@ -51,7 +51,7 @@ MuSSED_LIGHTWEIGHT = {
     
     # Detection head
     "num_queries": 3,  # Set based on max events per window in training data
-    "constrain_intervals": True,
+    "interval_output_format": "start_end",
 }
 ```
 

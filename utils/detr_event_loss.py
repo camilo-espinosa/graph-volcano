@@ -3,7 +3,8 @@ DETR-style loss for temporal event detection.
 
 Combines:
 - Focal loss for class imbalance
-- L1 regression loss for temporal coordinates
+- L1 regression loss for temporal center and duration
+- Temporal GIoU loss for interval overlap quality
 - Confidence (objectness) loss
 """
 
@@ -13,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from typing import Dict
 
+from utils.detection_prediction_utils import normalize_prediction_intervals
 from utils.hungarian_matcher_1d import HungarianMatcher, MatchResult
 from utils.event_targets import EventInterval
 
@@ -28,6 +30,7 @@ class DETREventLoss(torch.nn.Module):
         loss_weights: Dict[str, float] | None = None,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
+        duration_smooth_l1_beta: float = 0.1,
         matcher_cost_class: float = 1.0,
         matcher_cost_bbox: float = 1.0,
         matcher_cost_giou: float = 1.0,
@@ -37,23 +40,27 @@ class DETREventLoss(torch.nn.Module):
             num_classes: Number of event classes (including background)
             loss_weights: Dict with keys:
                 - class_loss: weight for classification loss
-                - bbox_loss: weight for regression loss
+                - bbox_loss: weight for L1 center+duration regression loss
+                - giou_loss: weight for temporal GIoU loss
                 - conf_loss: weight for confidence loss
                 - unmatched_query: weight for unmatched query penalty
             focal_alpha: Focal loss alpha parameter
             focal_gamma: Focal loss gamma parameter (focusing parameter)
+            duration_smooth_l1_beta: Beta parameter for SmoothL1 on duration
             matcher_cost_*: Hungarian matcher cost weights
         """
         super().__init__()
         self.num_classes = int(num_classes)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
+        self.duration_smooth_l1_beta = float(duration_smooth_l1_beta)
 
         # Default loss weights
         if loss_weights is None:
             loss_weights = {
                 "class_loss": 2.0,
                 "bbox_loss": 5.0,
+                "giou_loss": 2.0,
                 "conf_loss": 2.0,
                 "unmatched_query": 0.1,
             }
@@ -80,6 +87,7 @@ class DETREventLoss(torch.nn.Module):
                 - center: [B, Nq, 1]
                 - start: [B, Nq, 1]
                 - end: [B, Nq, 1]
+                - duration: [B, Nq, 1] (materialized by normalization)
                 - confidence: [B, Nq, 1]
             targets: List of lists of EventInterval per sample [B][N_gt]
 
@@ -87,10 +95,12 @@ class DETREventLoss(torch.nn.Module):
             Dict with:
                 - loss_total: scalar loss
                 - loss_class: classification loss
-                - loss_bbox: regression loss
+                - loss_bbox: L1 regression loss
+                - loss_giou: temporal GIoU loss
                 - loss_conf: confidence loss
                 - metrics: dict with auxiliary metrics
         """
+        predictions = normalize_prediction_intervals(predictions)
         batch_size = predictions["class_logits"].shape[0]
         num_queries = predictions["class_logits"].shape[1]
 
@@ -100,6 +110,7 @@ class DETREventLoss(torch.nn.Module):
         # Compute losses per sample
         class_losses = []
         bbox_losses = []
+        giou_losses = []
         conf_losses = []
 
         device = predictions["class_logits"].device
@@ -156,6 +167,7 @@ class DETREventLoss(torch.nn.Module):
                 pred_centers = center_b[match.pred_indices, 0]  # [M]
                 pred_starts = start_b[match.pred_indices, 0]  # [M]
                 pred_ends = end_b[match.pred_indices, 0]  # [M]
+                pred_durations = (pred_ends - pred_starts).clamp(0.0, 1.0)  # [M]
 
                 target_centers = torch.tensor(
                     [target_list[i].center_norm for i in match.target_indices],
@@ -172,15 +184,26 @@ class DETREventLoss(torch.nn.Module):
                     dtype=torch.float32,
                     device=device,
                 )
+                target_durations = (target_ends - target_starts).clamp(0.0, 1.0)
 
-                # L1 loss on temporal coordinates
+                # L1 on center + SmoothL1 on duration.
                 loss_bbox_b = (
                     F.l1_loss(pred_centers, target_centers, reduction="mean")
-                    + F.l1_loss(pred_starts, target_starts, reduction="mean")
-                    + F.l1_loss(pred_ends, target_ends, reduction="mean")
-                ) / 3.0
+                    + F.smooth_l1_loss(
+                        pred_durations,
+                        target_durations,
+                        beta=self.duration_smooth_l1_beta,
+                        reduction="mean",
+                    )
+                ) / 2.0
+
+                giou = self._temporal_giou_1d(
+                    pred_starts, pred_ends, target_starts, target_ends
+                )
+                loss_giou_b = (1.0 - giou).mean()
             else:
                 loss_bbox_b = torch.tensor(0.0, device=device)
+                loss_giou_b = torch.tensor(0.0, device=device)
 
             # Confidence loss
             # Matched queries should have high confidence, unmatched should have low confidence
@@ -195,17 +218,20 @@ class DETREventLoss(torch.nn.Module):
 
             class_losses.append(loss_class_b)
             bbox_losses.append(loss_bbox_b)
+            giou_losses.append(loss_giou_b)
             conf_losses.append(loss_conf_b)
 
         # Average over batch
         loss_class = torch.stack(class_losses).mean()
         loss_bbox = torch.stack(bbox_losses).mean()
+        loss_giou = torch.stack(giou_losses).mean()
         loss_conf = torch.stack(conf_losses).mean()
 
         # Weighted sum
         loss_total = (
             self.loss_weights["class_loss"] * loss_class
             + self.loss_weights["bbox_loss"] * loss_bbox
+            + self.loss_weights["giou_loss"] * loss_giou
             + self.loss_weights["conf_loss"] * loss_conf
         )
 
@@ -213,6 +239,7 @@ class DETREventLoss(torch.nn.Module):
             "loss_total": loss_total,
             "loss_class": loss_class.detach(),
             "loss_bbox": loss_bbox.detach(),
+            "loss_giou": loss_giou.detach(),
             "loss_conf": loss_conf.detach(),
             "metrics": {
                 "num_matched": sum(len(m.pred_indices) for m in matches),
@@ -220,6 +247,41 @@ class DETREventLoss(torch.nn.Module):
                 "num_predictions": batch_size * num_queries,
             },
         }
+
+    @staticmethod
+    def _temporal_giou_1d(
+        pred_starts: torch.Tensor,
+        pred_ends: torch.Tensor,
+        target_starts: torch.Tensor,
+        target_ends: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute temporal GIoU for matched 1D interval pairs."""
+        pred_starts = pred_starts.clamp(0.0, 1.0)
+        pred_ends = pred_ends.clamp(0.0, 1.0)
+        target_starts = target_starts.clamp(0.0, 1.0)
+        target_ends = target_ends.clamp(0.0, 1.0)
+
+        pred_start_fixed = torch.minimum(pred_starts, pred_ends)
+        pred_end_fixed = torch.maximum(pred_starts, pred_ends)
+        target_start_fixed = torch.minimum(target_starts, target_ends)
+        target_end_fixed = torch.maximum(target_starts, target_ends)
+
+        inter_start = torch.maximum(pred_start_fixed, target_start_fixed)
+        inter_end = torch.minimum(pred_end_fixed, target_end_fixed)
+        inter_len = (inter_end - inter_start).clamp(min=0.0)
+
+        pred_len = (pred_end_fixed - pred_start_fixed).clamp(min=0.0)
+        target_len = (target_end_fixed - target_start_fixed).clamp(min=0.0)
+        union_len = pred_len + target_len - inter_len
+
+        iou = inter_len / (union_len + 1e-7)
+
+        enclose_start = torch.minimum(pred_start_fixed, target_start_fixed)
+        enclose_end = torch.maximum(pred_end_fixed, target_end_fixed)
+        enclose_len = (enclose_end - enclose_start).clamp(min=1e-7)
+
+        giou = iou - (enclose_len - union_len) / enclose_len
+        return giou
 
     def _focal_loss(
         self,

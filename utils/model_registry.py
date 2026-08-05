@@ -5,12 +5,10 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-# from models.PhaseNO import PhaseNO
 from models.PhaseNet import PhaseNet
 from models.PhaseNet_bottleneck_attention import PhaseNetBottleneckAttention
 from models.MuSSeg import MuSSeg
 from models.MuSSED import MuSSED
-from models.PhaseNet_permutation_invariant import PhaseNetPermutationInvariant
 from models.UNet import UNet
 from models.UNet_bottleneck_attention import UNetBottleneckAttention
 
@@ -75,6 +73,7 @@ MUSSED_BASE_KWARGS: dict[str, Any] = {
     "bottleneck_attn_ff_mult": 2,
     "station_attn_heads": 4,
     "station_attn_ff_mult": 2,
+    "station_mask_abs_sum_threshold": 1e1,
     "num_queries": 10,
     "query_dim": 128,
     "hidden_dim": 256,
@@ -82,26 +81,144 @@ MUSSED_BASE_KWARGS: dict[str, Any] = {
     "num_decoder_layers": 2,
     "decoder_dropout": 0.01,
     "use_temporal_projection": False,
-    "constrain_intervals": True,
+    "interval_output_format": "center_duration",
 }
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # ===================================================================
     # EVENT DETECTION: MuSSED models (DETR-based event detection)
+    # Model-search set: keep encoder fixed, vary decoder/query side only.
     # ===================================================================
-    "mussed_base": {
+    "mussed_multilevel_memory_all": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            # "query_dim": 128,
-            # "hidden_dim": 256,
-            # "num_decoder_heads": 4,
-            "num_decoder_layers": 1,
-            # "decoder_dropout": 0.01,
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
         },
-        "batch_size": 36,
+        "batch_size": 24,
+    },
+    "mussed_search_dec1_q8": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
+            "num_decoder_layers": 1,
+            "num_queries": 8,
+        },
+        "batch_size": 28,
+    },
+    "mussed_search_dec3_q8": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
+            "num_decoder_layers": 3,
+            "num_queries": 8,
+        },
+        "batch_size": 20,
+    },
+    "mussed_search_q6_fast": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
+            "num_queries": 6,
+        },
+        "batch_size": 32,
+    },
+    "mussed_search_q14_capacity": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
+            "num_queries": 14,
+        },
+        "batch_size": 20,
+    },
+    "mussed_search_ffn192": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
+            "hidden_dim": 192,
+        },
+        "batch_size": 28,
+    },
+    "mussed_search_ffn384": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
+            "hidden_dim": 384,
+        },
+        "batch_size": 18,
+    },
+    "mussed_search_heads8": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
+            "num_decoder_heads": 8,
+            "num_queries": 8,
+        },
+        "batch_size": 20,
+    },
+    "mussed_search_dropout005": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 375,
+            "decoder_dropout": 0.05,
+        },
+        "batch_size": 24,
+    },
+    "mussed_search_evalpool256": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+            "eval_memory_level_pool_to": 256,
+        },
+        "batch_size": 24,
     },
     "mussed_d4_r16_s222_k127_no_bottleneck": {
         "family": "detr",

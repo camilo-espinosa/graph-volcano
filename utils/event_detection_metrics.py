@@ -11,6 +11,7 @@ from typing import Dict, Tuple
 import numpy as np
 from scipy.special import softmax
 
+from utils.detection_prediction_utils import normalize_prediction_intervals
 from utils.event_targets import EventInterval
 
 
@@ -58,6 +59,7 @@ class EventDetectionMetrics:
                 - F1_*: F1 scores at each threshold
                 - per_class_AP_*: Per-class AP
         """
+        predictions = normalize_prediction_intervals(predictions)
         batch_size = predictions["class_logits"].shape[0]
 
         # Convert to numpy
@@ -303,6 +305,7 @@ class EventDetectionMetrics:
         - Unmatched GT event => (true=class_id, pred=0)
         - Unmatched predicted event => (true=0, pred=class_id)
         """
+        predictions = normalize_prediction_intervals(predictions)
         class_logits = np.asarray(predictions["class_logits"])
         pred_starts = np.asarray(predictions["start"])
         pred_ends = np.asarray(predictions["end"])
@@ -449,6 +452,7 @@ class EventDetectionMetrics:
         """
         Compute F1 score at a specific IoU threshold.
         """
+        predictions = normalize_prediction_intervals(predictions)
         batch_size = predictions["class_logits"].shape[0]
 
         # Collect all predictions and targets with sample indices.

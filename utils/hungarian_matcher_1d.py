@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 from scipy.optimize import linear_sum_assignment
 
+from utils.detection_prediction_utils import normalize_prediction_intervals
 from utils.event_targets import EventInterval
 
 
@@ -44,7 +45,7 @@ class HungarianMatcher(nn.Module):
         """
         Args:
             cost_class: Relative weight of classification cost
-            cost_bbox: Relative weight of bbox (temporal) regression cost
+            cost_bbox: Relative weight of temporal center+duration regression cost
             cost_giou: Relative weight of temporal GIoU cost
         """
         super().__init__()
@@ -77,6 +78,7 @@ class HungarianMatcher(nn.Module):
         Returns:
             List of MatchResult per sample.
         """
+        predictions = normalize_prediction_intervals(predictions)
         batch_size = predictions["class_logits"].shape[0]
 
         class_logits = predictions["class_logits"]  # [B, Nq, num_classes]
@@ -168,13 +170,13 @@ class HungarianMatcher(nn.Module):
         # [Nq, N_gt]
         cost_class = -class_probs_np[:, target_classes]
 
-        # Cost 2: L1 distance for bbox (center, start, end)
+        # Cost 2: L1 distance for center and duration.
         # [Nq] -> [Nq, 1], [N_gt] -> [1, N_gt]
         # Broadcast to [Nq, N_gt]
-        cost_bbox = (
-            np.abs(center_pred_np[:, None] - target_centers[None, :])
-            + np.abs(start_pred_np[:, None] - target_starts[None, :])
-            + np.abs(end_pred_np[:, None] - target_ends[None, :])
+        pred_durations = np.clip(end_pred_np - start_pred_np, 0.0, 1.0)
+        target_durations = np.clip(target_ends - target_starts, 0.0, 1.0)
+        cost_bbox = np.abs(center_pred_np[:, None] - target_centers[None, :]) + np.abs(
+            pred_durations[:, None] - target_durations[None, :]
         )
 
         # Cost 3: Temporal GIoU (1 - GIoU)
@@ -222,11 +224,17 @@ class HungarianMatcher(nn.Module):
         start_target = np.clip(start_target, 0, 1)
         end_target = np.clip(end_target, 0, 1)
 
-        # Ensure start < end
-        start_pred = np.minimum(start_pred, end_pred)
-        end_pred = np.maximum(start_pred, end_pred)
-        start_target = np.minimum(start_target, end_target)
-        end_target = np.maximum(start_target, end_target)
+        # Ensure start < end using original clamped arrays.
+        # This preserves valid swaps when start > end.
+        pred_start_orig = start_pred
+        pred_end_orig = end_pred
+        target_start_orig = start_target
+        target_end_orig = end_target
+
+        start_pred = np.minimum(pred_start_orig, pred_end_orig)
+        end_pred = np.maximum(pred_start_orig, pred_end_orig)
+        start_target = np.minimum(target_start_orig, target_end_orig)
+        end_target = np.maximum(target_start_orig, target_end_orig)
 
         # Intersection: [Nq, N_gt]
         inter_start = np.maximum(start_pred[:, None], start_target[None, :])

@@ -23,6 +23,7 @@ from utils.train_utils import (
     MultiStation1DDataset,
     BalancedBatchSampler,
 )
+from utils.detection_prediction_utils import normalize_prediction_intervals
 from utils.model_registry import get_model_spec
 from utils.detr_event_loss import DETREventLoss
 from utils.event_detection_metrics import EventDetectionMetrics
@@ -56,6 +57,7 @@ def compute_event_confusion_matrix(
     """
     print(f"[compute_event_confusion_matrix] Starting computation...")
     t0_cm_compute = time.time()
+    all_predictions = normalize_prediction_intervals(all_predictions)
     class_logits = np.asarray(all_predictions["class_logits"])  # [B, Nq, C]
     pred_starts = np.asarray(all_predictions["start"])  # [B, Nq, 1]
     pred_ends = np.asarray(all_predictions["end"])  # [B, Nq, 1]
@@ -315,6 +317,7 @@ def train_one_event_detection_fold(
         train_loss = 0.0
         train_loss_class = 0.0
         train_loss_bbox = 0.0
+        train_loss_giou = 0.0
         train_loss_conf = 0.0
         num_train_batches = 0
 
@@ -344,6 +347,7 @@ def train_one_event_detection_fold(
             train_loss += loss.item()
             train_loss_class += loss_dict["loss_class"].item()
             train_loss_bbox += loss_dict["loss_bbox"].item()
+            train_loss_giou += loss_dict["loss_giou"].item()
             train_loss_conf += loss_dict["loss_conf"].item()
             num_train_batches += 1
 
@@ -355,6 +359,7 @@ def train_one_event_detection_fold(
                     f"loss={current_loss:.4f} "
                     f"[class={train_loss_class / (batch_idx + 1):.4f} "
                     f"bbox={train_loss_bbox / (batch_idx + 1):.4f} "
+                    f"giou={train_loss_giou / (batch_idx + 1):.4f} "
                     f"conf={train_loss_conf / (batch_idx + 1):.4f}]"
                 )
 
@@ -365,6 +370,7 @@ def train_one_event_detection_fold(
         val_loss = 0.0
         val_loss_class = 0.0
         val_loss_bbox = 0.0
+        val_loss_giou = 0.0
         val_loss_conf = 0.0
         all_predictions = {
             "class_logits": [],
@@ -382,7 +388,7 @@ def train_one_event_detection_fold(
                 y_onehot = batch[1]
 
                 # Forward pass
-                predictions = model(xb)
+                predictions = normalize_prediction_intervals(model(xb))
 
                 # Convert targets
                 targets = batch_segmentation_to_events(y_onehot, normalize=True)
@@ -393,6 +399,7 @@ def train_one_event_detection_fold(
                 val_loss += loss_dict["loss_total"].item()
                 val_loss_class += loss_dict["loss_class"].item()
                 val_loss_bbox += loss_dict["loss_bbox"].item()
+                val_loss_giou += loss_dict["loss_giou"].item()
                 val_loss_conf += loss_dict["loss_conf"].item()
                 num_val_batches += 1
 
@@ -413,6 +420,9 @@ def train_one_event_detection_fold(
         avg_train_loss_bbox = (
             train_loss_bbox / num_train_batches if num_train_batches > 0 else 0.0
         )
+        avg_train_loss_giou = (
+            train_loss_giou / num_train_batches if num_train_batches > 0 else 0.0
+        )
         avg_train_loss_conf = (
             train_loss_conf / num_train_batches if num_train_batches > 0 else 0.0
         )
@@ -425,6 +435,9 @@ def train_one_event_detection_fold(
         )
         avg_val_loss_bbox = (
             val_loss_bbox / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_loss_giou = (
+            val_loss_giou / num_val_batches if num_val_batches > 0 else 0.0
         )
         avg_val_loss_conf = (
             val_loss_conf / num_val_batches if num_val_batches > 0 else 0.0
@@ -487,7 +500,7 @@ def train_one_event_detection_fold(
                 device=device,
                 output_dir=val_plot_dir,
                 epoch=epoch,
-                max_samples=config.get("val_plot_events", 15),
+                samples_per_class=config.get("val_plot_samples_per_class", 1),
                 extract_attention=True,
             )
 
@@ -566,10 +579,10 @@ def train_one_event_detection_fold(
             f"EPOCH {epoch + 1:3d} SUMMARY\n"
             f"==============================================================================\n"
             f"Train Loss:  {avg_train_loss:.4f}  "
-            f"[class={avg_train_loss_class:.4f} bbox={avg_train_loss_bbox:.4f} "
+            f"[class={avg_train_loss_class:.4f} bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f} "
             f"conf={avg_train_loss_conf:.4f}]\n"
             f"Val Loss:    {avg_val_loss:.4f}  "
-            f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} "
+            f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f} "
             f"conf={avg_val_loss_conf:.4f}]\n"
             f"Metrics:     mean_f1={mean_f1:.4f} mean_iou={mean_iou:.4f} "
             f"best_epoch={best_epoch + 1} no_improve={epochs_without_improvement}/{config['early_stop_patience']}\n"
@@ -639,7 +652,7 @@ def train_one_event_detection_fold(
             xb = batch[0].to(device)
             y_onehot = batch[1]
 
-            predictions = model(xb)
+            predictions = normalize_prediction_intervals(model(xb))
             targets = batch_segmentation_to_events(y_onehot, normalize=True)
             all_test_targets.extend(targets)
 

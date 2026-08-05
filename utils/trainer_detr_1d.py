@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.MuSSED import MuSSED
+from utils.detection_prediction_utils import normalize_prediction_intervals
 from utils.musseg_utils import MuSSegWindowDataset, musseg_collate_fn, MuSSegBatch
 from utils.event_targets import batch_segmentation_to_events
 from utils.detr_event_loss import DETREventLoss
@@ -186,6 +187,7 @@ class DETRTrainer:
             "center": [],
             "start": [],
             "end": [],
+            "duration": [],
             "confidence": [],
         }
         all_targets = []
@@ -198,7 +200,7 @@ class DETRTrainer:
                 batch = self._move_batch_to_device(batch)
 
                 # Forward pass
-                predictions = self.model(batch.x)
+                predictions = normalize_prediction_intervals(self.model(batch.x))
 
                 # Convert segmentation labels to events
                 targets = batch_segmentation_to_events(batch.y_onehot, normalize=True)

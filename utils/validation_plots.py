@@ -21,9 +21,10 @@ import matplotlib.pyplot as plt
 import torch
 
 from utils import data_utils
+from utils.detection_prediction_utils import normalize_prediction_intervals
 
 # Keep delivered attention artifacts compact for plotting diagnostics.
-MAX_TEMPORAL_ATTN_POINTS = 256
+MAX_TEMPORAL_ATTN_POINTS = 32
 
 
 def plot_segmentation_validation(
@@ -32,7 +33,7 @@ def plot_segmentation_validation(
     device: torch.device,
     output_dir: Path,
     epoch: int,
-    max_samples: int = 15,
+    samples_per_class: int = 2,
     class_names: list = None,
 ) -> int:
     """
@@ -44,7 +45,7 @@ def plot_segmentation_validation(
         device: torch.device
         output_dir: Directory to save plots
         epoch: Epoch number (for naming)
-        max_samples: Maximum number of random samples to plot
+        samples_per_class: Number of examples to save per non-background class
         class_names: List of class names (default: ["BG", "VT", "LP", "TR", "AV", "IC"])
 
     Returns:
@@ -57,6 +58,7 @@ def plot_segmentation_validation(
 
     model.eval()
     plot_count = 0
+    class_counts: dict = {}  # {class_id: n_saved}
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(dataloader):
@@ -67,10 +69,8 @@ def plot_segmentation_validation(
                 xb, y_onehot, _y_idx = batch
 
             xb = xb.to(device)
-
             outputs = model(xb)
 
-            # Convert to CPU for plotting
             xb_np = xb.cpu().numpy()
             y_np = y_onehot.cpu().numpy()
 
@@ -83,11 +83,21 @@ def plot_segmentation_validation(
                     .numpy()
                 )
 
-            # Plot each sample in batch
-            for sample_idx in range(min(len(xb_np), max_samples - plot_count)):
+            for sample_idx in range(len(xb_np)):
+                y_sample = y_np[sample_idx]  # [C, T] or [C, H, W]
+                sample_classes = [
+                    c for c in range(1, y_sample.shape[0]) if y_sample[c].any()
+                ]
+                if not sample_classes:
+                    continue
+                if not any(
+                    class_counts.get(c, 0) < samples_per_class for c in sample_classes
+                ):
+                    continue
+
                 plot_segmentation_sample(
                     x=xb_np[sample_idx],
-                    y_true=y_np[sample_idx],
+                    y_true=y_sample,
                     y_pred=pred_np[sample_idx],
                     output_dir=output_dir,
                     epoch=epoch,
@@ -95,12 +105,8 @@ def plot_segmentation_validation(
                     class_names=class_names,
                 )
                 plot_count += 1
-
-                if plot_count >= max_samples:
-                    break
-
-            if plot_count >= max_samples:
-                break
+                for c in sample_classes:
+                    class_counts[c] = class_counts.get(c, 0) + 1
 
             del xb, y_onehot, outputs
 
@@ -143,7 +149,7 @@ def plot_event_validation(
     device: torch.device,
     output_dir: Path,
     epoch: int,
-    max_samples: int = 15,
+    samples_per_class: int = 1,
     class_names: list = None,
     extract_attention: bool = True,
 ) -> int:
@@ -156,7 +162,7 @@ def plot_event_validation(
         device: torch.device
         output_dir: Directory to save plots
         epoch: Epoch number
-        max_samples: Maximum number of samples to plot
+        samples_per_class: Number of examples to save per non-background class
         class_names: List of class names
         extract_attention: Whether to extract and visualize attention weights
 
@@ -183,6 +189,7 @@ def plot_event_validation(
 
     model.eval()
     plot_count = 0
+    class_counts: dict = {}  # {class_id: n_saved}
 
     # Setup attention hooks (fail fast if modules not found)
     station_hook = try_attach_station_attention_hook(model)
@@ -190,12 +197,8 @@ def plot_event_validation(
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(dataloader):
-            remaining = max_samples - plot_count
-            if remaining <= 0:
-                break
-
-            xb, y_onehot = batch[0][:remaining], batch[1][:remaining]
-            xb = xb.to(device)
+            xb = batch[0].to(device)
+            y_onehot = batch[1]
 
             # Forward pass through MuSSED
             outputs = model(xb)
@@ -224,32 +227,43 @@ def plot_event_validation(
                     f"Temporal attention batch mismatch: expected {xb.shape[0]}, got {temporal_attn_batch.shape[0]}."
                 )
 
-            # Ground-truth events are extracted inside plot_event_sample.
+            # normalized_outputs computed once per batch
+            normalized_outputs = normalize_prediction_intervals(outputs)
 
-            # Plot each sample
-            for sample_idx in range(min(len(xb), max_samples - plot_count)):
+            # Plot each sample that contributes to an under-represented class
+            for sample_idx in range(len(xb)):
+                y_sample = y_onehot[sample_idx].numpy()  # [C, T]
+                sample_classes = [
+                    c for c in range(1, y_sample.shape[0]) if y_sample[c].any()
+                ]
+                if not sample_classes:
+                    continue
+                if not any(
+                    class_counts.get(c, 0) < samples_per_class for c in sample_classes
+                ):
+                    continue
+
                 station_attn = station_attn_batch[sample_idx]
                 temporal_attn = temporal_attn_batch[sample_idx]
 
-                # Extract sample-level outputs
-                # Note: MuSSED outputs use singular names: center, start, end (not centers, starts, ends)
+                # Note: MuSSED outputs use singular names: center, start, end
                 outputs_sample = {}
                 key_mapping = {
                     "class_logits": "class_logits",
-                    "centers": "center",  # MuSSED uses singular
-                    "starts": "start",  # MuSSED uses singular
-                    "ends": "end",  # MuSSED uses singular
+                    "centers": "center",
+                    "starts": "start",
+                    "ends": "end",
                     "confidence": "confidence",
                 }
                 for plot_key, model_key in key_mapping.items():
-                    if model_key in outputs:
+                    if model_key in normalized_outputs:
                         outputs_sample[plot_key] = (
-                            outputs[model_key][sample_idx].cpu().numpy()
+                            normalized_outputs[model_key][sample_idx].cpu().numpy()
                         )
 
                 plot_event_sample(
                     x=xb[sample_idx].cpu().numpy(),
-                    y_true=y_onehot[sample_idx].numpy(),
+                    y_true=y_sample,
                     outputs=outputs_sample,
                     output_dir=output_dir,
                     epoch=epoch,
@@ -259,13 +273,10 @@ def plot_event_validation(
                     temporal_attn=temporal_attn,
                 )
                 plot_count += 1
-
-                if plot_count >= max_samples:
-                    break
+                for c in sample_classes:
+                    class_counts[c] = class_counts.get(c, 0) + 1
 
             del xb, y_onehot, outputs, station_attn_batch, temporal_attn_batch
-            if plot_count >= max_samples:
-                break
 
     # Clean up hooks
     station_hook.detach()
@@ -428,6 +439,7 @@ def plot_event_sample(
     for s_idx in range(n_stations):
         ax = station_axes[s_idx]
         waveform = x[s_idx]
+        waveform_sum_abs = float(np.sum(np.abs(waveform)))
 
         # Use original waveform values (no normalization)
         waveform_norm = waveform.copy()
@@ -546,13 +558,18 @@ def plot_event_sample(
         ax.set_ylim(y_lim_min, y_lim_max)
         if station_attn is not None:
             ax.set_ylabel(
-                f"S{s_idx} a={station_attn[s_idx]:.2f}",
+                f"S{s_idx} a={station_attn[s_idx]:.2f}\nabs={waveform_sum_abs:.3e}",
                 fontsize=11,
                 fontweight="bold",
                 rotation=0,
             )
         else:
-            ax.set_ylabel(f"S{s_idx}", fontsize=11, fontweight="bold", rotation=0)
+            ax.set_ylabel(
+                f"S{s_idx}\nabs={waveform_sum_abs:.3e}",
+                fontsize=11,
+                fontweight="bold",
+                rotation=0,
+            )
         ax.yaxis.set_label_coords(-0.08, 0.5)
         ax.grid(True, alpha=0.2, zorder=0)
         ax.tick_params(axis="y", labelsize=10)
