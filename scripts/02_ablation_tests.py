@@ -59,8 +59,8 @@ MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
 CONFIG = {
     "volcano": "NVCHVC",
     "batch_size": 16,
-    "epochs": 2,
-    "early_stop_patience": 20,
+    "epochs": 100,
+    "early_stop_patience": 25,
     "lr": 5e-4,
     "lr_final": 1e-6,
     "dice_weight": 0.7,
@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--folds",
         type=str,
-        default="1",
+        default="all",
         help=(
             "Comma-separated folds to run (e.g. '1,3' or '01,03'). "
             "Use 'all' for all folds. Default: all folds."

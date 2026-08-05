@@ -51,8 +51,6 @@ def format_epoch_summary_detection(
     train_loss: float,
     train_loss_class: float,
     train_loss_bbox: float,
-    train_loss_conf: float,
-    train_loss_unmatched: float,
     val_loss: float,
     mean_f1: float,  # F1@0.5 from events
     mAP: float,

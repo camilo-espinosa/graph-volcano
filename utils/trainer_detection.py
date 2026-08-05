@@ -34,7 +34,6 @@ from utils.validation_plots import plot_event_validation
 def compute_event_confusion_matrix(
     all_predictions: dict,
     all_targets: list,
-    confidence_threshold: float = 0.5,
     iou_threshold: float = 0.5,
     num_classes: int = 6,
 ) -> np.ndarray:
@@ -45,10 +44,9 @@ def compute_event_confusion_matrix(
     from the (true_class, pred_class) pairs.
 
     Args:
-        all_predictions: Dict with keys "class_logits", "center", "start", "end", "confidence"
+        all_predictions: Dict with keys "class_logits", "center", "start", "end"
                         Each is [N_pred] or [N_pred, C] array
         all_targets: List of event lists (each sample has list of EventInterval objects)
-        confidence_threshold: Minimum confidence to consider prediction
         iou_threshold: Minimum IoU to match predictions to targets
         num_classes: Number of classes (including background)
 
@@ -61,7 +59,6 @@ def compute_event_confusion_matrix(
     class_logits = np.asarray(all_predictions["class_logits"])  # [B, Nq, C]
     pred_starts = np.asarray(all_predictions["start"])  # [B, Nq, 1]
     pred_ends = np.asarray(all_predictions["end"])  # [B, Nq, 1]
-    pred_conf_logits = np.asarray(all_predictions["confidence"])  # [B, Nq, 1]
 
     if class_logits.ndim != 3:
         raise ValueError(
@@ -75,11 +72,6 @@ def compute_event_confusion_matrix(
         raise ValueError(
             f"End shape mismatch: ends {pred_ends.shape} vs class_logits {class_logits.shape}."
         )
-    if pred_conf_logits.shape[:2] != class_logits.shape[:2]:
-        raise ValueError(
-            f"Confidence shape mismatch: confidence {pred_conf_logits.shape} vs class_logits {class_logits.shape}."
-        )
-
     batch_size, n_queries, _ = class_logits.shape
     if len(all_targets) != batch_size:
         raise ValueError(
@@ -117,14 +109,14 @@ def compute_event_confusion_matrix(
 
     for b in range(batch_size):
         probs = softmax(class_logits[b], axis=-1)  # [Nq, C]
-        conf_sigmoid = 1.0 / (1.0 + np.exp(-pred_conf_logits[b, :, 0]))  # [Nq]
 
         sample_preds = []
         for q in range(n_queries):
-            pred_class = int(np.argmax(probs[q, 1:]) + 1)  # exclude background
-            pred_score = float(probs[q, pred_class] * conf_sigmoid[q])
-            if pred_score < confidence_threshold:
+            pred_class = int(np.argmax(probs[q]))
+            if pred_class == 0:
                 continue
+
+            pred_score = float(probs[q, pred_class])
 
             sample_preds.append(
                 {
@@ -166,16 +158,16 @@ def compute_event_confusion_matrix(
                 true_classes.append(int(target.class_id))
                 pred_classes.append(int(sample_preds[best_pred_idx]["class_id"]))
             else:
-                # Undetected event (false negative): pred_class=0 means "No Detection"
+                # Undetected event (false negative): pred_class=0 means background.
                 matched_target[t_idx] = True
                 true_classes.append(int(target.class_id))
                 pred_classes.append(0)
 
-    # Build confusion matrix with classes 0-5 (0=No Detection, 1-5=VT,LP,TR,AV,IC)
+    # Build confusion matrix with classes 0-5 (0=Background, 1-5=VT,LP,TR,AV,IC)
     cm = confusion_matrix(
         true_classes,
         pred_classes,
-        labels=list(range(num_classes)),  # Include 0 for "No Detection"
+        labels=list(range(num_classes)),
     )
 
     print(
@@ -204,7 +196,7 @@ def train_one_event_detection_fold(
         config: Training config dict with keys:
             - batch_size, lr, lr_final, epochs
             - early_stop_patience, val_plot_events
-            - detection-specific: loss weights for class, bbox, conf, unmatched
+            - detection-specific: loss weights for class, bbox, giou, unmatched
 
     Returns:
         fold_summary: dict with results (best epoch, metrics, elapsed time)
@@ -257,8 +249,8 @@ def train_one_event_detection_fold(
         - Detection head: 1.0 * base_lr (fast adaptation)
         """
         param_groups = [
-            {"params": [], "lr": base_lr * 0.1, "name": "encoder"},
-            {"params": [], "lr": base_lr * 0.3, "name": "attention"},
+            {"params": [], "lr": base_lr, "name": "encoder"},
+            {"params": [], "lr": base_lr, "name": "attention"},
             {"params": [], "lr": base_lr, "name": "detection_head"},
         ]
 
@@ -318,7 +310,6 @@ def train_one_event_detection_fold(
         train_loss_class = 0.0
         train_loss_bbox = 0.0
         train_loss_giou = 0.0
-        train_loss_conf = 0.0
         num_train_batches = 0
 
         for batch_idx, batch in enumerate(train_loader):
@@ -348,7 +339,6 @@ def train_one_event_detection_fold(
             train_loss_class += loss_dict["loss_class"].item()
             train_loss_bbox += loss_dict["loss_bbox"].item()
             train_loss_giou += loss_dict["loss_giou"].item()
-            train_loss_conf += loss_dict["loss_conf"].item()
             num_train_batches += 1
 
             # Print progress every few batches
@@ -359,8 +349,7 @@ def train_one_event_detection_fold(
                     f"loss={current_loss:.4f} "
                     f"[class={train_loss_class / (batch_idx + 1):.4f} "
                     f"bbox={train_loss_bbox / (batch_idx + 1):.4f} "
-                    f"giou={train_loss_giou / (batch_idx + 1):.4f} "
-                    f"conf={train_loss_conf / (batch_idx + 1):.4f}]"
+                    f"giou={train_loss_giou / (batch_idx + 1):.4f}]"
                 )
 
         scheduler.step()
@@ -371,13 +360,11 @@ def train_one_event_detection_fold(
         val_loss_class = 0.0
         val_loss_bbox = 0.0
         val_loss_giou = 0.0
-        val_loss_conf = 0.0
         all_predictions = {
             "class_logits": [],
             "center": [],
             "start": [],
             "end": [],
-            "confidence": [],
         }
         all_targets = []
         num_val_batches = 0
@@ -400,7 +387,6 @@ def train_one_event_detection_fold(
                 val_loss_class += loss_dict["loss_class"].item()
                 val_loss_bbox += loss_dict["loss_bbox"].item()
                 val_loss_giou += loss_dict["loss_giou"].item()
-                val_loss_conf += loss_dict["loss_conf"].item()
                 num_val_batches += 1
 
                 # Collect predictions for metrics computation
@@ -423,9 +409,6 @@ def train_one_event_detection_fold(
         avg_train_loss_giou = (
             train_loss_giou / num_train_batches if num_train_batches > 0 else 0.0
         )
-        avg_train_loss_conf = (
-            train_loss_conf / num_train_batches if num_train_batches > 0 else 0.0
-        )
 
         avg_val_loss = (
             val_loss / num_val_batches if num_val_batches > 0 else float("inf")
@@ -439,25 +422,19 @@ def train_one_event_detection_fold(
         avg_val_loss_giou = (
             val_loss_giou / num_val_batches if num_val_batches > 0 else 0.0
         )
-        avg_val_loss_conf = (
-            val_loss_conf / num_val_batches if num_val_batches > 0 else 0.0
-        )
 
         # Concatenate predictions for metrics computation
         for key in all_predictions:
             all_predictions[key] = np.concatenate(all_predictions[key], axis=0)
 
         # Compute event detection metrics (mAP at various IoU thresholds)
-        detection_metrics = metrics_fn.evaluate_batch(
-            all_predictions, all_targets, confidence_threshold=0.5
-        )
+        detection_metrics = metrics_fn.evaluate_batch(all_predictions, all_targets)
 
         # Unified event summary from one matching pass: confusion matrix + per-class metrics.
         detection_summary = metrics_fn.compute_detection_summary(
             all_predictions,
             all_targets,
             iou_threshold=0.5,
-            confidence_threshold=0.5,
         )
         per_class_f1_dict = detection_summary["per_class_f1"]
         per_class_iou_dict = detection_summary["per_class_iou"]
@@ -512,14 +489,14 @@ def train_one_event_detection_fold(
             # Save rolling best (gets replaced each new best)
             save_confusion_matrix_image(
                 cm=val_cm,
-                labels=["No Detection", "VT", "LP", "TR", "AV", "IC"],
+                labels=["Background", "VT", "LP", "TR", "AV", "IC"],
                 out_path=cm_dir / "confusion_matrix_val_best_f1.png",
                 title=f"Event Detection Confusion Matrix - Fold {fold_id} - Best F1",
             )
             # Save per-epoch record (historical)
             save_confusion_matrix_image(
                 cm=val_cm,
-                labels=["No Detection", "VT", "LP", "TR", "AV", "IC"],
+                labels=["Background", "VT", "LP", "TR", "AV", "IC"],
                 out_path=cm_dir / f"confusion_matrix_epoch_{epoch:03d}.png",
                 title=f"Event Detection Confusion Matrix - Fold {fold_id} - Epoch {epoch + 1}",
             )
@@ -581,11 +558,9 @@ def train_one_event_detection_fold(
             f"EPOCH {epoch + 1:3d} SUMMARY\n"
             f"==============================================================================\n"
             f"Train Loss:  {avg_train_loss:.4f}  "
-            f"[class={avg_train_loss_class:.4f} bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f} "
-            f"conf={avg_train_loss_conf:.4f}]\n"
+            f"[class={avg_train_loss_class:.4f} bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f}]\n"
             f"Val Loss:    {avg_val_loss:.4f}  "
-            f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f} "
-            f"conf={avg_val_loss_conf:.4f}]\n"
+            f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f}]\n"
             f"Metrics:     mean_f1={mean_f1:.4f} mean_iou={mean_iou:.4f} "
             f"best_epoch={best_epoch + 1} no_improve={epochs_without_improvement}/{config['early_stop_patience']}\n"
             f"mAP:         {detection_metrics.get('mAP', 0.0):.4f} "
@@ -661,7 +636,6 @@ def train_one_event_detection_fold(
         "center": [],
         "start": [],
         "end": [],
-        "confidence": [],
     }
     all_test_targets = []
     num_test_batches = 0
@@ -694,14 +668,11 @@ def train_one_event_detection_fold(
     for key in all_test_predictions:
         all_test_predictions[key] = np.concatenate(all_test_predictions[key], axis=0)
 
-    test_metrics = metrics_fn.evaluate_batch(
-        all_test_predictions, all_test_targets, confidence_threshold=0.5
-    )
+    test_metrics = metrics_fn.evaluate_batch(all_test_predictions, all_test_targets)
     test_f1 = metrics_fn.compute_f1(
         all_test_predictions,
         all_test_targets,
         iou_threshold=0.5,
-        confidence_threshold=0.5,
     )
 
     fold_elapsed = time.time() - fold_start

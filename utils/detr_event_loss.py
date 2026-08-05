@@ -5,7 +5,6 @@ Combines:
 - Focal loss for class imbalance
 - L1 regression loss for temporal center and duration
 - Temporal GIoU loss for interval overlap quality
-- Confidence (objectness) loss
 """
 
 from __future__ import annotations
@@ -31,9 +30,9 @@ class DETREventLoss(torch.nn.Module):
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         duration_smooth_l1_beta: float = 0.1,
-        matcher_cost_class: float = 1.0,
-        matcher_cost_bbox: float = 1.0,
-        matcher_cost_giou: float = 1.0,
+        matcher_cost_class: float | None = None,
+        matcher_cost_bbox: float | None = None,
+        matcher_cost_giou: float | None = None,
     ):
         """
         Args:
@@ -42,7 +41,6 @@ class DETREventLoss(torch.nn.Module):
                 - class_loss: weight for classification loss
                 - bbox_loss: weight for L1 center+duration regression loss
                 - giou_loss: weight for temporal GIoU loss
-                - conf_loss: weight for confidence loss
                 - unmatched_query: weight for unmatched query penalty
             focal_alpha: Focal loss alpha parameter
             focal_gamma: Focal loss gamma parameter (focusing parameter)
@@ -59,12 +57,18 @@ class DETREventLoss(torch.nn.Module):
         if loss_weights is None:
             loss_weights = {
                 "class_loss": 2.0,
-                "bbox_loss": 5.0,
+                "bbox_loss": 3.0,
                 "giou_loss": 2.0,
-                "conf_loss": 2.0,
                 "unmatched_query": 0.1,
             }
         self.loss_weights = loss_weights
+
+        if matcher_cost_class is None:
+            matcher_cost_class = float(self.loss_weights["class_loss"])
+        if matcher_cost_bbox is None:
+            matcher_cost_bbox = float(self.loss_weights["bbox_loss"])
+        if matcher_cost_giou is None:
+            matcher_cost_giou = float(self.loss_weights["giou_loss"])
 
         # Matcher
         self.matcher = HungarianMatcher(
@@ -88,7 +92,6 @@ class DETREventLoss(torch.nn.Module):
                 - start: [B, Nq, 1]
                 - end: [B, Nq, 1]
                 - duration: [B, Nq, 1] (materialized by normalization)
-                - confidence: [B, Nq, 1]
             targets: List of lists of EventInterval per sample [B][N_gt]
 
         Returns:
@@ -97,7 +100,6 @@ class DETREventLoss(torch.nn.Module):
                 - loss_class: classification loss
                 - loss_bbox: L1 regression loss
                 - loss_giou: temporal GIoU loss
-                - loss_conf: confidence loss
                 - metrics: dict with auxiliary metrics
         """
         predictions = normalize_prediction_intervals(predictions)
@@ -111,7 +113,6 @@ class DETREventLoss(torch.nn.Module):
         class_losses = []
         bbox_losses = []
         giou_losses = []
-        conf_losses = []
 
         device = predictions["class_logits"].device
 
@@ -124,7 +125,6 @@ class DETREventLoss(torch.nn.Module):
             center_b = predictions["center"][b]  # [Nq, 1]
             start_b = predictions["start"][b]  # [Nq, 1]
             end_b = predictions["end"][b]  # [Nq, 1]
-            confidence_b = predictions["confidence"][b]  # [Nq, 1]
 
             # Classification loss for matched queries
             if len(match.pred_indices) > 0:
@@ -205,34 +205,20 @@ class DETREventLoss(torch.nn.Module):
                 loss_bbox_b = torch.tensor(0.0, device=device)
                 loss_giou_b = torch.tensor(0.0, device=device)
 
-            # Confidence loss
-            # Matched queries should have high confidence, unmatched should have low confidence
-            target_confidence = torch.zeros(num_queries, device=device)
-            if len(match.pred_indices) > 0:
-                target_confidence[match.pred_indices] = 1.0
-
-            # BCE loss with logits
-            loss_conf_b = F.binary_cross_entropy_with_logits(
-                confidence_b.squeeze(-1), target_confidence, reduction="mean"
-            )
-
             class_losses.append(loss_class_b)
             bbox_losses.append(loss_bbox_b)
             giou_losses.append(loss_giou_b)
-            conf_losses.append(loss_conf_b)
 
         # Average over batch
         loss_class = torch.stack(class_losses).mean()
         loss_bbox = torch.stack(bbox_losses).mean()
         loss_giou = torch.stack(giou_losses).mean()
-        loss_conf = torch.stack(conf_losses).mean()
 
         # Weighted sum
         loss_total = (
             self.loss_weights["class_loss"] * loss_class
             + self.loss_weights["bbox_loss"] * loss_bbox
             + self.loss_weights["giou_loss"] * loss_giou
-            + self.loss_weights["conf_loss"] * loss_conf
         )
 
         return {
@@ -240,7 +226,6 @@ class DETREventLoss(torch.nn.Module):
             "loss_class": loss_class.detach(),
             "loss_bbox": loss_bbox.detach(),
             "loss_giou": loss_giou.detach(),
-            "loss_conf": loss_conf.detach(),
             "metrics": {
                 "num_matched": sum(len(m.pred_indices) for m in matches),
                 "num_targets": sum(len(t) for t in targets),

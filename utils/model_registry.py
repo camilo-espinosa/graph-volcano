@@ -79,7 +79,7 @@ MUSSED_BASE_KWARGS: dict[str, Any] = {
     "hidden_dim": 256,
     "num_decoder_heads": 4,
     "num_decoder_layers": 2,
-    "decoder_dropout": 0.01,
+    "decoder_dropout": 0.1,
     "use_temporal_projection": False,
     "interval_output_format": "center_duration",
 }
@@ -98,6 +98,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "use_temporal_projection": True,
             "memory_levels": [0, 1, 2],
             "eval_memory_level_pool_to": 375,
+            "num_queries": 2,
         },
         "batch_size": 16,
     },

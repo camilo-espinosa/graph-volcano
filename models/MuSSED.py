@@ -2,7 +2,7 @@
 MuSSED: Multi-Station Seismic Event Detection
 
 Standalone DETR-style event detector for multi-station seismic waveforms. The
-model emits a fixed set of events (class + temporal interval + confidence)
+model emits a fixed set of events (class + temporal interval)
 directly, avoiding per-timestep segmentation and catalog post-processing.
 
 This module is fully self-contained and does not depend on the MuSSeg
@@ -530,7 +530,7 @@ class DETRTransformerDecoder(nn.Module):
 
 
 class DetectionHead(nn.Module):
-    """Per-query prediction heads: class, temporal interval, and confidence.
+    """Per-query prediction heads: class and temporal interval.
 
     Intervals are parameterized as a ``center`` and a ``width`` (both squashed
     to ``[0, 1]`` via sigmoid), then converted to ``start = center - width / 2``
@@ -559,7 +559,6 @@ class DetectionHead(nn.Module):
             )
 
         self.class_head = mlp(num_classes)
-        self.confidence_head = mlp(1)
         self.center_head = mlp(1)
         self.width_head = mlp(1)
 
@@ -571,7 +570,6 @@ class DetectionHead(nn.Module):
         Returns:
             Dict with keys:
                 - class_logits: [B, Nq, num_classes] (raw logits)
-                - confidence: [B, Nq, 1] (raw logit; apply sigmoid in the loss)
                 - if interval_output_format == "start_end":
                     - center: [B, Nq, 1] in [0, 1]
                     - start: [B, Nq, 1] in [0, 1]
@@ -588,7 +586,6 @@ class DetectionHead(nn.Module):
         predictions = {
             "class_logits": self.class_head(x),
             "center": center,
-            "confidence": self.confidence_head(x),
         }
         if self.interval_output_format == "start_end":
             predictions["start"] = start
@@ -609,7 +606,7 @@ class MuSSED(nn.Module):
     - Temporal Encoder: multi-station aware, produces [B, C, T']
     - Event Queries: learnable set of Nq queries
     - Transformer Decoder: self-attention on queries + cross-attention to features
-    - Detection Head: per-query predictions (class, interval, confidence)
+    - Detection Head: per-query predictions (class, interval)
     """
 
     def __init__(
@@ -755,7 +752,6 @@ class MuSSED(nn.Module):
         Returns:
             Dict with keys:
                 - class_logits: [B, Nq, num_classes]
-                - confidence: [B, Nq, 1] objectness logit
                 - if interval_output_format == "start_end":
                     - center: [B, Nq, 1] normalized event center time in [0, 1]
                     - start: [B, Nq, 1] normalized event start time in [0, 1]

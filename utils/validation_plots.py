@@ -176,7 +176,7 @@ def plot_event_validation(
     Plot structure (per sample):
         - 8 station waveforms (stacked vertically)
         - Ground-truth events (temporal intervals)
-        - Predicted events (temporal intervals with confidence)
+        - Predicted events (temporal intervals with class probability)
         - Station attention heatmap (encoded as panel opacity)
         - Temporal attention heatmap (encoded as color saturation)
     """
@@ -317,7 +317,6 @@ def plot_event_validation(
                         "centers": "center",
                         "starts": "start",
                         "ends": "end",
-                        "confidence": "confidence",
                     }
                     for plot_key, model_key in key_mapping.items():
                         if model_key in normalized_outputs:
@@ -392,7 +391,7 @@ def plot_event_sample(
     Args:
         x: Input waveforms [S, T] where S=8 stations
         y_true: Ground truth segmentation [C, T] one-hot
-        outputs: Dict with predicted events (class_logits, centers, starts, ends, confidence)
+        outputs: Dict with predicted events (class_logits, centers, starts, ends)
         output_dir: Output directory
         epoch: Epoch number
         sample_id: Sample index
@@ -468,7 +467,6 @@ def plot_event_sample(
             "centers",
             "starts",
             "ends",
-            "confidence",
             "class_logits",
         }
         missing_keys = required_pred_keys - set(outputs.keys())
@@ -480,28 +478,24 @@ def plot_event_sample(
         centers = outputs["centers"]  # [Nq]
         starts = outputs["starts"]  # [Nq]
         ends = outputs["ends"]  # [Nq]
-        confidence = outputs["confidence"]  # [Nq]
         class_logits = outputs["class_logits"]  # [Nq, C]
+        class_probs = torch.softmax(torch.from_numpy(class_logits), dim=-1).numpy()
 
         for q_idx in range(len(centers)):
-            conf = float(confidence[q_idx])
-            if conf > 0.0:
-                class_id = (
-                    int(np.argmax(class_logits[q_idx]))
-                    if class_logits is not None
-                    else 1
-                )
-                if class_id == 0:
-                    continue
-                events_pred.append(
-                    {
-                        "class_id": class_id,
-                        "start": float(starts[q_idx]),
-                        "end": float(ends[q_idx]),
-                        "center": float(centers[q_idx]),
-                        "confidence": conf,
-                    }
-                )
+            class_id = int(np.argmax(class_probs[q_idx]))
+            if class_id == 0:
+                continue
+
+            conf = float(class_probs[q_idx, class_id])
+            events_pred.append(
+                {
+                    "class_id": class_id,
+                    "start": float(starts[q_idx]),
+                    "end": float(ends[q_idx]),
+                    "center": float(centers[q_idx]),
+                    "confidence": conf,
+                }
+            )
 
     # Create figure
     n_stations = min(x.shape[0], 8)  # Max 8 stations

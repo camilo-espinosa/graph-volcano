@@ -110,7 +110,6 @@ class DETRTrainer:
         total_loss = 0.0
         total_loss_class = 0.0
         total_loss_bbox = 0.0
-        total_loss_conf = 0.0
 
         num_batches = len(train_loader)
         print_interval = max(1, num_batches // lines_per_epoch)
@@ -143,7 +142,6 @@ class DETRTrainer:
             total_loss += loss.item()
             total_loss_class += loss_dict["loss_class"].item()
             total_loss_bbox += loss_dict["loss_bbox"].item()
-            total_loss_conf += loss_dict["loss_conf"].item()
 
             # Print progress
             if (batch_idx + 1) % print_interval == 0 or batch_idx == 0:
@@ -157,14 +155,12 @@ class DETRTrainer:
             "loss_total": total_loss / num_batches,
             "loss_class": total_loss_class / num_batches,
             "loss_bbox": total_loss_bbox / num_batches,
-            "loss_conf": total_loss_conf / num_batches,
         }
 
     def evaluate(
         self,
         val_loader: DataLoader,
         epoch: int = 0,
-        confidence_threshold: float = 0.5,
         lines_per_epoch: int = 5,
     ) -> Dict[str, float]:
         """
@@ -173,7 +169,6 @@ class DETRTrainer:
         Args:
             val_loader: Validation data loader
             epoch: Epoch number (for logging)
-            confidence_threshold: Confidence threshold for predictions
             lines_per_epoch: Number of progress lines to print per epoch
 
         Returns:
@@ -188,7 +183,6 @@ class DETRTrainer:
             "start": [],
             "end": [],
             "duration": [],
-            "confidence": [],
         }
         all_targets = []
 
@@ -231,7 +225,6 @@ class DETRTrainer:
         metrics_dict = self.metrics_fn.evaluate_batch(
             predictions_for_metrics,
             all_targets,
-            confidence_threshold=confidence_threshold,
         )
 
         # Compute F1 at IoU=0.5 and mean IoU
@@ -239,7 +232,6 @@ class DETRTrainer:
             predictions_for_metrics,
             all_targets,
             iou_threshold=0.5,
-            confidence_threshold=confidence_threshold,
         )
         metrics_dict["F1@0.5"] = f1_score
 
@@ -255,7 +247,6 @@ class DETRTrainer:
         num_epochs: int = 10,
         output_dir: Path | str = "results/mussed",
         checkpoint_interval: int = 1,
-        confidence_threshold: float = 0.5,
         lines_per_epoch: int = 5,
     ) -> Dict[str, list]:
         """
@@ -267,7 +258,6 @@ class DETRTrainer:
             num_epochs: Number of training epochs
             output_dir: Directory to save checkpoints and logs
             checkpoint_interval: Save checkpoint every N epochs
-            confidence_threshold: Confidence threshold for evaluation
             lines_per_epoch: Number of progress lines to print per epoch
 
         Returns:
@@ -280,7 +270,6 @@ class DETRTrainer:
             "train_loss": [],
             "train_loss_class": [],
             "train_loss_bbox": [],
-            "train_loss_conf": [],
             "val_metrics": [],
         }
 
@@ -298,14 +287,12 @@ class DETRTrainer:
             history["train_loss"].append(train_metrics["loss_total"])
             history["train_loss_class"].append(train_metrics["loss_class"])
             history["train_loss_bbox"].append(train_metrics["loss_bbox"])
-            history["train_loss_conf"].append(train_metrics["loss_conf"])
 
             print(
                 f"[Epoch {epoch + 1}/{num_epochs}] "
                 f"Train Loss: {train_metrics['loss_total']:.4f} | "
                 f"Class: {train_metrics['loss_class']:.4f} | "
-                f"BBox: {train_metrics['loss_bbox']:.4f} | "
-                f"Conf: {train_metrics['loss_conf']:.4f}"
+                f"BBox: {train_metrics['loss_bbox']:.4f}"
             )
 
             # Validation
@@ -313,7 +300,6 @@ class DETRTrainer:
                 val_metrics = self.evaluate(
                     val_loader,
                     epoch=epoch + 1,
-                    confidence_threshold=confidence_threshold,
                     lines_per_epoch=lines_per_epoch,
                 )
                 history["val_metrics"].append(val_metrics)

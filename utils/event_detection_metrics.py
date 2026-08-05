@@ -37,7 +37,6 @@ class EventDetectionMetrics:
         self,
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
-        confidence_threshold: float = 0.5,
     ) -> Dict[str, float]:
         """
         Evaluate batch of predictions.
@@ -48,9 +47,7 @@ class EventDetectionMetrics:
                 - center: [B, Nq, 1]
                 - start: [B, Nq, 1]
                 - end: [B, Nq, 1]
-                - confidence: [B, Nq, 1]
             targets: List of lists of EventInterval per sample
-            confidence_threshold: Confidence threshold for keeping predictions
 
         Returns:
             Dict with metrics:
@@ -83,11 +80,6 @@ class EventDetectionMetrics:
             if isinstance(predictions["end"], np.ndarray)
             else predictions["end"].cpu().numpy()
         )
-        confidence = (
-            predictions["confidence"]
-            if isinstance(predictions["confidence"], np.ndarray)
-            else predictions["confidence"].cpu().numpy()
-        )
 
         metrics = {}
 
@@ -98,10 +90,8 @@ class EventDetectionMetrics:
                 center,
                 start,
                 end,
-                confidence,
                 targets,
                 iou_threshold,
-                confidence_threshold,
             )
             metrics[f"mAP@{iou_threshold:.1f}"] = float(ap)
 
@@ -122,10 +112,8 @@ class EventDetectionMetrics:
         center: np.ndarray,  # [B, Nq, 1]
         start: np.ndarray,  # [B, Nq, 1]
         end: np.ndarray,  # [B, Nq, 1]
-        confidence: np.ndarray,  # [B, Nq, 1]
         targets: list[list[EventInterval]],
         iou_threshold: float,
-        confidence_threshold: float = 0.5,
     ) -> Tuple[float, Dict[int, float]]:
         """
         Compute AP at a specific IoU threshold.
@@ -157,24 +145,24 @@ class EventDetectionMetrics:
 
             # Extract predictions
             class_probs = softmax(class_logits[b], axis=-1)  # [Nq, num_classes]
-            conf = 1.0 / (1.0 + np.exp(-confidence[b, :, 0]))  # Sigmoid
 
             for q in range(class_logits.shape[1]):
-                # Predict class (argmax, excluding background=0)
-                pred_class_id = np.argmax(class_probs[q, 1:]) + 1
-                pred_conf = class_probs[q, pred_class_id] * conf[q]
+                # DETR-style decode: argmax over all classes, discard background.
+                pred_class_id = int(np.argmax(class_probs[q]))
+                if pred_class_id == 0:
+                    continue
 
-                if pred_conf >= confidence_threshold:
-                    all_predictions.append(
-                        (
-                            pred_class_id,
-                            pred_conf,
-                            np.clip(start[b, q, 0], 0, 1),
-                            np.clip(end[b, q, 0], 0, 1),
-                            b,
-                            q,
-                        )
+                pred_conf = float(class_probs[q, pred_class_id])
+                all_predictions.append(
+                    (
+                        pred_class_id,
+                        pred_conf,
+                        np.clip(start[b, q, 0], 0, 1),
+                        np.clip(end[b, q, 0], 0, 1),
+                        b,
+                        q,
                     )
+                )
 
         # Compute AP per class
         per_class_ap = {}
@@ -294,14 +282,13 @@ class EventDetectionMetrics:
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
         iou_threshold: float = 0.5,
-        confidence_threshold: float = 0.5,
     ) -> Dict[str, object]:
         """
         Compute confusion matrix and per-class metrics from one shared matching pass.
 
         Confusion matrix convention:
-        - Rows: true class (0 = No Event)
-        - Cols: predicted class (0 = No Detection)
+        - Rows: true class (0 = Background)
+        - Cols: predicted class (0 = Background)
         - Unmatched GT event => (true=class_id, pred=0)
         - Unmatched predicted event => (true=0, pred=class_id)
         """
@@ -309,7 +296,6 @@ class EventDetectionMetrics:
         class_logits = np.asarray(predictions["class_logits"])
         pred_starts = np.asarray(predictions["start"])
         pred_ends = np.asarray(predictions["end"])
-        pred_conf_logits = np.asarray(predictions["confidence"])
 
         if class_logits.ndim != 3:
             raise ValueError(
@@ -323,11 +309,6 @@ class EventDetectionMetrics:
             raise ValueError(
                 f"End shape mismatch: ends {pred_ends.shape} vs class_logits {class_logits.shape}."
             )
-        if pred_conf_logits.shape[:2] != class_logits.shape[:2]:
-            raise ValueError(
-                f"Confidence shape mismatch: confidence {pred_conf_logits.shape} vs class_logits {class_logits.shape}."
-            )
-
         batch_size, n_queries, _ = class_logits.shape
         if len(targets) != batch_size:
             raise ValueError(
@@ -341,14 +322,14 @@ class EventDetectionMetrics:
 
         for b in range(batch_size):
             probs = softmax(class_logits[b], axis=-1)  # [Nq, C]
-            conf_sigmoid = 1.0 / (1.0 + np.exp(-pred_conf_logits[b, :, 0]))  # [Nq]
 
             sample_preds = []
             for q in range(n_queries):
-                pred_class = int(np.argmax(probs[q, 1:]) + 1)
-                pred_score = float(probs[q, pred_class] * conf_sigmoid[q])
-                if pred_score < confidence_threshold:
+                pred_class = int(np.argmax(probs[q]))
+                if pred_class == 0:
                     continue
+
+                pred_score = float(probs[q, pred_class])
 
                 sample_preds.append(
                     {
@@ -397,7 +378,7 @@ class EventDetectionMetrics:
                     # Missed detection for this true event.
                     cm[true_class, 0] += 1
 
-            # Unmatched predictions become false positives against true "No Event".
+            # Unmatched predictions become false positives against true background.
             for p_idx, pred in enumerate(sample_preds):
                 if matched_pred[p_idx]:
                     continue
@@ -447,7 +428,6 @@ class EventDetectionMetrics:
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
         iou_threshold: float = 0.5,
-        confidence_threshold: float = 0.5,
     ) -> float:
         """
         Compute F1 score at a specific IoU threshold.
@@ -472,11 +452,6 @@ class EventDetectionMetrics:
             else:
                 class_probs = softmax(class_logits[b].cpu().numpy(), axis=-1)
 
-            conf = predictions["confidence"]
-            if not isinstance(conf, np.ndarray):
-                conf = conf.cpu().numpy()
-            conf = 1.0 / (1.0 + np.exp(-conf[b, :, 0]))
-
             start = predictions["start"]
             end = predictions["end"]
             if not isinstance(start, np.ndarray):
@@ -485,19 +460,20 @@ class EventDetectionMetrics:
                 end = end.cpu().numpy()
 
             for q in range(class_logits.shape[1]):
-                pred_class_id = np.argmax(class_probs[q, 1:]) + 1
-                pred_conf = class_probs[q, pred_class_id] * conf[q]
+                pred_class_id = int(np.argmax(class_probs[q]))
+                if pred_class_id == 0:
+                    continue
 
-                if pred_conf >= confidence_threshold:
-                    event = EventInterval(
-                        class_id=pred_class_id,
-                        start_norm=np.clip(start[b, q, 0], 0, 1),
-                        end_norm=np.clip(end[b, q, 0], 0, 1),
-                        center_norm=((start[b, q, 0] + end[b, q, 0]) / 2.0),
-                        start_frame=int(start[b, q, 0]),
-                        end_frame=int(end[b, q, 0]),
-                    )
-                    all_predictions.append((b, event, float(pred_conf)))
+                pred_conf = float(class_probs[q, pred_class_id])
+                event = EventInterval(
+                    class_id=pred_class_id,
+                    start_norm=np.clip(start[b, q, 0], 0, 1),
+                    end_norm=np.clip(end[b, q, 0], 0, 1),
+                    center_norm=((start[b, q, 0] + end[b, q, 0]) / 2.0),
+                    start_frame=int(start[b, q, 0]),
+                    end_frame=int(end[b, q, 0]),
+                )
+                all_predictions.append((b, event, pred_conf))
 
         if len(all_predictions) == 0 and len(all_targets) == 0:
             return 1.0  # Perfect score if both empty
@@ -550,7 +526,6 @@ class EventDetectionMetrics:
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
         iou_threshold: float = 0.5,
-        confidence_threshold: float = 0.5,
     ) -> Dict[int, float]:
         """
         Compute per-class F1 scores at a specific IoU threshold.
@@ -562,7 +537,6 @@ class EventDetectionMetrics:
             predictions=predictions,
             targets=targets,
             iou_threshold=iou_threshold,
-            confidence_threshold=confidence_threshold,
         )
 
         return dict(summary["per_class_f1"])
@@ -572,7 +546,6 @@ class EventDetectionMetrics:
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
         iou_threshold: float = 0.5,
-        confidence_threshold: float = 0.5,
     ) -> Dict[int, float]:
         """
         Compute per-class IoU scores (average IoU of matched predictions per class).
@@ -584,6 +557,5 @@ class EventDetectionMetrics:
             predictions=predictions,
             targets=targets,
             iou_threshold=iou_threshold,
-            confidence_threshold=confidence_threshold,
         )
         return dict(summary["per_class_iou"])

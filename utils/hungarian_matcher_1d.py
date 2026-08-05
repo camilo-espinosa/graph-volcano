@@ -33,7 +33,7 @@ class HungarianMatcher(nn.Module):
     Hungarian Matcher for 1D temporal event detection.
 
     Matches predicted event queries to ground-truth events by minimizing
-    a cost matrix combining classification, temporal, and confidence costs.
+    a cost matrix combining classification and temporal localization costs.
     """
 
     def __init__(
@@ -71,7 +71,6 @@ class HungarianMatcher(nn.Module):
                 - center: [B, Nq, 1]
                 - start: [B, Nq, 1]
                 - end: [B, Nq, 1]
-                - confidence: [B, Nq, 1]
             targets: List of lists of EventInterval per sample [B][N_gt]
             num_classes: Number of classes (for focal loss weighting)
 
@@ -85,7 +84,6 @@ class HungarianMatcher(nn.Module):
         center_pred = predictions["center"]  # [B, Nq, 1]
         start_pred = predictions["start"]  # [B, Nq, 1]
         end_pred = predictions["end"]  # [B, Nq, 1]
-        confidence = predictions["confidence"]  # [B, Nq, 1]
 
         # Softmax over classes
         class_probs = torch.softmax(class_logits, dim=-1)  # [B, Nq, num_classes]
@@ -113,7 +111,6 @@ class HungarianMatcher(nn.Module):
                 center_pred[b],
                 start_pred[b],
                 end_pred[b],
-                confidence[b],
                 target_list,
                 num_classes=num_classes,
             )
@@ -130,7 +127,6 @@ class HungarianMatcher(nn.Module):
         center_pred: torch.Tensor,  # [Nq, 1]
         start_pred: torch.Tensor,  # [Nq, 1]
         end_pred: torch.Tensor,  # [Nq, 1]
-        confidence: torch.Tensor,  # [Nq, 1]
         target_list: list[EventInterval],
         num_classes: int = 6,
     ) -> np.ndarray:
