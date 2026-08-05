@@ -452,6 +452,18 @@ def train_one_event_detection_fold(
         mean_f1 = float(np.mean(class_f1_scores)) if class_f1_scores else 0.0
         # mean_iou = average of per-class IoU scores (actual IoU metric)
         mean_iou = float(np.mean(class_iou_scores)) if class_iou_scores else 0.0
+        class_precision_scores = [
+            float(per_class_stats[class_id]["precision"]) for class_id in range(1, 6)
+        ]
+        class_recall_scores = [
+            float(per_class_stats[class_id]["recall"]) for class_id in range(1, 6)
+        ]
+        mean_precision = (
+            float(np.mean(class_precision_scores)) if class_precision_scores else 0.0
+        )
+        mean_recall = (
+            float(np.mean(class_recall_scores)) if class_recall_scores else 0.0
+        )
 
         is_best_mean_f1_epoch = mean_f1 > best_mean_f1
         if is_best_mean_f1_epoch:
@@ -561,7 +573,8 @@ def train_one_event_detection_fold(
             f"[class={avg_train_loss_class:.4f} bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f}]\n"
             f"Val Loss:    {avg_val_loss:.4f}  "
             f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f}]\n"
-            f"Metrics:     mean_f1={mean_f1:.4f} mean_iou={mean_iou:.4f} "
+            f"Metrics:     mean_f1={mean_f1:.4f} mean_precision={mean_precision:.4f} "
+            f"mean_recall={mean_recall:.4f} mean_iou={mean_iou:.4f} "
             f"best_epoch={best_epoch + 1} no_improve={epochs_without_improvement}/{config['early_stop_patience']}\n"
             f"mAP:         {detection_metrics.get('mAP', 0.0):.4f} "
             f"(@ 0.1: {detection_metrics.get('mAP@0.1', 0.0):.4f}, "
