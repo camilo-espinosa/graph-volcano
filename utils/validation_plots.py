@@ -510,7 +510,7 @@ def plot_event_sample(
             if class_id == 0:
                 continue
 
-            conf = float(class_probs[q_idx, class_id])
+            conf = float(1.0 - class_probs[q_idx, 0])
             events_pred.append(
                 {
                     "class_id": class_id,

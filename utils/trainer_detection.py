@@ -116,7 +116,7 @@ def compute_event_confusion_matrix(
             if pred_class == 0:
                 continue
 
-            pred_score = float(probs[q, pred_class])
+            pred_score = float(1.0 - probs[q, 0])
 
             sample_preds.append(
                 {
@@ -310,6 +310,7 @@ def train_one_event_detection_fold(
         train_loss_class = 0.0
         train_loss_bbox = 0.0
         train_loss_giou = 0.0
+        train_loss_unmatched_query = 0.0
         num_train_batches = 0
 
         for batch_idx, batch in enumerate(train_loader):
@@ -339,6 +340,7 @@ def train_one_event_detection_fold(
             train_loss_class += loss_dict["loss_class"].item()
             train_loss_bbox += loss_dict["loss_bbox"].item()
             train_loss_giou += loss_dict["loss_giou"].item()
+            train_loss_unmatched_query += loss_dict["loss_unmatched_query"].item()
             num_train_batches += 1
 
             # Print progress every few batches
@@ -349,7 +351,8 @@ def train_one_event_detection_fold(
                     f"loss={current_loss:.4f} "
                     f"[class={train_loss_class / (batch_idx + 1):.4f} "
                     f"bbox={train_loss_bbox / (batch_idx + 1):.4f} "
-                    f"giou={train_loss_giou / (batch_idx + 1):.4f}]"
+                    f"giou={train_loss_giou / (batch_idx + 1):.4f} "
+                    f"unmatched={train_loss_unmatched_query / (batch_idx + 1):.4f}]"
                 )
 
         scheduler.step()
@@ -360,6 +363,7 @@ def train_one_event_detection_fold(
         val_loss_class = 0.0
         val_loss_bbox = 0.0
         val_loss_giou = 0.0
+        val_loss_unmatched_query = 0.0
         all_predictions = {
             "class_logits": [],
             "center": [],
@@ -387,6 +391,7 @@ def train_one_event_detection_fold(
                 val_loss_class += loss_dict["loss_class"].item()
                 val_loss_bbox += loss_dict["loss_bbox"].item()
                 val_loss_giou += loss_dict["loss_giou"].item()
+                val_loss_unmatched_query += loss_dict["loss_unmatched_query"].item()
                 num_val_batches += 1
 
                 # Collect predictions for metrics computation
@@ -409,6 +414,11 @@ def train_one_event_detection_fold(
         avg_train_loss_giou = (
             train_loss_giou / num_train_batches if num_train_batches > 0 else 0.0
         )
+        avg_train_loss_unmatched_query = (
+            train_loss_unmatched_query / num_train_batches
+            if num_train_batches > 0
+            else 0.0
+        )
 
         avg_val_loss = (
             val_loss / num_val_batches if num_val_batches > 0 else float("inf")
@@ -421,6 +431,9 @@ def train_one_event_detection_fold(
         )
         avg_val_loss_giou = (
             val_loss_giou / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_loss_unmatched_query = (
+            val_loss_unmatched_query / num_val_batches if num_val_batches > 0 else 0.0
         )
 
         # Concatenate predictions for metrics computation
@@ -570,9 +583,9 @@ def train_one_event_detection_fold(
             f"EPOCH {epoch + 1:3d} SUMMARY\n"
             f"==============================================================================\n"
             f"Train Loss:  {avg_train_loss:.4f}  "
-            f"[class={avg_train_loss_class:.4f} bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f}]\n"
+            f"[class={avg_train_loss_class:.4f} bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f} unmatched={avg_train_loss_unmatched_query:.4f}]\n"
             f"Val Loss:    {avg_val_loss:.4f}  "
-            f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f}]\n"
+            f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f} unmatched={avg_val_loss_unmatched_query:.4f}]\n"
             f"Metrics:     mean_f1={mean_f1:.4f} mean_precision={mean_precision:.4f} "
             f"mean_recall={mean_recall:.4f} mean_iou={mean_iou:.4f} "
             f"best_epoch={best_epoch + 1} no_improve={epochs_without_improvement}/{config['early_stop_patience']}\n"

@@ -59,7 +59,7 @@ class DETREventLoss(torch.nn.Module):
                 "class_loss": 2.0,
                 "bbox_loss": 3.0,
                 "giou_loss": 2.0,
-                "unmatched_query": 0.1,
+                "unmatched_query":1.0,
             }
         self.loss_weights = loss_weights
 
@@ -113,6 +113,7 @@ class DETREventLoss(torch.nn.Module):
         class_losses = []
         bbox_losses = []
         giou_losses = []
+        unmatched_query_losses = []
 
         device = predictions["class_logits"].device
 
@@ -155,7 +156,7 @@ class DETREventLoss(torch.nn.Module):
                 loss_class_unmatched = self._focal_loss(
                     unmatched_class_logits,
                     unmatched_target_classes,
-                    weight_unmatched=self.loss_weights.get("unmatched_query", 0.1),
+                    weight_unmatched=self.loss_weights.get("unmatched_query", 1.0),
                 )
             else:
                 loss_class_unmatched = torch.tensor(0.0, device=device)
@@ -208,11 +209,13 @@ class DETREventLoss(torch.nn.Module):
             class_losses.append(loss_class_b)
             bbox_losses.append(loss_bbox_b)
             giou_losses.append(loss_giou_b)
+            unmatched_query_losses.append(loss_class_unmatched)
 
         # Average over batch
         loss_class = torch.stack(class_losses).mean()
         loss_bbox = torch.stack(bbox_losses).mean()
         loss_giou = torch.stack(giou_losses).mean()
+        loss_unmatched_query = torch.stack(unmatched_query_losses).mean()
 
         # Weighted sum
         loss_total = (
@@ -226,6 +229,7 @@ class DETREventLoss(torch.nn.Module):
             "loss_class": loss_class.detach(),
             "loss_bbox": loss_bbox.detach(),
             "loss_giou": loss_giou.detach(),
+            "loss_unmatched_query": loss_unmatched_query.detach(),
             "metrics": {
                 "num_matched": sum(len(m.pred_indices) for m in matches),
                 "num_targets": sum(len(t) for t in targets),

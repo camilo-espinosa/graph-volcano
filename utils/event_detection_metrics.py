@@ -152,7 +152,7 @@ class EventDetectionMetrics:
                 if pred_class_id == 0:
                     continue
 
-                pred_conf = float(class_probs[q, pred_class_id])
+                pred_conf = float(1.0 - class_probs[q, 0])
                 all_predictions.append(
                     (
                         pred_class_id,
@@ -329,7 +329,7 @@ class EventDetectionMetrics:
                 if pred_class == 0:
                     continue
 
-                pred_score = float(probs[q, pred_class])
+                pred_score = float(1.0 - probs[q, 0])
 
                 sample_preds.append(
                     {
@@ -464,7 +464,7 @@ class EventDetectionMetrics:
                 if pred_class_id == 0:
                     continue
 
-                pred_conf = float(class_probs[q, pred_class_id])
+                pred_conf = float(1.0 - class_probs[q, 0])
                 event = EventInterval(
                     class_id=pred_class_id,
                     start_norm=np.clip(start[b, q, 0], 0, 1),
