@@ -143,7 +143,7 @@ def train_one_segmentation_fold(
 
     best_train_loss = float("inf")
     best_val_loss = float("inf")
-    best_mean_f1 = float("-inf")
+    best_val_mean_f1 = float("-inf")
     best_epoch = -1
     epochs_without_improvement = 0
 
@@ -256,9 +256,9 @@ def train_one_segmentation_fold(
             val_loss_dice = None
             val_loss_ce = None
 
-        is_best_mean_f1_epoch = float(val_mean_f1) > float(best_mean_f1)
+        is_best_val_mean_f1_epoch = float(val_mean_f1) > float(best_val_mean_f1)
 
-        if is_best_mean_f1_epoch:
+        if is_best_val_mean_f1_epoch:
             if trainer_kind == "1d":
                 saved_plot_count = save_event_plot_payloads(
                     event_plot_payloads,
@@ -284,7 +284,7 @@ def train_one_segmentation_fold(
                 out_path=cm_dir / "confusion_matrix_val_best_f1.png",
                 title=f"Validation Confusion Matrix - {display_name} - best_f1",
             )
-            best_mean_f1 = float(val_mean_f1)
+            best_val_mean_f1 = float(val_mean_f1)
             best_epoch = int(epoch)
             epochs_without_improvement = 0
 
@@ -478,7 +478,7 @@ def train_one_segmentation_fold(
         "best_epoch": int(best_epoch),
         "best_train_loss": float(best_train_loss),
         "best_val_loss": float(best_val_loss),
-        "best_val_mean_f1": float(best_mean_f1),
+        "best_val_mean_f1": float(best_val_mean_f1),
         "test_loss": float(test_loss),
         "test_mean_f1": float(test_mean_f1),
         "test_mean_iou": float(test_mean_iou),

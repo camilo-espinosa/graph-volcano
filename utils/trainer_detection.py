@@ -287,7 +287,7 @@ def train_one_event_detection_fold(
 
     best_train_loss = float("inf")
     best_val_loss = float("inf")
-    best_mean_f1 = float("-inf")  # F1@0.5 for events
+    best_val_mean_f1 = float("-inf")  # F1@0.5 for events
     best_epoch = -1
     epochs_without_improvement = 0
 
@@ -478,9 +478,9 @@ def train_one_event_detection_fold(
             float(np.mean(class_recall_scores)) if class_recall_scores else 0.0
         )
 
-        is_best_mean_f1_epoch = mean_f1 > best_mean_f1
-        if is_best_mean_f1_epoch:
-            best_mean_f1 = mean_f1
+        is_best_val_mean_f1_epoch = mean_f1 > best_val_mean_f1
+        if is_best_val_mean_f1_epoch:
+            best_val_mean_f1 = mean_f1
             best_epoch = int(epoch)
             epochs_without_improvement = 0
 
@@ -695,24 +695,48 @@ def train_one_event_detection_fold(
         all_test_predictions[key] = np.concatenate(all_test_predictions[key], axis=0)
 
     test_metrics = metrics_fn.evaluate_batch(all_test_predictions, all_test_targets)
+    test_detection_summary = metrics_fn.compute_detection_summary(
+        all_test_predictions,
+        all_test_targets,
+        iou_threshold=0.5,
+    )
+    test_f1_per_class = [
+        float(test_detection_summary["per_class_f1"].get(class_id, 0.0))
+        for class_id in range(1, 6)
+    ]
+    test_iou_per_class = [
+        float(test_detection_summary["per_class_iou"].get(class_id, 0.0))
+        for class_id in range(1, 6)
+    ]
+    test_mean_iou = (
+        float(np.mean(test_iou_per_class)) if test_iou_per_class else 0.0
+    )
     test_f1 = metrics_fn.compute_f1(
         all_test_predictions,
         all_test_targets,
         iou_threshold=0.5,
     )
 
-    fold_elapsed = time.time() - fold_start
+    fold_elapsed_sec = float(time.time() - fold_start)
 
     # Prepare fold summary
     fold_summary = {
-        "fold": fold_id,
-        "best_epoch": best_epoch + 1,
+        "trainer_kind": "detr",
+        "fold": int(fold_id),
+        "n_train": int(len(train_ds)),
+        "n_val": int(len(val_ds)),
+        "n_test": int(len(test_ds)),
+        "best_epoch": int(best_epoch + 1),
+        "best_train_loss": float(best_train_loss),
         "best_val_loss": float(best_val_loss),
-        "best_mean_f1": float(best_mean_f1),
+        "best_val_mean_f1": float(best_val_mean_f1),
         "test_loss": float(avg_test_loss),
         "test_mean_f1": float(test_f1),
+        "test_mean_iou": float(test_mean_iou),
+        "test_f1_per_class": [float(x) for x in test_f1_per_class],
+        "test_iou_per_class": [float(x) for x in test_iou_per_class],
         "test_mAP": float(test_metrics.get("mAP", 0.0)),
-        "elapsed_seconds": float(fold_elapsed),
+        "fold_elapsed_seconds": fold_elapsed_sec,
     }
     fold_summary.update(test_metrics)
     fold_summary["test_F1@0.5"] = float(test_f1)
@@ -726,7 +750,7 @@ def train_one_event_detection_fold(
     print(
         f"Fold {fold_id} complete | Best Epoch: {best_epoch + 1} | "
         f"Test F1: {test_f1:.4f} | Test mAP: {test_metrics.get('mAP', 0.0):.4f} | "
-        f"Elapsed: {fold_elapsed / 60:.1f} min"
+        f"Elapsed: {fold_elapsed_sec / 60:.1f} min"
     )
 
     cleanup_gpu_cache()
@@ -744,7 +768,7 @@ def train_one_event_detection_fold(
         "best_epoch": int(best_epoch),
         "best_train_loss": float(best_train_loss),
         "best_val_loss": float(best_val_loss),
-        "best_val_mean_f1": float(best_mean_f1),
+        "best_val_mean_f1": float(best_val_mean_f1),
         "test_loss": 0.0,  # TODO
         "test_mean_f1": 0.0,  # TODO
         "test_mAP": 0.0,  # TODO
