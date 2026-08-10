@@ -196,7 +196,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "num_decoder_layers": 3,            
             "hidden_dim": 384,
         },
-        "batch_size": 24,
+        "batch_size": 20,
     }, 
     "mussed_q1_dec1_no_tempproj_memlvl2": {
         "family": "detr",
@@ -209,7 +209,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "num_queries": 1,
             "num_decoder_layers": 1,            
         },
-        "batch_size": 24,
+        "batch_size": 20,
     }, 
     "mussed_multilevel_memory_all_q1": {
         "family": "detr",
