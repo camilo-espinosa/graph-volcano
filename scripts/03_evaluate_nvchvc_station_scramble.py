@@ -43,6 +43,7 @@ from utils.fold_io_utils import (
 from utils.model_registry import MODEL_SPECS
 from utils.script_common import parse_csv_selection, resolve_project_path
 from utils.active_eval_utils import (
+    evaluate_detr_checkpoint as evaluate_detr_checkpoint_on_test_fold,
     evaluate_multistation_checkpoint as evaluate_multistation_checkpoint_on_test_fold,
     evaluate_unet_checkpoint as evaluate_unet_checkpoint_on_test_fold,
     load_checkpoint_into_model,
@@ -393,6 +394,7 @@ def main() -> None:
         "test_mean_f1",
         "test_mean_iou",
         "test_mean_iou_all",
+        "test_mAP",
         "n_active_classes",
         "active_classes",
     ]
@@ -507,6 +509,7 @@ def main() -> None:
                     scramble_stations=bool(args.scramble_stations),
                     station_scramble_seed=int(args.station_scramble_seed),
                 )
+                test_map = float("nan")
             elif trainer_kind == "2d":
                 model = model_spec["model_cls"](
                     in_channels=1,
@@ -550,6 +553,36 @@ def main() -> None:
                 )
                 iou_all_classes = [float("nan")] * len(ALL_CLASS_NAMES)
                 mean_iou_all = float("nan")
+                test_map = float("nan")
+            elif trainer_kind == "detr":
+                model = model_spec["model_cls"](**model_kwargs).to(device)
+                load_checkpoint_into_model(
+                    model=model,
+                    checkpoint_path=ckpt_path,
+                    device=device,
+                    trainer_kind=trainer_kind,
+                )
+                (
+                    f1_per_class,
+                    mean_f1,
+                    iou_per_class,
+                    mean_iou,
+                    iou_all_classes,
+                    mean_iou_all,
+                    eval_loss,
+                    cm,
+                    n_samples,
+                    active_event_ids,
+                    test_map,
+                ) = evaluate_detr_checkpoint_on_test_fold(
+                    model=model,
+                    test_npz_path=test_npz_path,
+                    batch_size=batch_size,
+                    device=device,
+                    scramble_stations=bool(args.scramble_stations),
+                    station_scramble_seed=int(args.station_scramble_seed),
+                    model_spec=model_spec,
+                )
             else:
                 raise ValueError(
                     f"Unsupported trainer kind '{trainer_kind}' for key '{model_key}'"
@@ -567,6 +600,7 @@ def main() -> None:
                 "test_mean_f1": float(mean_f1),
                 "test_mean_iou": float(mean_iou),
                 "test_mean_iou_all": float(mean_iou_all),
+                "test_mAP": float(test_map),
                 "n_active_classes": int(len(active_event_ids)),
                 "active_classes": ",".join(
                     [CLASS_NAMES[x - 1] for x in active_event_ids]
@@ -596,9 +630,12 @@ def main() -> None:
                     out_dir / "confusion_matrices" / model_key / f"fold_{fold_id:02d}"
                 )
                 cm_dir.mkdir(parents=True, exist_ok=True)
+                cm_labels = (
+                    ALL_CLASS_NAMES if cm.shape[0] == len(ALL_CLASS_NAMES) else CLASS_NAMES
+                )
                 save_confusion_matrix_image(
                     cm=cm,
-                    labels=CLASS_NAMES,
+                    labels=cm_labels,
                     out_path=cm_dir / "test_confusion_matrix.png",
                     title=f"Scrambled station order | {model_key} | fold {fold_id:02d}",
                 )

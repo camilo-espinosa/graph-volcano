@@ -8,6 +8,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from utils.detection_prediction_utils import normalize_prediction_intervals
+from utils.detr_event_loss import DETREventLoss
+from utils.event_detection_metrics import EventDetectionMetrics
+from utils.event_targets import batch_segmentation_to_events
+from utils.trainer_detection import _resolve_detr_loss_weights
 from utils.train_utils import (
     MultiStation1DDataset,
     UNetPatchDataset,
@@ -230,6 +235,118 @@ def evaluate_unet_checkpoint(
         cm,
         n_samples,
         active_event_ids,
+    )
+
+
+def evaluate_detr_checkpoint(
+    model: torch.nn.Module,
+    test_npz_path: Path,
+    batch_size: int,
+    device: torch.device,
+    scramble_stations: bool,
+    station_scramble_seed: int,
+    model_spec: dict,
+) -> tuple[
+    list[float],
+    float,
+    list[float],
+    float,
+    list[float],
+    float,
+    float,
+    np.ndarray,
+    int,
+    list[int],
+    float,
+]:
+    ds = MultiStation1DDataset(
+        test_npz_path,
+        scramble_stations=scramble_stations,
+        station_scramble_seed=station_scramble_seed,
+    )
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+
+    active_event_ids, active_class_indices = active_event_ids_from_label_ids(
+        ds.label_ids
+    )
+
+    loss_weights = _resolve_detr_loss_weights(model_spec=model_spec, config={})
+    loss_fn = DETREventLoss(num_classes=6, loss_weights=loss_weights)
+    metrics_fn = EventDetectionMetrics(num_classes=6)
+
+    model.eval()
+    test_loss = 0.0
+    all_predictions = {
+        "class_logits": [],
+        "center": [],
+        "start": [],
+        "end": [],
+    }
+    all_targets = []
+    n_batches = 0
+
+    with torch.inference_mode():
+        for xb, y_onehot, _ in loader:
+            xb = xb.to(device)
+            predictions = normalize_prediction_intervals(model(xb))
+            targets = batch_segmentation_to_events(y_onehot, normalize=True)
+            all_targets.extend(targets)
+
+            loss_dict = loss_fn(predictions, targets)
+            test_loss += float(loss_dict["loss_total"].item())
+            n_batches += 1
+
+            for key in all_predictions:
+                all_predictions[key].append(predictions[key].detach().cpu().numpy())
+
+            del xb, y_onehot, predictions, targets, loss_dict
+
+    avg_test_loss = float(test_loss / n_batches) if n_batches > 0 else float("inf")
+
+    for key in all_predictions:
+        all_predictions[key] = np.concatenate(all_predictions[key], axis=0)
+
+    detection_summary = metrics_fn.compute_detection_summary(
+        all_predictions,
+        all_targets,
+        iou_threshold=0.5,
+    )
+    f1_per_class = [
+        float(detection_summary["per_class_f1"].get(class_id, 0.0))
+        for class_id in range(1, 6)
+    ]
+    iou_per_class = [
+        float(detection_summary["per_class_iou"].get(class_id, 0.0))
+        for class_id in range(1, 6)
+    ]
+
+    if len(active_class_indices) > 0:
+        mean_f1 = float(np.mean([f1_per_class[i] for i in active_class_indices]))
+        mean_iou = float(np.mean([iou_per_class[i] for i in active_class_indices]))
+    else:
+        mean_f1 = float(np.mean(f1_per_class)) if len(f1_per_class) > 0 else 0.0
+        mean_iou = float(np.mean(iou_per_class)) if len(iou_per_class) > 0 else 0.0
+
+    test_metrics = metrics_fn.evaluate_batch(all_predictions, all_targets)
+    test_map = float(test_metrics.get("mAP", 0.0))
+    cm = detection_summary["confusion_matrix"]
+
+    n_samples = int(len(ds))
+    del ds, loader
+    cleanup_gpu_cache()
+
+    return (
+        [float(x) for x in f1_per_class],
+        float(mean_f1),
+        [float(x) for x in iou_per_class],
+        float(mean_iou),
+        [float("nan")] * 6,
+        float("nan"),
+        float(avg_test_loss),
+        cm,
+        n_samples,
+        active_event_ids,
+        test_map,
     )
 
 

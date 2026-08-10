@@ -31,6 +31,50 @@ from utils.event_targets import batch_segmentation_to_events
 from utils.validation_plots import plot_event_validation
 
 
+DEFAULT_DETR_LOSS_WEIGHTS = {
+    "class_loss": 2.0,
+    "bbox_loss": 5.0,
+    "giou_loss": 2.0,
+    "unmatched_query": 2.0,
+}
+
+
+def _normalize_detr_loss_weights(raw_weights: dict | None) -> dict[str, float]:
+    """Normalize alias keys to DETREventLoss schema and cast to float."""
+    if not raw_weights:
+        return {}
+
+    normalized: dict[str, float] = {}
+    key_aliases = {
+        "class": "class_loss",
+        "bbox": "bbox_loss",
+        "giou": "giou_loss",
+        "confidence": "unmatched_query",
+        "class_loss": "class_loss",
+        "bbox_loss": "bbox_loss",
+        "giou_loss": "giou_loss",
+        "unmatched_query": "unmatched_query",
+    }
+    for key, value in raw_weights.items():
+        mapped_key = key_aliases.get(str(key))
+        if mapped_key is None:
+            continue
+        normalized[mapped_key] = float(value)
+    return normalized
+
+
+def _resolve_detr_loss_weights(model_spec: dict, config: dict) -> dict[str, float]:
+    """Resolve final DETR loss weights with precedence config > model spec > default."""
+    resolved = dict(DEFAULT_DETR_LOSS_WEIGHTS)
+
+    spec_weights = _normalize_detr_loss_weights(model_spec.get("loss_weights"))
+    config_weights = _normalize_detr_loss_weights(config.get("loss_weights"))
+
+    resolved.update(spec_weights)
+    resolved.update(config_weights)
+    return resolved
+
+
 def compute_event_confusion_matrix(
     all_predictions: dict,
     all_targets: list,
@@ -235,7 +279,9 @@ def train_one_event_detection_fold(
         )
 
     # Initialize loss function and metrics
-    loss_fn = DETREventLoss(num_classes=6)
+    loss_weights = _resolve_detr_loss_weights(spec, config)
+    print(f"Resolved DETR loss weights for {model_key}: {loss_weights}")
+    loss_fn = DETREventLoss(num_classes=6, loss_weights=loss_weights)
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
     # Build param groups with differential learning rates

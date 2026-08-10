@@ -836,6 +836,7 @@ def try_attach_station_attention_hook(
     # Try common naming patterns for station attention module
     for module_name in [
         "encoder.station_attention",
+        "encoder",
         "encoder.station_attention_block",
         "encoder.attention_station",
         "station_attention",
@@ -919,6 +920,20 @@ class StationAttentionHook(AttentionHook):
         Capture station attention from attention module.
         Uses StationAttentionBlock.last_attn_weights with shape [B, H, S, S].
         """
+        aggregated = getattr(module, "last_station_weights_aggregate", None)
+        if isinstance(aggregated, torch.Tensor):
+            if aggregated.ndim != 2:
+                raise RuntimeError(
+                    "Station attention aggregate expected tensor [B, S]."
+                )
+            attn_np = aggregated.detach().cpu().numpy()
+            batch_min = attn_np.min(axis=-1, keepdims=True)
+            batch_max = attn_np.max(axis=-1, keepdims=True)
+            attn_np = (attn_np - batch_min) / (batch_max - batch_min + 1e-8)
+            self.attention_weights = np.clip(attn_np, 0.0, 1.0).astype(np.float16)
+            module.last_station_weights_aggregate = None
+            return
+
         attn = getattr(module, "last_attn_weights", None)
         if attn is None:
             self.attention_weights = None

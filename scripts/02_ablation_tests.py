@@ -81,6 +81,15 @@ FOLDS = range(1, 6)
 LR_SCALE_REF_BATCH = 16
 LR_SCALE_ALPHA = -0.25
 
+# Default DETR event-loss weights used when a model spec does not define
+# loss_weights explicitly.
+DEFAULT_DETR_LOSS_WEIGHTS = {
+    "class": 2.0,
+    "bbox": 5.0,
+    "giou": 2.0,
+    "confidence": 2.0,
+}
+
 
 # ------------------------------ PATHS AND OUTPUTS -------------------------------
 DATA_ROOT = PROJECT_ROOT / "data" / "prepared_data" / CONFIG["volcano"] / "cv_5fold"
@@ -207,6 +216,19 @@ def select_folds(raw_folds: str | None) -> list[int]:
     return selected
 
 
+def resolve_detr_loss_weights(spec: dict) -> dict[str, float]:
+    """Return model-specific DETR loss weights with defaults filled in."""
+    if spec.get("trainer_kind") != "detr":
+        return {}
+
+    raw = spec.get("loss_weights") or {}
+    weights = dict(DEFAULT_DETR_LOSS_WEIGHTS)
+    for key in ("class", "bbox", "giou", "confidence"):
+        if key in raw:
+            weights[key] = float(raw[key])
+    return weights
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -236,6 +258,7 @@ def main() -> None:
                 "trainer_kind": spec["trainer_kind"],
                 "batch_size": spec["batch_size"],
                 "model_kwargs": spec["model_kwargs"],
+                "loss_weights": resolve_detr_loss_weights(spec),
             }
             for name, spec in selected_specs.items()
         },
@@ -294,11 +317,17 @@ def main() -> None:
         )
         model_config["lr"] = float(scaled_lr)
         model_config["lr_final"] = float(scaled_lr_final)
+        model_config["loss_weights"] = resolve_detr_loss_weights(spec)
 
         print(
             f"[{model_key}] batch_size={model_batch_size} | "
             f"lr={model_config['lr']:.3e} | lr_final={model_config['lr_final']:.3e}"
         )
+        if spec["trainer_kind"] == "detr":
+            print(
+                f"[{model_key}] loss_weights="
+                f"{model_config['loss_weights']}"
+            )
 
         completed_folds = []
         remaining_folds = []

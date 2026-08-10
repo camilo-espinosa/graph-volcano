@@ -76,6 +76,20 @@ def _validate_memory_levels(
     return tuple(levels)
 
 
+def _validate_station_attention_mode(value: str) -> str:
+    allowed_values = {
+        "shared_memory_levels",
+        "bottleneck_only",
+        "per_level_memory_levels",
+    }
+    if value not in allowed_values:
+        raise ValueError(
+            "station_attention_mode must be one of "
+            f"{sorted(allowed_values)}, got {value!r}."
+        )
+    return value
+
+
 class StationAttentionBlock(nn.Module):
     """Self-attention across stations, applied to time-pooled descriptors.
 
@@ -133,6 +147,149 @@ class StationAttentionBlock(nn.Module):
         pooled = pooled + attn_out
         pooled = pooled + self.ff(self.norm2(pooled))
         return x + pooled[:, :, :, None]
+
+
+class StationAttentionWeightsBlock(nn.Module):
+    """Independent station-attention block that outputs one gate per station.
+
+    Input: [B, S, C, T]
+    Output: [B, S, 1, 1] (station gates derived from attention weights)
+    """
+
+    def __init__(self, channels: int, heads: int = 4, ff_mult: int = 2):
+        super().__init__()
+        if channels % heads != 0:
+            raise ValueError(
+                f"station-attention channels ({channels}) must be divisible "
+                f"by heads ({heads})."
+            )
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(
+            channels, heads, dropout=0.0, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(channels)
+        self.ff = nn.Sequential(
+            nn.Linear(channels, channels * ff_mult),
+            nn.GELU(),
+            nn.Linear(channels * ff_mult, channels),
+        )
+        self.last_attn_weights: torch.Tensor | None = None
+        self.capture_attention_weights = False
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        station_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        pooled = x.mean(dim=-1)  # [B, S, C]
+        normed = self.norm1(pooled)
+        attn_out, attn_weights = self.attn(
+            normed,
+            normed,
+            normed,
+            need_weights=True,
+            average_attn_weights=False,
+            key_padding_mask=station_key_padding_mask,
+        )
+        if self.capture_attention_weights:
+            self.last_attn_weights = attn_weights.detach()
+        else:
+            self.last_attn_weights = None
+
+        pooled = pooled + attn_out
+        pooled = pooled + self.ff(self.norm2(pooled))
+
+        # One scalar importance weight per station, mean-preserving over stations.
+        station_weights = attn_weights.mean(dim=1).mean(dim=1)  # [B, S]
+        station_weights = station_weights * station_weights.shape[-1]
+        if station_key_padding_mask is not None:
+            station_weights = station_weights.masked_fill(station_key_padding_mask, 0.0)
+        return station_weights[:, :, None, None]
+
+
+class SharedMemoryLevelStationAttention(nn.Module):
+    """Single station-attention mechanism over multiple encoder levels.
+
+    Each selected level contributes a time-pooled station descriptor.
+    Descriptors are projected to a shared channel space, averaged, and attended
+    across stations once. The resulting attention map is reduced to one scalar
+    weight per station, which is then used as a multiplicative gate.
+    """
+
+    def __init__(
+        self,
+        level_channels: dict[int, int],
+        output_channels: int,
+        heads: int = 4,
+        ff_mult: int = 2,
+    ):
+        super().__init__()
+        if output_channels % heads != 0:
+            raise ValueError(
+                f"shared station-attention channels ({output_channels}) must be "
+                f"divisible by heads ({heads})."
+            )
+        self.level_projections = nn.ModuleDict(
+            {
+                str(level): nn.Linear(channels, output_channels)
+                for level, channels in level_channels.items()
+            }
+        )
+        self.norm1 = nn.LayerNorm(output_channels)
+        self.attn = nn.MultiheadAttention(
+            output_channels, heads, dropout=0.0, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(output_channels)
+        self.ff = nn.Sequential(
+            nn.Linear(output_channels, output_channels * ff_mult),
+            nn.GELU(),
+            nn.Linear(output_channels * ff_mult, output_channels),
+        )
+        self.last_attn_weights: torch.Tensor | None = None
+        self.capture_attention_weights = False
+
+    def forward(
+        self,
+        level_features: dict[int, torch.Tensor],
+        station_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if len(level_features) < 1:
+            raise ValueError("level_features must contain at least one level.")
+
+        descriptors: list[torch.Tensor] = []
+        for level in sorted(level_features):
+            if str(level) not in self.level_projections:
+                raise KeyError(
+                    f"Missing projection for level {level}. "
+                    "Check station_attention_mode and memory_levels configuration."
+                )
+            pooled = level_features[level].mean(dim=-1)  # [B, S, C_level]
+            descriptors.append(self.level_projections[str(level)](pooled))
+
+        fused = torch.stack(descriptors, dim=0).mean(dim=0)  # [B, S, C_out]
+        normed = self.norm1(fused)
+        attn_out, attn_weights = self.attn(
+            normed,
+            normed,
+            normed,
+            need_weights=True,
+            average_attn_weights=False,
+            key_padding_mask=station_key_padding_mask,
+        )
+        if self.capture_attention_weights:
+            self.last_attn_weights = attn_weights.detach()
+        else:
+            self.last_attn_weights = None
+
+        fused = fused + attn_out
+        fused = fused + self.ff(self.norm2(fused))
+
+        # One scalar importance weight per station, mean-preserving over stations.
+        station_weights = attn_weights.mean(dim=1).mean(dim=1)  # [B, S]
+        station_weights = station_weights * station_weights.shape[-1]
+        if station_key_padding_mask is not None:
+            station_weights = station_weights.masked_fill(station_key_padding_mask, 0.0)
+        return station_weights[:, :, None, None]
 
 
 class TemporalBottleneckAttention(nn.Module):
@@ -208,6 +365,7 @@ class MultiStationTemporalEncoder(nn.Module):
         station_attn_heads: int,
         station_attn_ff_mult: int,
         station_mask_abs_sum_threshold: float = 0.0,
+        station_attention_mode: str = "shared_memory_levels",
         memory_levels: Sequence[int] = (),
         memory_level_pool_to: int | None = None,
     ):
@@ -228,6 +386,9 @@ class MultiStationTemporalEncoder(nn.Module):
         self.strides = _broadcast_level_param("stride", stride, self.depth - 1)
         self.use_bottleneck_attention = bool(bottleneck_attention)
         self.station_mask_abs_sum_threshold = float(station_mask_abs_sum_threshold)
+        self.station_attention_mode = _validate_station_attention_mode(
+            station_attention_mode
+        )
         self.memory_levels = _validate_memory_levels(memory_levels, self.depth)
         if memory_level_pool_to is not None and memory_level_pool_to < 1:
             raise ValueError(
@@ -287,9 +448,38 @@ class MultiStationTemporalEncoder(nn.Module):
         self.bottleneck_stride = float(self.level_base_strides[self.depth - 1])
         self.last_extra_level_effective_strides: dict[int, float] = {}
         self.last_bottleneck_effective_stride = self.bottleneck_stride
-        self.station_attention = StationAttentionBlock(
-            self.output_channels, station_attn_heads, station_attn_ff_mult
-        )
+        self.capture_attention_weights = False
+        self.last_station_attn_weights_by_level: dict[int, torch.Tensor] = {}
+        self.last_station_weights_by_level: dict[int, torch.Tensor] = {}
+        self.last_station_weights_aggregate: torch.Tensor | None = None
+        if self.station_attention_mode == "bottleneck_only":
+            self.station_attention = StationAttentionBlock(
+                self.output_channels, station_attn_heads, station_attn_ff_mult
+            )
+            self.station_attention_by_level = None
+        elif self.station_attention_mode == "per_level_memory_levels":
+            self.station_attention = None
+            per_level_indices = sorted(set(self.memory_levels) | {self.depth - 1})
+            self.station_attention_by_level = nn.ModuleDict(
+                {
+                    str(level): StationAttentionWeightsBlock(
+                        self.level_channels[level], station_attn_heads, station_attn_ff_mult
+                    )
+                    for level in per_level_indices
+                }
+            )
+        else:
+            shared_attention_levels = sorted(set(self.memory_levels) | {self.depth - 1})
+            shared_level_channels = {
+                level: self.level_channels[level] for level in shared_attention_levels
+            }
+            self.station_attention = SharedMemoryLevelStationAttention(
+                level_channels=shared_level_channels,
+                output_channels=self.output_channels,
+                heads=station_attn_heads,
+                ff_mult=station_attn_ff_mult,
+            )
+            self.station_attention_by_level = None
         if self.use_bottleneck_attention:
             self.bottleneck_attention = TemporalBottleneckAttention(
                 self.output_channels, bottleneck_attn_heads, bottleneck_attn_ff_mult
@@ -324,6 +514,22 @@ class MultiStationTemporalEncoder(nn.Module):
         y = F.pad(y, (pad_left, pad_right))
         return y.reshape(bsz, n_stations, channels, y.shape[-1])
 
+    @staticmethod
+    def _station_weights_from_attention_map(
+        attn_weights: torch.Tensor,
+        station_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if attn_weights.ndim != 4:
+            raise ValueError(
+                "station attention map must be [B, H, S, S], "
+                f"got shape {tuple(attn_weights.shape)}."
+            )
+        station_weights = attn_weights.mean(dim=1).mean(dim=1)  # [B, S]
+        station_weights = station_weights * station_weights.shape[-1]
+        if station_key_padding_mask is not None:
+            station_weights = station_weights.masked_fill(station_key_padding_mask, 0.0)
+        return station_weights
+
     def forward(
         self, x: torch.Tensor, return_extra_level_features: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
@@ -350,18 +556,58 @@ class MultiStationTemporalEncoder(nn.Module):
         x = self._station_conv(x, self.stem_conv, self.stem_bn)
         x = x * station_valid_scale
 
-        raw_extra_level_features: dict[int, torch.Tensor] = {}
+        raw_level_station_features: dict[int, torch.Tensor] = {}
+        level_station_weights: dict[int, torch.Tensor] = {}
+        self.last_station_attn_weights_by_level = {}
+        self.last_station_weights_by_level = {}
+        self.last_station_weights_aggregate = None
+
+        if self.station_attention_mode == "per_level_memory_levels":
+            for block in self.station_attention_by_level.values():
+                block.capture_attention_weights = self.capture_attention_weights
 
         for level, (conv_same, bn_same, conv_down, bn_down) in enumerate(self.levels):
             x = self._station_conv(x, conv_same, bn_same)
             x = x * station_valid_scale
+
+            if (
+                self.station_attention_mode == "per_level_memory_levels"
+                and level in self.memory_levels
+            ):
+                level_block = self.station_attention_by_level[str(level)]
+                level_weights = level_block(
+                    x,
+                    station_key_padding_mask=station_missing_mask,
+                )
+                x = x * level_weights
+                x = x * station_valid_scale
+                level_station_weights[level] = level_weights[:, :, 0, 0].detach()
+                if self.capture_attention_weights and level_block.last_attn_weights is not None:
+                    self.last_station_attn_weights_by_level[level] = (
+                        level_block.last_attn_weights.detach()
+                    )
+
             if level in self.memory_levels:
-                raw_extra_level_features[level] = x.max(dim=1).values
-            if level == self.depth - 1:
+                raw_level_station_features[level] = x
+            if (
+                self.station_attention_mode == "bottleneck_only"
+                and level == self.depth - 1
+            ):
                 x = self.station_attention(
                     x, station_key_padding_mask=station_missing_mask
                 )
                 x = x * station_valid_scale
+                if self.capture_attention_weights:
+                    attn_map = self.station_attention.last_attn_weights
+                    if attn_map is not None:
+                        bottleneck_weights = self._station_weights_from_attention_map(
+                            attn_map,
+                            station_key_padding_mask=station_missing_mask,
+                        ).detach()
+                        level_station_weights[self.depth - 1] = bottleneck_weights
+                        self.last_station_attn_weights_by_level[self.depth - 1] = (
+                            attn_map.detach()
+                        )
             if conv_down is not None:
                 x = self._pad_for_downsample(
                     x,
@@ -379,6 +625,50 @@ class MultiStationTemporalEncoder(nn.Module):
             x = x.reshape(bsz, n_stations, channels, t_len)
             x = x * station_valid_scale
 
+        if self.station_attention_mode == "per_level_memory_levels":
+            bottleneck_block = self.station_attention_by_level[str(self.depth - 1)]
+            bottleneck_weights = bottleneck_block(
+                x,
+                station_key_padding_mask=station_missing_mask,
+            )
+            x = x * bottleneck_weights
+            x = x * station_valid_scale
+            level_station_weights[self.depth - 1] = bottleneck_weights[:, :, 0, 0].detach()
+            if self.capture_attention_weights and bottleneck_block.last_attn_weights is not None:
+                self.last_station_attn_weights_by_level[self.depth - 1] = (
+                    bottleneck_block.last_attn_weights.detach()
+                )
+
+        if self.station_attention_mode == "shared_memory_levels":
+            attention_inputs = {
+                level: raw_level_station_features[level] for level in self.memory_levels
+            }
+            attention_inputs[self.depth - 1] = x
+            station_weights = self.station_attention(
+                attention_inputs,
+                station_key_padding_mask=station_missing_mask,
+            )
+            x = x * station_weights
+            for level in self.memory_levels:
+                raw_level_station_features[level] = (
+                    raw_level_station_features[level] * station_weights
+                )
+            level_station_weights[self.depth - 1] = station_weights[:, :, 0, 0].detach()
+            if self.capture_attention_weights and self.station_attention.last_attn_weights is not None:
+                self.last_station_attn_weights_by_level[self.depth - 1] = (
+                    self.station_attention.last_attn_weights.detach()
+                )
+
+        if level_station_weights:
+            self.last_station_weights_by_level = {
+                level: weights.detach() for level, weights in level_station_weights.items()
+            }
+            self.last_station_weights_aggregate = (
+                torch.stack(list(self.last_station_weights_by_level.values()), dim=0)
+                .mean(dim=0)
+                .detach()
+            )
+
         # Permutation-invariant station merge.
         bottleneck_features = x.max(dim=1).values  # [B, C, T']
         self.last_bottleneck_effective_stride = self.bottleneck_stride
@@ -387,7 +677,7 @@ class MultiStationTemporalEncoder(nn.Module):
         extra_level_features: dict[int, torch.Tensor] = {}
         self.last_extra_level_effective_strides = {}
         for level in self.memory_levels:
-            level_features = raw_extra_level_features[level]
+            level_features = raw_level_station_features[level].max(dim=1).values
             raw_length = level_features.shape[-1]
             if target_tokens is not None and raw_length > target_tokens:
                 level_features = F.adaptive_avg_pool1d(level_features, target_tokens)
@@ -624,6 +914,7 @@ class MuSSED(nn.Module):
         station_attn_heads: int = 4,
         station_attn_ff_mult: int = 2,
         station_mask_abs_sum_threshold: float = 0.0,
+        station_attention_mode: str = "shared_memory_levels",
         memory_levels: Sequence[int] = (),
         memory_level_pool_to: int | None = None,
         eval_memory_level_pool_to: int | None = None,
@@ -655,6 +946,7 @@ class MuSSED(nn.Module):
             station_attn_heads=station_attn_heads,
             station_attn_ff_mult=station_attn_ff_mult,
             station_mask_abs_sum_threshold=station_mask_abs_sum_threshold,
+            station_attention_mode=station_attention_mode,
             memory_levels=memory_levels,
             memory_level_pool_to=memory_level_pool_to,
         )
