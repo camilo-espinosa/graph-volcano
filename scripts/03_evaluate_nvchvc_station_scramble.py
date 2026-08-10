@@ -354,7 +354,6 @@ def main() -> None:
         "folds": [int(f) for f in FOLDS],
         "model_specs": {
             key: {
-                "display_name": MODEL_SPECS[key]["display_name"],
                 "batch_size": int(MODEL_SPECS[key]["batch_size"]),
                 "model_kwargs": MODEL_SPECS[key]["model_kwargs"],
             }
@@ -419,7 +418,7 @@ def main() -> None:
         trainer_kind = str(model_spec["trainer_kind"])
         model_kwargs = dict(model_spec["model_kwargs"])
 
-        print(f"\n[MODEL] {model_key} ({model_spec['display_name']})")
+        print(f"\n[MODEL] {model_key}")
         model_root = ablations_root / model_key
         if not model_root.exists():
             msg = f"Missing model folder: {model_root}"
@@ -590,7 +589,7 @@ def main() -> None:
 
             row = {
                 "model_key": model_key,
-                "model_display_name": str(model_spec["display_name"]),
+                "model_display_name": model_key,
                 "fold": int(fold_id),
                 "n_test": int(n_samples),
                 "checkpoint": str(ckpt_path),
@@ -631,7 +630,9 @@ def main() -> None:
                 )
                 cm_dir.mkdir(parents=True, exist_ok=True)
                 cm_labels = (
-                    ALL_CLASS_NAMES if cm.shape[0] == len(ALL_CLASS_NAMES) else CLASS_NAMES
+                    ALL_CLASS_NAMES
+                    if cm.shape[0] == len(ALL_CLASS_NAMES)
+                    else CLASS_NAMES
                 )
                 save_confusion_matrix_image(
                     cm=cm,
