@@ -90,6 +90,16 @@ def _validate_station_attention_mode(value: str) -> str:
     return value
 
 
+def _validate_detection_head_mode(value: str) -> str:
+    allowed_values = {"independent", "shared_trunk"}
+    if value not in allowed_values:
+        raise ValueError(
+            "detection_head_mode must be one of "
+            f"{sorted(allowed_values)}, got {value!r}."
+        )
+    return value
+
+
 class StationAttentionBlock(nn.Module):
     """Self-attention across stations, applied to time-pooled descriptors.
 
@@ -888,30 +898,76 @@ class DetectionHead(nn.Module):
         hidden_dim: int,
         num_classes: int = 6,
         interval_output_format: str = "start_end",
+        detection_head_mode: str = "independent",
+        trunk_dims: Sequence[int] | None = None,
     ):
         super().__init__()
         self.interval_output_format = _validate_interval_output_format(
             interval_output_format
         )
+        self.detection_head_mode = _validate_detection_head_mode(detection_head_mode)
 
-        def mlp(output_dim: int) -> nn.Sequential:
-            return nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, output_dim),
-            )
+        if hidden_dim < 1:
+            raise ValueError(f"hidden_dim must be >= 1, got {hidden_dim}.")
 
-        self.class_head = mlp(num_classes)
-        if self.interval_output_format == "start_end":
-            self.start_head = mlp(1)
-            self.end_head = mlp(1)
-            self.center_head = None
-            self.duration_head = None
+        if trunk_dims is None:
+            resolved_trunk_dims = [hidden_dim, hidden_dim]
         else:
-            self.center_head = mlp(1)
-            self.duration_head = mlp(1)
-            self.start_head = None
-            self.end_head = None
+            resolved_trunk_dims = [int(v) for v in trunk_dims]
+        if len(resolved_trunk_dims) < 1:
+            raise ValueError(
+                "trunk_dims must contain at least one positive integer layer size."
+            )
+        if any(v < 1 for v in resolved_trunk_dims):
+            raise ValueError(
+                "trunk_dims values must be >= 1, got " f"{resolved_trunk_dims}."
+            )
+        self.trunk_dims = tuple(resolved_trunk_dims)
+
+        def build_mlp(
+            in_dim: int,
+            hidden_dims: Sequence[int],
+            out_dim: int,
+        ) -> nn.Sequential:
+            layers: list[nn.Module] = []
+            prev_dim = in_dim
+            for dim in hidden_dims:
+                layers.append(nn.Linear(prev_dim, dim))
+                layers.append(nn.ReLU())
+                prev_dim = dim
+            layers.append(nn.Linear(prev_dim, out_dim))
+            return nn.Sequential(*layers)
+
+        if self.detection_head_mode == "independent":
+            self.shared_trunk = None
+            self.class_head = build_mlp(input_dim, [hidden_dim], num_classes)
+            if self.interval_output_format == "start_end":
+                self.start_head = build_mlp(input_dim, [hidden_dim], 1)
+                self.end_head = build_mlp(input_dim, [hidden_dim], 1)
+                self.center_head = None
+                self.duration_head = None
+            else:
+                self.center_head = build_mlp(input_dim, [hidden_dim], 1)
+                self.duration_head = build_mlp(input_dim, [hidden_dim], 1)
+                self.start_head = None
+                self.end_head = None
+        else:
+            self.shared_trunk = build_mlp(
+                input_dim,
+                self.trunk_dims,
+                self.trunk_dims[-1],
+            )
+            self.class_head = nn.Linear(self.trunk_dims[-1], num_classes)
+            if self.interval_output_format == "start_end":
+                self.start_head = nn.Linear(self.trunk_dims[-1], 1)
+                self.end_head = nn.Linear(self.trunk_dims[-1], 1)
+                self.center_head = None
+                self.duration_head = None
+            else:
+                self.center_head = nn.Linear(self.trunk_dims[-1], 1)
+                self.duration_head = nn.Linear(self.trunk_dims[-1], 1)
+                self.start_head = None
+                self.end_head = None
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -929,10 +985,11 @@ class DetectionHead(nn.Module):
                     - center: [B, Nq, 1] in [0, 1]
                     - duration: [B, Nq, 1] in [0, 1]
         """
-        predictions = {"class_logits": self.class_head(x)}
+        head_input = x if self.shared_trunk is None else self.shared_trunk(x)
+        predictions = {"class_logits": self.class_head(head_input)}
         if self.interval_output_format == "start_end":
-            raw_start = torch.sigmoid(self.start_head(x))
-            raw_end = torch.sigmoid(self.end_head(x))
+            raw_start = torch.sigmoid(self.start_head(head_input))
+            raw_end = torch.sigmoid(self.end_head(head_input))
             start = torch.minimum(raw_start, raw_end)
             end = torch.maximum(raw_start, raw_end)
             center = 0.5 * (start + end)
@@ -940,8 +997,8 @@ class DetectionHead(nn.Module):
             predictions["end"] = end
             predictions["center"] = center
         else:
-            center = torch.sigmoid(self.center_head(x))
-            duration = torch.sigmoid(self.duration_head(x))
+            center = torch.sigmoid(self.center_head(head_input))
+            duration = torch.sigmoid(self.duration_head(head_input))
             predictions["center"] = center
             predictions["duration"] = duration
         return predictions
@@ -984,16 +1041,37 @@ class MuSSED(nn.Module):
         num_queries: int = 10,
         query_dim: int = 128,
         hidden_dim: int = 256,
+        decoder_ffn_dim: int | None = None,
+        head_hidden_dim: int | None = None,
         num_decoder_heads: int = 4,
         num_decoder_layers: int = 2,
         decoder_dropout: float = 0.1,
         use_temporal_projection: bool = False,
         interval_output_format: str = "start_end",
+        detection_head_mode: str = "independent",
+        head_trunk_dims: Sequence[int] | None = None,
     ):
         super().__init__()
 
         if num_queries < 1:
             raise ValueError(f"num_queries must be >= 1, got {num_queries}.")
+
+        decoder_ffn_dim_resolved = (
+            int(hidden_dim) if decoder_ffn_dim is None else int(decoder_ffn_dim)
+        )
+        head_hidden_dim_resolved = (
+            int(hidden_dim) if head_hidden_dim is None else int(head_hidden_dim)
+        )
+        if decoder_ffn_dim_resolved < 1:
+            raise ValueError(
+                "decoder_ffn_dim must be >= 1 after resolution, got "
+                f"{decoder_ffn_dim_resolved}."
+            )
+        if head_hidden_dim_resolved < 1:
+            raise ValueError(
+                "head_hidden_dim must be >= 1 after resolution, got "
+                f"{head_hidden_dim_resolved}."
+            )
 
         # Build temporal encoder.
         self.encoder = MultiStationTemporalEncoder(
@@ -1076,7 +1154,7 @@ class MuSSED(nn.Module):
             d_model=query_dim,
             nhead=num_decoder_heads,
             num_decoder_layers=num_decoder_layers,
-            dim_feedforward=hidden_dim,
+            dim_feedforward=decoder_ffn_dim_resolved,
             dropout=decoder_dropout,
             capture_attention_weights=False,
         )
@@ -1084,14 +1162,18 @@ class MuSSED(nn.Module):
         # Detection heads.
         self.detection_head = DetectionHead(
             input_dim=query_dim,
-            hidden_dim=hidden_dim,
+            hidden_dim=head_hidden_dim_resolved,
             num_classes=num_classes,
             interval_output_format=interval_output_format,
+            detection_head_mode=detection_head_mode,
+            trunk_dims=head_trunk_dims,
         )
 
         self.query_dim = query_dim
         self.num_classes = num_classes
         self.interval_output_format = self.detection_head.interval_output_format
+        self.decoder_ffn_dim = decoder_ffn_dim_resolved
+        self.head_hidden_dim = head_hidden_dim_resolved
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """

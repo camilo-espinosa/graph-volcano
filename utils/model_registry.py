@@ -81,6 +81,26 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # EVENT DETECTION: MuSSED models (DETR-based event detection)
     # Progressive search set: keep encoder fixed and keep num_queries=1.
     # ===================================================================
+    # -------------------------------------------------------------------
+    # Targeted probe: expressive shared detection head
+    # -------------------------------------------------------------------
+    "mussed_head384_shared_trunk": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "num_queries": 1,
+            "num_decoder_layers": 1,
+            "decoder_ffn_dim": 384,
+            "head_hidden_dim": 384,
+            "detection_head_mode": "shared_trunk",
+            "head_trunk_dims": [384, 384],
+            "use_temporal_projection": True,
+            "memory_levels": [0, 1, 2],
+        },
+        "batch_size": 20,
+    },
     "mussed_base": {
         "family": "detr",
         "trainer_kind": "detr",
@@ -101,7 +121,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         },
         "batch_size": 20,
     },
-
     # -------------------------------------------------------------------
     # Stage 1: DETR loss weights
     # -------------------------------------------------------------------
