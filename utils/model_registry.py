@@ -101,16 +101,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         },
         "batch_size": 20,
     },
-    "mussed_s0_i_cd": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "interval_output_format": "center_duration",
-        },
-        "batch_size": 20,
-    },
+
     # -------------------------------------------------------------------
     # Stage 1: DETR loss weights
     # -------------------------------------------------------------------
