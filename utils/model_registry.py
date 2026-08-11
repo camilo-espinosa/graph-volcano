@@ -30,11 +30,10 @@ PHASENET_BOTTLENECK_ATTENTION_BASE_KWARGS: dict[str, Any] = {
     "bottleneck_attn_ff_mult": 2,
 }
 
-PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS: dict[str, Any] = {
+MUSSEG_PI_SE_LSA_BA_BASE_KWARGS: dict[str, Any] = {
     **PHASENET_BASE_KWARGS,
     "filters_root": 32,
     "bottleneck_attention": False,
-    "shared_station_encoder": False,
     "station_interaction": "none",
     "station_message_levels": [],
     "station_message_aggregation": "sum",
@@ -47,19 +46,11 @@ PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS: dict[str, Any] = {
     "station_attn_heads": 4,
     "station_attn_dropout": 0.2,
     "station_attn_ff_mult": 2,
+    "bottleneck_attention": True,
+    "station_interaction": "late_attention",
+    "volcano_name": "NVCHVC",
 }
 
-MUSSEG_PI_SE_LSA_BA_BASE_KWARGS: dict[str, Any] = deepcopy(
-    PHASENET_PERMUTATION_INVARIANT_BASE_KWARGS
-)
-MUSSEG_PI_SE_LSA_BA_BASE_KWARGS.pop("shared_station_encoder", None)
-MUSSEG_PI_SE_LSA_BA_BASE_KWARGS.update(
-    {
-        "bottleneck_attention": True,
-        "station_interaction": "late_attention",
-        "volcano_name": "NVCHVC",
-    }
-)
 
 MUSSED_BASE_KWARGS: dict[str, Any] = {
     "num_classes": 6,
@@ -74,649 +65,269 @@ MUSSED_BASE_KWARGS: dict[str, Any] = {
     "station_attn_heads": 4,
     "station_attn_ff_mult": 2,
     "station_mask_abs_sum_threshold": 1e1,
-    "num_queries": 10,
+    "num_queries": 1,
     "query_dim": 128,
     "hidden_dim": 256,
     "num_decoder_heads": 4,
-    "num_decoder_layers": 2,
+    "num_decoder_layers": 1,
     "decoder_dropout": 0.1,
     "use_temporal_projection": False,
-    "station_attention_mode": "bottleneck_only",
+    "station_attention_mode": "per_level_memory_levels",
     "interval_output_format": "center_duration",
 }
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # ===================================================================
     # EVENT DETECTION: MuSSED models (DETR-based event detection)
-    # Model-search set: keep encoder fixed, vary decoder/query side only.
+    # Progressive search set: keep encoder fixed and keep num_queries=1.
     # ===================================================================
-    "mussed_q1_dec1_no_tempproj_memlvl0": {
+    "mussed_base": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
         "batch_size": 20,
     },
-
-    "mussed_q1_dec1_no_tempproj_memlvl1": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [1],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
-        "batch_size": 20,
-    },
-
-    "mussed_q1_dec1_no_tempproj_memlvl2": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
-        "batch_size": 20,
-    },
-
-    "mussed_q1_dec1_no_tempproj_memlvl01": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
-        "batch_size": 20,
-    },
-
-    "mussed_q1_dec1_no_tempproj_memlvl12": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
-        "batch_size": 20,
-    },
-
-    "mussed_q1_dec1_no_tempproj_memlvl02": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
-        "batch_size": 20,
-    },
-
     # -------------------------------------------------------------------
-    # Stride / temporal-resolution ablations
-    #
-    # Purpose:
-    # Test whether changing the location of temporal downsampling
-    # improves direct event localization.
-    #
-    # All retain the same overall downsampling factor of 4 for the
-    # three encoder transitions.
+    # Stage 0: interval representation (run first)
     # -------------------------------------------------------------------
-
-    "mussed_q1_dec1_no_tempproj_stride122": {
+    "mussed_s0_i_se": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "stride": [1, 2, 2],
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
+            "interval_output_format": "start_end",
         },
         "batch_size": 20,
     },
-
-    "mussed_q1_dec1_no_tempproj_stride212": {
+    "mussed_s0_i_cd": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "stride": [2, 1, 2],
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
+            "interval_output_format": "center_duration",
         },
         "batch_size": 20,
     },
-
-    "mussed_q1_dec1_no_tempproj_stride221": {
+    # -------------------------------------------------------------------
+    # Stage 1: DETR loss weights
+    # -------------------------------------------------------------------
+    "mussed_s1_l0": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "stride": [2, 2, 1],
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
-        "batch_size": 20,
-    },
-
-    # -------------------------------------------------------------------
-    # Loss-weight ablations
-    #
-    # Architecture fixed to:
-    # q=1, decoder=1, temporal projection=True,
-    # memory=[0,1,2], hidden_dim=384.
-    #
-    # The trainer is expected to read:
-    # spec["loss_weights"]
-    #
-    # Baseline assumed from the current DETR training setup:
-    # class=2, bbox=5, giou=2, confidence=2.
-    # -------------------------------------------------------------------
-
-    "mussed_q1_loss_baseline": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-            "hidden_dim": 384,
-        },
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
         "loss_weights": {
             "class": 2.0,
             "bbox": 5.0,
             "giou": 2.0,
             "confidence": 2.0,
-        },
-        "batch_size": 24,
+        },  # baseline
+        "batch_size": 20,
     },
-
-    "mussed_q1_loss_balanced": {
+    "mussed_s1_l1": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-            "hidden_dim": 384,
-        },
-        "loss_weights": {
-            "class": 2.0,
-            "bbox": 2.0,
-            "giou": 2.0,
-            "confidence": 2.0,
-        },
-        "batch_size": 24,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": {"class": 2.0, "bbox": 2.0, "giou": 2.0, "confidence": 2.0},
+        "batch_size": 20,
     },
-
-    "mussed_q1_loss_class_conf": {
+    "mussed_s1_l2": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-            "hidden_dim": 384,
-        },
-        "loss_weights": {
-            "class": 4.0,
-            "bbox": 2.0,
-            "giou": 2.0,
-            "confidence": 4.0,
-        },
-        "batch_size": 24,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": {"class": 2.0, "bbox": 6.0, "giou": 3.0, "confidence": 2.0},
+        "batch_size": 20,
     },
-
-    "mussed_q1_loss_localization": {
+    "mussed_s1_l3": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-            "hidden_dim": 384,
-        },
-        "loss_weights": {
-            "class": 2.0,
-            "bbox": 8.0,
-            "giou": 4.0,
-            "confidence": 2.0,
-        },
-        "batch_size": 24,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": {"class": 2.0, "bbox": 8.0, "giou": 4.0, "confidence": 2.0},
+        "batch_size": 20,
     },
-
-    "mussed_q1_loss_confidence": {
+    "mussed_s1_l4": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-            "hidden_dim": 384,
-        },
-        "loss_weights": {
-            "class": 2.0,
-            "bbox": 2.0,
-            "giou": 2.0,
-            "confidence": 6.0,
-        },
-        "batch_size": 24,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": {"class": 4.0, "bbox": 2.0, "giou": 2.0, "confidence": 4.0},
+        "batch_size": 20,
     },
-
+    "mussed_s1_l5": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": {"class": 2.0, "bbox": 5.0, "giou": 2.0, "confidence": 4.0},
+        "batch_size": 20,
+    },
+    "mussed_s1_l6": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": {"class": 2.0, "bbox": 5.0, "giou": 2.0, "confidence": 6.0},
+        "batch_size": 20,
+    },
+    "mussed_s1_l7": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": {"class": 2.0, "bbox": 5.0, "giou": 2.0, "confidence": 1.0},
+        "batch_size": 20,
+    },
     # -------------------------------------------------------------------
-    # Combined multi-level + localization experiment
-    #
-    # Purpose:
-    # Test whether the strong temporal localization from multi-level
-    # memory can be converted into higher event F1 by changing the loss.
+    # Stage 2: temporal projection path
     # -------------------------------------------------------------------
-
-    "mussed_multilevel_loss_localization": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-            "hidden_dim": 384,
-        },
-        "loss_weights": {
-            "class": 2.0,
-            "bbox": 8.0,
-            "giou": 4.0,
-            "confidence": 2.0,
-        },
-        "batch_size": 24,
-    },
-    "mussed_q1_dec1_ffn384": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,            
-            "hidden_dim": 384,
-        },
-        "batch_size": 24,
-    },    
-    "mussed_sq1_dec1_ffn192": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,            
-            "hidden_dim": 192,
-        },
-        "batch_size": 24,
-    },
-    "mussed_q1_dec1_no_tempproj": {
+    "mussed_s2_p0": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
-        "batch_size": 24,
-    },
-
-    "mussed_q1_dec1": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
-        },
-        "batch_size": 16,
-    },
-    "mussed_multilevel_memory_all_q2": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 2,
-        },
-        "batch_size": 16,
-    },
-    "mussed_q1_dec1_ffn384_no_tempproj": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,            
-            "hidden_dim": 384,
-        },
-        "batch_size": 24,
-    }, 
-    "mussed_q1_dec2_ffn384_no_tempproj": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 2,            
-            "hidden_dim": 384,
-        },
-        "batch_size": 24,
-    }, 
-    "mussed_q1_dec3_ffn384_no_tempproj": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 3,            
-            "hidden_dim": 384,
         },
         "batch_size": 20,
-    }, 
-    "mussed_q1_dec1_no_tempproj_memlvl2": {
+    },
+    "mussed_s2_p1": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,            
+            "use_temporal_projection": True,
         },
         "batch_size": 20,
-    }, 
-    "mussed_multilevel_memory_all_q1": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-        },
-        "batch_size": 16,
     },
-    "mussed_search_dec3_q1": {
+    # -------------------------------------------------------------------
+    # Stage 3: decoder dropout
+    # -------------------------------------------------------------------
+    "mussed_s3_d05": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_decoder_layers": 3,
-            "num_queries": 1,
-        },
-        "batch_size": 16,
-    },
-    "mussed_search_dec1_q8": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_decoder_layers": 1,
-            "num_queries": 8,
-        },
-        "batch_size": 16,
-    },
-    "mussed_search_dec3_q8": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_decoder_layers": 3,
-            "num_queries": 8,
-        },
-        "batch_size": 16,
-    },
-    "mussed_search_q6_fast": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 6,
-        },
-        "batch_size": 16,
-    },
-    "mussed_search_ffn192": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "hidden_dim": 192,
-        },
-        "batch_size": 16,
-    },
-    "mussed_search_ffn384": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "hidden_dim": 384,
-        },
-        "batch_size": 16,
-    },
-    "mussed_search_dropout005": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
             "decoder_dropout": 0.05,
         },
-        "batch_size": 16,
+        "batch_size": 20,
     },
-    "mussed_search_evalpool256": {
+    "mussed_s3_d10": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "bottleneck_only",
-            "memory_levels": [0, 1, 2],
-            "eval_memory_level_pool_to": 256,
-        },
-        "batch_size": 16,
-    },
-    "mussed_d4_r16_s222_k127_no_bottleneck": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "station_attention_mode": "bottleneck_only",
-            "bottleneck_attention": False,
-        },
-        "batch_size": 16,
-    },
-
-    # -------------------------------------------------------------------
-    # Per-level station-attention probes (small set)
-    #
-    # Selected from top leaderboard performers to compare the new
-    # per_level_memory_levels station-attention mode against legacy behavior.
-    # -------------------------------------------------------------------
-
-    "mussed_q1_dec1_no_tempproj_memlvl2_sharedattn": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": False,
-            "station_attention_mode": "per_level_memory_levels",
-            "memory_levels": [2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
+            "decoder_dropout": 0.10,
         },
         "batch_size": 20,
     },
-    "mussed_q1_dec1_ffn384_sharedattn": {
+    "mussed_s3_d20": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "per_level_memory_levels",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
-            "num_decoder_layers": 1,
+            "decoder_dropout": 0.20,
+        },
+        "batch_size": 20,
+    },
+    # -------------------------------------------------------------------
+    # Stage 4: FFN capacity (decoder feed-forward width)
+    # -------------------------------------------------------------------
+    "mussed_s4_f192": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "hidden_dim": 192,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s4_f256": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "batch_size": 20,
+    },
+    "mussed_s4_f384": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
             "hidden_dim": 384,
         },
-        "batch_size": 24,
+        "batch_size": 20,
     },
-    "mussed_multilevel_memory_all_q1_sharedattn": {
+    # -------------------------------------------------------------------
+    # Stage 5: station attention mode
+    # -------------------------------------------------------------------
+    "mussed_s5_a_pl": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "batch_size": 20,
+    },
+    "mussed_s5_a_bo": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "per_level_memory_levels",
-            "memory_levels": [0, 1, 2],
-            "num_queries": 1,
+            "station_attention_mode": "bottleneck_only",
         },
-        "batch_size": 16,
+        "batch_size": 20,
     },
-    "mussed_search_dec3_q1_sharedattn": {
+    "mussed_s5_a_sm": {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "use_temporal_projection": True,
-            "station_attention_mode": "per_level_memory_levels",
-            "memory_levels": [0, 1, 2],
+            "station_attention_mode": "shared_memory_levels",
+        },
+        "batch_size": 20,
+    },
+    # -------------------------------------------------------------------
+    # Stage 6: decoder depth (run last)
+    # -------------------------------------------------------------------
+    "mussed_s6_n1": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "batch_size": 20,
+    },
+    "mussed_s6_n2": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "num_decoder_layers": 2,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s6_n3": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
             "num_decoder_layers": 3,
-            "num_queries": 1,
         },
-        "batch_size": 16,
+        "batch_size": 20,
     },
     # # ===================================================================
     # # ACTIVE: 5-FOLD SELECTION

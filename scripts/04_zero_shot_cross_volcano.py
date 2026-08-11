@@ -579,19 +579,14 @@ def main() -> None:
                             device
                         )
                         if uses_station_info:
-                            ckpt = torch.load(
-                                ckpt_path,
-                                map_location=device,
-                                weights_only=False,
+                            load_checkpoint_into_model(
+                                model=model,
+                                checkpoint_path=ckpt_path,
+                                device=device,
+                                trainer_kind=trainer_kind,
+                                allowed_missing_keys=("station_dist",),
+                                ignore_checkpoint_keys=("station_dist",),
                             )
-                            ckpt_state = {
-                                key: value
-                                for key, value in ckpt["model_state_dict"].items()
-                                if key != "station_dist"
-                            }
-                            model.load_state_dict(ckpt_state, strict=False)
-                            del ckpt
-                            cleanup_gpu_cache()
                         else:
                             load_checkpoint_into_model(
                                 model=model,

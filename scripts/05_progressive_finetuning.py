@@ -309,15 +309,14 @@ def _load_base_model(
             n_classes=6,
             volcano_name=str(target_volcano),
         ).to(device)
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        ckpt_state = {
-            key: value
-            for key, value in ckpt["model_state_dict"].items()
-            if key != "station_dist"
-        }
-        model.load_state_dict(ckpt_state, strict=False)
-        del ckpt
-        cleanup_gpu_cache()
+        load_checkpoint_into_model(
+            model,
+            checkpoint_path,
+            device,
+            trainer_kind=str(spec["trainer_kind"]),
+            allowed_missing_keys=("station_dist",),
+            ignore_checkpoint_keys=("station_dist",),
+        )
     else:
         model = build_model_from_spec(model_key, n_classes=6).to(device)
         load_checkpoint_into_model(

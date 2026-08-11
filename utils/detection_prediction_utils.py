@@ -19,17 +19,30 @@ def normalize_prediction_intervals(
     if "center" not in predictions:
         raise KeyError("Predictions must include 'center'.")
 
-    center = predictions["center"]
+    center = _clip_unit_interval(predictions["center"])
 
     if "start" in predictions and "end" in predictions:
-        start = _clip_unit_interval(predictions["start"])
-        end = _clip_unit_interval(predictions["end"])
+        start_raw = _clip_unit_interval(predictions["start"])
+        end_raw = _clip_unit_interval(predictions["end"])
+
+        # Canonicalize interval ordering for all downstream consumers.
+        if isinstance(start_raw, torch.Tensor):
+            start = torch.minimum(start_raw, end_raw)
+            end = torch.maximum(start_raw, end_raw)
+        else:
+            start = np.minimum(start_raw, end_raw)
+            end = np.maximum(start_raw, end_raw)
+
         duration = _clip_unit_interval(end - start)
+        center = _clip_unit_interval(0.5 * (start + end))
     elif "duration" in predictions:
         duration = _clip_unit_interval(predictions["duration"])
         half_duration = 0.5 * duration
         start = _clip_unit_interval(center - half_duration)
         end = _clip_unit_interval(center + half_duration)
+
+        # Recompute canonical center from the realized interval endpoints.
+        center = _clip_unit_interval(0.5 * (start + end))
     else:
         raise KeyError(
             "Predictions must include either ('start', 'end') or 'duration'."

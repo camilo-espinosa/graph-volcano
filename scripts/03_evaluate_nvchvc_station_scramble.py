@@ -171,8 +171,19 @@ def write_aggregate_reports(out_dir: Path) -> None:
     per_class_f1_rows = []
     per_class_iou_rows = []
 
+    def _normalize_model_key(value) -> str:
+        if isinstance(value, tuple):
+            if len(value) != 1:
+                raise ValueError(
+                    "Grouped model_key must contain a single element when provided as tuple, "
+                    f"got {value}."
+                )
+            return str(value[0])
+        return str(value)
+
     grouped = fold_df.groupby(["model_key"], sort=True)
     for model_key, grp in grouped:
+        model_key = _normalize_model_key(model_key)
         mean_f1_summary = compute_summary(grp["test_mean_f1"].astype(float).tolist())
         mean_iou_summary = compute_summary(grp["test_mean_iou"].astype(float).tolist())
         iou_all_values = pd.to_numeric(
@@ -190,7 +201,7 @@ def write_aggregate_reports(out_dir: Path) -> None:
             str(display_names[0]) if len(display_names) > 0 else str(model_key)
         )
         summary_row = {
-            "model_key": str(model_key),
+            "model_key": model_key,
             "model_display_name": display_name,
             "n_folds": int(len(grp)),
             "test_mean_f1_mean": float(mean_f1_summary["mean"]),
@@ -205,11 +216,11 @@ def write_aggregate_reports(out_dir: Path) -> None:
             summary_row["test_mean_iou_all_std"] = float(mean_iou_all_summary["std"])
 
         per_class_f1_row = {
-            "model_key": str(model_key),
+            "model_key": model_key,
             "model_display_name": display_name,
         }
         per_class_iou_row = {
-            "model_key": str(model_key),
+            "model_key": model_key,
             "model_display_name": display_name,
         }
 
@@ -471,17 +482,14 @@ def main() -> None:
 
                 model = model_spec["model_cls"](**model_kwargs_runtime).to(device)
                 if uses_station_info:
-                    ckpt = torch.load(
-                        ckpt_path, map_location=device, weights_only=False
+                    load_checkpoint_into_model(
+                        model=model,
+                        checkpoint_path=ckpt_path,
+                        device=device,
+                        trainer_kind=trainer_kind,
+                        allowed_missing_keys=("station_dist",),
+                        ignore_checkpoint_keys=("station_dist",),
                     )
-                    ckpt_state = {
-                        key: value
-                        for key, value in ckpt["model_state_dict"].items()
-                        if key != "station_dist"
-                    }
-                    model.load_state_dict(ckpt_state, strict=False)
-                    del ckpt
-                    cleanup_gpu_cache()
                 else:
                     load_checkpoint_into_model(
                         model=model,

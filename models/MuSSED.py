@@ -116,6 +116,7 @@ class StationAttentionBlock(nn.Module):
             nn.Linear(channels * ff_mult, channels),
         )
         self.last_attn_weights: torch.Tensor | None = None
+        self.last_station_weights: torch.Tensor | None = None
         self.capture_attention_weights = False
 
     def forward(
@@ -125,25 +126,23 @@ class StationAttentionBlock(nn.Module):
     ) -> torch.Tensor:
         pooled = x.mean(dim=-1)  # [B, S, C]
         normed = self.norm1(pooled)
+        attn_out, attn_weights = self.attn(
+            normed,
+            normed,
+            normed,
+            need_weights=True,
+            average_attn_weights=False,
+            key_padding_mask=station_key_padding_mask,
+        )
         if self.capture_attention_weights:
-            attn_out, attn_weights = self.attn(
-                normed,
-                normed,
-                normed,
-                need_weights=True,
-                average_attn_weights=False,
-                key_padding_mask=station_key_padding_mask,
-            )
             self.last_attn_weights = attn_weights.detach()
         else:
-            attn_out, _ = self.attn(
-                normed,
-                normed,
-                normed,
-                need_weights=False,
-                key_padding_mask=station_key_padding_mask,
-            )
             self.last_attn_weights = None
+        station_weights = attn_weights.mean(dim=1).mean(dim=1)  # [B, S]
+        station_weights = station_weights * station_weights.shape[-1]
+        if station_key_padding_mask is not None:
+            station_weights = station_weights.masked_fill(station_key_padding_mask, 0.0)
+        self.last_station_weights = station_weights.detach()
         pooled = pooled + attn_out
         pooled = pooled + self.ff(self.norm2(pooled))
         return x + pooled[:, :, :, None]
@@ -463,7 +462,9 @@ class MultiStationTemporalEncoder(nn.Module):
             self.station_attention_by_level = nn.ModuleDict(
                 {
                     str(level): StationAttentionWeightsBlock(
-                        self.level_channels[level], station_attn_heads, station_attn_ff_mult
+                        self.level_channels[level],
+                        station_attn_heads,
+                        station_attn_ff_mult,
                     )
                     for level in per_level_indices
                 }
@@ -530,6 +531,30 @@ class MultiStationTemporalEncoder(nn.Module):
             station_weights = station_weights.masked_fill(station_key_padding_mask, 0.0)
         return station_weights
 
+    @staticmethod
+    def _normalized_station_weights(station_weights: torch.Tensor) -> torch.Tensor:
+        if station_weights.ndim != 2:
+            raise ValueError(
+                "station weights for merge must be [B, S], "
+                f"got shape {tuple(station_weights.shape)}."
+            )
+        weight_sums = station_weights.sum(dim=1, keepdim=True)
+        if (weight_sums <= 0).any():
+            raise RuntimeError(
+                "Station weights must have positive mass per sample for weighted merge."
+            )
+        return station_weights / weight_sums
+
+    @staticmethod
+    def _weighted_station_merge(
+        x: torch.Tensor,
+        station_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        normalized = MultiStationTemporalEncoder._normalized_station_weights(
+            station_weights
+        )
+        return (x * normalized[:, :, None, None]).sum(dim=1)
+
     def forward(
         self, x: torch.Tensor, return_extra_level_features: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
@@ -579,10 +604,11 @@ class MultiStationTemporalEncoder(nn.Module):
                     x,
                     station_key_padding_mask=station_missing_mask,
                 )
-                x = x * level_weights
-                x = x * station_valid_scale
                 level_station_weights[level] = level_weights[:, :, 0, 0].detach()
-                if self.capture_attention_weights and level_block.last_attn_weights is not None:
+                if (
+                    self.capture_attention_weights
+                    and level_block.last_attn_weights is not None
+                ):
                     self.last_station_attn_weights_by_level[level] = (
                         level_block.last_attn_weights.detach()
                     )
@@ -597,14 +623,15 @@ class MultiStationTemporalEncoder(nn.Module):
                     x, station_key_padding_mask=station_missing_mask
                 )
                 x = x * station_valid_scale
+                bottleneck_weights = self.station_attention.last_station_weights
+                if bottleneck_weights is None:
+                    raise RuntimeError(
+                        "bottleneck_only station attention did not produce station weights."
+                    )
+                level_station_weights[self.depth - 1] = bottleneck_weights.detach()
                 if self.capture_attention_weights:
                     attn_map = self.station_attention.last_attn_weights
                     if attn_map is not None:
-                        bottleneck_weights = self._station_weights_from_attention_map(
-                            attn_map,
-                            station_key_padding_mask=station_missing_mask,
-                        ).detach()
-                        level_station_weights[self.depth - 1] = bottleneck_weights
                         self.last_station_attn_weights_by_level[self.depth - 1] = (
                             attn_map.detach()
                         )
@@ -631,10 +658,13 @@ class MultiStationTemporalEncoder(nn.Module):
                 x,
                 station_key_padding_mask=station_missing_mask,
             )
-            x = x * bottleneck_weights
-            x = x * station_valid_scale
-            level_station_weights[self.depth - 1] = bottleneck_weights[:, :, 0, 0].detach()
-            if self.capture_attention_weights and bottleneck_block.last_attn_weights is not None:
+            level_station_weights[self.depth - 1] = bottleneck_weights[
+                :, :, 0, 0
+            ].detach()
+            if (
+                self.capture_attention_weights
+                and bottleneck_block.last_attn_weights is not None
+            ):
                 self.last_station_attn_weights_by_level[self.depth - 1] = (
                     bottleneck_block.last_attn_weights.detach()
                 )
@@ -648,36 +678,54 @@ class MultiStationTemporalEncoder(nn.Module):
                 attention_inputs,
                 station_key_padding_mask=station_missing_mask,
             )
-            x = x * station_weights
-            for level in self.memory_levels:
-                raw_level_station_features[level] = (
-                    raw_level_station_features[level] * station_weights
-                )
             level_station_weights[self.depth - 1] = station_weights[:, :, 0, 0].detach()
-            if self.capture_attention_weights and self.station_attention.last_attn_weights is not None:
+            if (
+                self.capture_attention_weights
+                and self.station_attention.last_attn_weights is not None
+            ):
                 self.last_station_attn_weights_by_level[self.depth - 1] = (
                     self.station_attention.last_attn_weights.detach()
                 )
 
         if level_station_weights:
             self.last_station_weights_by_level = {
-                level: weights.detach() for level, weights in level_station_weights.items()
+                level: weights.detach()
+                for level, weights in level_station_weights.items()
             }
             self.last_station_weights_aggregate = (
                 torch.stack(list(self.last_station_weights_by_level.values()), dim=0)
                 .mean(dim=0)
                 .detach()
             )
+        else:
+            raise RuntimeError(
+                "No station attention weights were collected; weighted station merge cannot proceed."
+            )
 
-        # Permutation-invariant station merge.
-        bottleneck_features = x.max(dim=1).values  # [B, C, T']
+        merge_weights = self.last_station_weights_aggregate
+        if merge_weights is None:
+            raise RuntimeError(
+                "Station merge requires aggregate station attention weights, got None."
+            )
+
+        # Permutation-invariant weighted station merge.
+        bottleneck_features = self._weighted_station_merge(
+            x, merge_weights
+        )  # [B, C, T']
         self.last_bottleneck_effective_stride = self.bottleneck_stride
 
         target_tokens = self.memory_level_pool_to
         extra_level_features: dict[int, torch.Tensor] = {}
         self.last_extra_level_effective_strides = {}
         for level in self.memory_levels:
-            level_features = raw_level_station_features[level].max(dim=1).values
+            if level in self.last_station_weights_by_level:
+                level_merge_weights = self.last_station_weights_by_level[level]
+            else:
+                level_merge_weights = merge_weights
+            level_features = self._weighted_station_merge(
+                raw_level_station_features[level],
+                level_merge_weights,
+            )
             raw_length = level_features.shape[-1]
             if target_tokens is not None and raw_length > target_tokens:
                 level_features = F.adaptive_avg_pool1d(level_features, target_tokens)
@@ -822,11 +870,16 @@ class DETRTransformerDecoder(nn.Module):
 class DetectionHead(nn.Module):
     """Per-query prediction heads: class and temporal interval.
 
-    Intervals are parameterized as a ``center`` and a ``width`` (both squashed
-    to ``[0, 1]`` via sigmoid), then converted to ``start = center - width / 2``
-    and ``end = center + width / 2`` (clamped to ``[0, 1]``). This guarantees
-    ``0 <= start <= center <= end <= 1`` by construction. The returned keys are
-    controlled by ``interval_output_format``.
+    Supports two interval parameterizations controlled by
+    ``interval_output_format``:
+
+    - ``center_duration``: predicts ``center`` and ``duration`` (both in [0, 1]).
+        ``start/end`` are materialized later by normalization utilities.
+    - ``start_end``: predicts ``start`` and ``end`` directly (both in [0, 1]),
+        then enforces temporal ordering via element-wise min/max.
+
+    In both modes, a ``center`` key is returned so downstream loss/matching code
+    can use a shared interface.
     """
 
     def __init__(
@@ -849,8 +902,16 @@ class DetectionHead(nn.Module):
             )
 
         self.class_head = mlp(num_classes)
-        self.center_head = mlp(1)
-        self.width_head = mlp(1)
+        if self.interval_output_format == "start_end":
+            self.start_head = mlp(1)
+            self.end_head = mlp(1)
+            self.center_head = None
+            self.duration_head = None
+        else:
+            self.center_head = mlp(1)
+            self.duration_head = mlp(1)
+            self.start_head = None
+            self.end_head = None
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -861,27 +922,28 @@ class DetectionHead(nn.Module):
             Dict with keys:
                 - class_logits: [B, Nq, num_classes] (raw logits)
                 - if interval_output_format == "start_end":
-                    - center: [B, Nq, 1] in [0, 1]
                     - start: [B, Nq, 1] in [0, 1]
                     - end: [B, Nq, 1] in [0, 1]
+                    - center: [B, Nq, 1] in [0, 1]
                 - if interval_output_format == "center_duration":
                     - center: [B, Nq, 1] in [0, 1]
                     - duration: [B, Nq, 1] in [0, 1]
         """
-        center = torch.sigmoid(self.center_head(x))
-        half_width = 0.5 * torch.sigmoid(self.width_head(x))
-        start = (center - half_width).clamp(0.0, 1.0)
-        end = (center + half_width).clamp(0.0, 1.0)
-
-        predictions = {
-            "class_logits": self.class_head(x),
-            "center": center,
-        }
+        predictions = {"class_logits": self.class_head(x)}
         if self.interval_output_format == "start_end":
+            raw_start = torch.sigmoid(self.start_head(x))
+            raw_end = torch.sigmoid(self.end_head(x))
+            start = torch.minimum(raw_start, raw_end)
+            end = torch.maximum(raw_start, raw_end)
+            center = 0.5 * (start + end)
             predictions["start"] = start
             predictions["end"] = end
+            predictions["center"] = center
         else:
-            predictions["duration"] = end - start
+            center = torch.sigmoid(self.center_head(x))
+            duration = torch.sigmoid(self.duration_head(x))
+            predictions["center"] = center
+            predictions["duration"] = duration
         return predictions
 
 

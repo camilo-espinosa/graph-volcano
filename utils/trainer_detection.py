@@ -30,7 +30,6 @@ from utils.event_detection_metrics import EventDetectionMetrics
 from utils.event_targets import batch_segmentation_to_events
 from utils.validation_plots import plot_event_validation
 
-
 DEFAULT_DETR_LOSS_WEIGHTS = {
     "class_loss": 2.0,
     "bbox_loss": 5.0,
@@ -507,10 +506,34 @@ def train_one_event_detection_fold(
             per_class_iou_dict.get(class_id, 0.0) for class_id in range(1, 6)
         ]
 
-        # mean_f1 = average of per-class F1 scores
-        mean_f1 = float(np.mean(class_f1_scores)) if class_f1_scores else 0.0
-        # mean_iou = average of per-class IoU scores (actual IoU metric)
-        mean_iou = float(np.mean(class_iou_scores)) if class_iou_scores else 0.0
+        active_event_class_ids = [
+            class_id
+            for class_id in range(1, 6)
+            if int(per_class_stats[class_id]["target_count"]) > 0
+        ]
+        if len(active_event_class_ids) == 0:
+            raise RuntimeError(
+                "Validation set contains no active event classes (target_count=0 for all VT/LP/TR/AV/IC)."
+            )
+
+        # Canonical study metric: macro-F1 over active (present) non-background classes.
+        mean_f1 = float(
+            np.mean(
+                [
+                    float(per_class_f1_dict.get(class_id, 0.0))
+                    for class_id in active_event_class_ids
+                ]
+            )
+        )
+        # Keep IoU aggregation aligned with active event classes.
+        mean_iou = float(
+            np.mean(
+                [
+                    float(per_class_iou_dict.get(class_id, 0.0))
+                    for class_id in active_event_class_ids
+                ]
+            )
+        )
         class_precision_scores = [
             float(per_class_stats[class_id]["precision"]) for class_id in range(1, 6)
         ]
@@ -754,8 +777,31 @@ def train_one_event_detection_fold(
         float(test_detection_summary["per_class_iou"].get(class_id, 0.0))
         for class_id in range(1, 6)
     ]
-    test_mean_iou = (
-        float(np.mean(test_iou_per_class)) if test_iou_per_class else 0.0
+    test_per_class_stats = test_detection_summary["per_class"]
+    active_test_class_ids = [
+        class_id
+        for class_id in range(1, 6)
+        if int(test_per_class_stats[class_id]["target_count"]) > 0
+    ]
+    if len(active_test_class_ids) == 0:
+        raise RuntimeError(
+            "Test set contains no active event classes (target_count=0 for all VT/LP/TR/AV/IC)."
+        )
+    test_macro_f1_active = float(
+        np.mean(
+            [
+                float(test_detection_summary["per_class_f1"].get(class_id, 0.0))
+                for class_id in active_test_class_ids
+            ]
+        )
+    )
+    test_mean_iou = float(
+        np.mean(
+            [
+                float(test_detection_summary["per_class_iou"].get(class_id, 0.0))
+                for class_id in active_test_class_ids
+            ]
+        )
     )
     test_f1 = metrics_fn.compute_f1(
         all_test_predictions,
@@ -777,7 +823,7 @@ def train_one_event_detection_fold(
         "best_val_loss": float(best_val_loss),
         "best_val_mean_f1": float(best_val_mean_f1),
         "test_loss": float(avg_test_loss),
-        "test_mean_f1": float(test_f1),
+        "test_mean_f1": float(test_macro_f1_active),
         "test_mean_iou": float(test_mean_iou),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
         "test_iou_per_class": [float(x) for x in test_iou_per_class],
@@ -795,7 +841,9 @@ def train_one_event_detection_fold(
     print(f"Fold summary saved to {summary_path}")
     print(
         f"Fold {fold_id} complete | Best Epoch: {best_epoch + 1} | "
-        f"Test F1: {test_f1:.4f} | Test mAP: {test_metrics.get('mAP', 0.0):.4f} | "
+        f"Test Macro-F1(active): {test_macro_f1_active:.4f} | "
+        f"Test F1@0.5(global): {test_f1:.4f} | "
+        f"Test mAP: {test_metrics.get('mAP', 0.0):.4f} | "
         f"Elapsed: {fold_elapsed_sec / 60:.1f} min"
     )
 

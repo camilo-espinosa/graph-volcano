@@ -59,7 +59,7 @@ MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
 CONFIG = {
     "volcano": "NVCHVC",
     "batch_size": 16,
-    "epochs": 100,
+    "epochs": 5,
     "early_stop_patience": 10,
     "lr": 5e-4,
     "lr_final": 1e-6,
@@ -324,10 +324,7 @@ def main() -> None:
             f"lr={model_config['lr']:.3e} | lr_final={model_config['lr_final']:.3e}"
         )
         if spec["trainer_kind"] == "detr":
-            print(
-                f"[{model_key}] loss_weights="
-                f"{model_config['loss_weights']}"
-            )
+            print(f"[{model_key}] loss_weights=" f"{model_config['loss_weights']}")
 
         completed_folds = []
         remaining_folds = []

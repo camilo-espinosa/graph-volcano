@@ -320,12 +320,32 @@ def evaluate_detr_checkpoint(
         for class_id in range(1, 6)
     ]
 
-    if len(active_class_indices) > 0:
-        mean_f1 = float(np.mean([f1_per_class[i] for i in active_class_indices]))
-        mean_iou = float(np.mean([iou_per_class[i] for i in active_class_indices]))
-    else:
-        mean_f1 = float(np.mean(f1_per_class)) if len(f1_per_class) > 0 else 0.0
-        mean_iou = float(np.mean(iou_per_class)) if len(iou_per_class) > 0 else 0.0
+    per_class_stats = detection_summary["per_class"]
+    active_class_ids = [
+        class_id
+        for class_id in range(1, 6)
+        if int(per_class_stats[class_id]["target_count"]) > 0
+    ]
+    if len(active_class_ids) == 0:
+        raise RuntimeError(
+            "No active event classes found in DETR evaluation target set."
+        )
+    mean_f1 = float(
+        np.mean(
+            [
+                float(detection_summary["per_class_f1"].get(class_id, 0.0))
+                for class_id in active_class_ids
+            ]
+        )
+    )
+    mean_iou = float(
+        np.mean(
+            [
+                float(detection_summary["per_class_iou"].get(class_id, 0.0))
+                for class_id in active_class_ids
+            ]
+        )
+    )
 
     test_metrics = metrics_fn.evaluate_batch(all_predictions, all_targets)
     test_map = float(test_metrics.get("mAP", 0.0))
@@ -356,14 +376,26 @@ def load_checkpoint_into_model(
     device: torch.device,
     *,
     trainer_kind: str,
+    allowed_missing_keys: Sequence[str] = (),
+    ignore_checkpoint_keys: Sequence[str] = (),
 ) -> None:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    ckpt_state = ckpt["model_state_dict"]
+    ckpt_state = dict(ckpt["model_state_dict"])
 
-    if trainer_kind == "2d":
-        model.load_state_dict(ckpt_state)
-    else:
-        model.load_state_dict(ckpt_state, strict=False)
+    for key in ignore_checkpoint_keys:
+        ckpt_state.pop(str(key), None)
+
+    incompat = model.load_state_dict(ckpt_state, strict=False)
+    missing_keys = sorted(
+        set(incompat.missing_keys) - {str(key) for key in allowed_missing_keys}
+    )
+    unexpected_keys = sorted(set(incompat.unexpected_keys))
+    if len(missing_keys) > 0 or len(unexpected_keys) > 0:
+        raise RuntimeError(
+            "Checkpoint/model mismatch detected while loading state_dict. "
+            f"checkpoint={checkpoint_path} trainer_kind={trainer_kind} "
+            f"missing_keys={missing_keys} unexpected_keys={unexpected_keys}"
+        )
 
     del ckpt
     cleanup_gpu_cache()
