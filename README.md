@@ -1,6 +1,18 @@
 # Graph Volcano
 
-Graph Volcano contains the training and evaluation pipelines for volcano-seismic segmentation experiments, including NVCHVC 5-fold experiments and leave-one-out cross-volcano protocols.
+Training and evaluation pipelines for volcano-seismic waveform segmentation and event detection, with 5-fold NVCHVC experiments and leave-one-out cross-volcano protocols.
+
+## Models
+
+### MuSSeg
+Multi-station seismic segmentation model. U-Net-based temporal encoder operating on multi-station waveform inputs `[B, S, T]`. Produces per-timestep class probabilities via pixel-wise segmentation. Supports station-level message passing and attention mechanisms to capture inter-station relationships.
+
+**Objective**: assign a seismic class label (noise, tremor, explosion, etc.) to every time step across all stations.
+
+### MuSSED
+Multi-Station Seismic Event Detection. DETR-inspired model built on top of the MuSSeg encoder. A transformer decoder with a fixed set of learnable event queries attends to the encoded temporal features and predicts a set of events, each with class, center time, start time, end time, and confidence.
+
+**Objective**: detect and localize a fixed number of discrete seismic events from continuous multi-station waveform streams.
 
 ## Repository Layout
 
@@ -20,20 +32,16 @@ pip install -r requirements.txt
 
 ## Script Reference (Current)
 
-- `scripts/01_prepare_data.py`: builds NVCHVC prepared data and 5-fold manifests.
-- `scripts/01b_prepare_cross-volcano_data.py`: builds leave-one-out cross-volcano manifests under `data/prepared_data/cross_volcano_loo/`.
-- `scripts/01c_edge_data.py`: precomputes legacy graph-oriented edge features and RSAM artifacts.
+- `scripts/01_prepare_data.py`: generates NVCHVC 5-fold dataset with inner validation and train-only augmentation.
+- `scripts/01b_prepare_cross-volcano_data.py`: prepares progressive finetuning splits (80/20) for CAU, VCA, and LDM target volcanoes.
 - `scripts/02_ablation_tests.py`: runs 5-fold training for the active registry models on NVCHVC.
 - `scripts/02b_aggregate_ablation_results.py`: re-aggregates already completed ablation folds into summary/comparison tables.
 - `scripts/03_evaluate_nvchvc_station_scramble.py`: evaluates NVCHVC fold test sets with randomly scrambled station ordering.
 - `scripts/04_zero_shot_cross_volcano.py`: evaluates trained checkpoints in zero-shot mode on the progressive-finetuning held-out test sets.
 - `scripts/04b_zero_shot_cross_volcano_scrambled.py`: zero-shot evaluation on the same test sets with randomly scrambled station ordering.
-- `scripts/05_progressive_finetuning.py`: placeholder for the progressive finetuning workflow.
+- `scripts/05_progressive_finetuning.py`: progressive finetuning workflow for target volcano splits.
 - `scripts/06_continuous_tests.py`: placeholder for the continuous tests workflow.
-- `scripts/07_detection_heads.py`: placeholder for the detection heads workflow.
-- `scripts/cross_volcano_leave_one_out.py`: preserved leave-one-out cross-volcano training/evaluation protocol.
-- `scripts/cross_volcano_leave_one_out_eval_only.py`: preserved eval-only leave-one-out cross-volcano script.
-- `scripts/ablation_param_counts.py`: prints parameter counts for ablation variants.
+- `scripts/ablation_param_counts.py`: instantiates all registry models and prints parameter counts.
 
 ## Typical Workflow
 
@@ -44,7 +52,6 @@ Run scripts from the repository root.
 ```bash
 python scripts/01_prepare_data.py
 python scripts/01b_prepare_cross-volcano_data.py
-python scripts/01c_edge_data.py
 ```
 
 ### 2. Train ablation models (5-fold)
@@ -72,12 +79,6 @@ python scripts/04_zero_shot_cross_volcano.py
 python scripts/04b_zero_shot_cross_volcano_scrambled.py
 ```
 
-### 6. Run leave-one-out cross-volcano training/evaluation
-
-```bash
-python scripts/cross_volcano_leave_one_out.py
-```
-
 ## Outputs
 
 - Main experiment outputs are written to `results/experiments/<experiment_name>/`.
@@ -85,7 +86,4 @@ python scripts/cross_volcano_leave_one_out.py
 - `results/latest/` stores pointers to most recent artifacts.
 - The active evaluation scripts now write model-centric outputs without a `family` column in their new fold/summary CSVs.
 
-## Notes
 
-- Use `README_SCRIPTS_DETAILED.md` for a script-by-script technical breakdown.
-- Script status in this README reflects the current repository files.
