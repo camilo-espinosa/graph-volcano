@@ -86,6 +86,4 @@ python scripts/04b_zero_shot_cross_volcano_scrambled.py
 - `results/latest/` stores pointers to most recent artifacts.
 - The active evaluation scripts now write model-centric outputs without a `family` column in their new fold/summary CSVs.
 
-## Notes
 
-- Script status in this README reflects the current repository files.
