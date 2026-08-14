@@ -66,7 +66,7 @@ CONFIG = {
     "dice_weight": 0.7,
     "ce_weight": 0.3,
     "val_plot_events": 5,
-    "save_confusion_matrix_each_epoch": True,
+    "save_confusion_matrix_each_epoch": False,
     "seed": 42,
     "val_plot_samples_per_class": 2,
     "val_plot_forward_batch_size": 5,
@@ -80,16 +80,6 @@ FOLDS = range(1, 6)
 #   lr_eff = lr_base * (batch_size / lr_scale_ref_batch) ** lr_scale_alpha
 LR_SCALE_REF_BATCH = 16
 LR_SCALE_ALPHA = -0.25
-
-# Default DETR event-loss weights used when a model spec does not define
-# loss_weights explicitly.
-DEFAULT_DETR_LOSS_WEIGHTS = {
-    "class": 2.0,
-    "bbox": 5.0,
-    "giou": 2.0,
-    "confidence": 2.0,
-}
-
 
 # ------------------------------ PATHS AND OUTPUTS -------------------------------
 DATA_ROOT = PROJECT_ROOT / "data" / "prepared_data" / CONFIG["volcano"] / "cv_5fold"
@@ -217,12 +207,12 @@ def select_folds(raw_folds: str | None) -> list[int]:
 
 
 def resolve_detr_loss_weights(spec: dict) -> dict[str, float]:
-    """Return model-specific DETR loss weights with defaults filled in."""
+    """Return explicit model-specific DETR loss weights, if defined."""
     if spec.get("trainer_kind") != "detr":
         return {}
 
     raw = spec.get("loss_weights") or {}
-    weights = dict(DEFAULT_DETR_LOSS_WEIGHTS)
+    weights: dict[str, float] = {}
     for key in ("class", "bbox", "giou", "confidence"):
         if key in raw:
             weights[key] = float(raw[key])
@@ -317,14 +307,21 @@ def main() -> None:
         )
         model_config["lr"] = float(scaled_lr)
         model_config["lr_final"] = float(scaled_lr_final)
-        model_config["loss_weights"] = resolve_detr_loss_weights(spec)
+        explicit_loss_weights = resolve_detr_loss_weights(spec)
+        if explicit_loss_weights:
+            model_config["loss_weights"] = explicit_loss_weights
 
         print(
             f"[{model_key}] batch_size={model_batch_size} | "
             f"lr={model_config['lr']:.3e} | lr_final={model_config['lr_final']:.3e}"
         )
         if spec["trainer_kind"] == "detr":
-            print(f"[{model_key}] loss_weights=" f"{model_config['loss_weights']}")
+            if "loss_weights" in model_config:
+                print(f"[{model_key}] loss_weights=" f"{model_config['loss_weights']}")
+            else:
+                print(
+                    f"[{model_key}] loss_weights=<trainer defaults>"
+                )
 
         completed_folds = []
         remaining_folds = []

@@ -70,10 +70,17 @@ MUSSED_BASE_KWARGS: dict[str, Any] = {
     "hidden_dim": 256,
     "num_decoder_heads": 4,
     "num_decoder_layers": 1,
-    "decoder_dropout": 0.1,
+    "decoder_dropout": 0.05,
     "use_temporal_projection": False,
     "station_attention_mode": "per_level_memory_levels",
     "interval_output_format": "center_duration",
+}
+
+MUSSED_DEFAULT_LOSS_WEIGHTS: dict[str, float] = {
+    "class": 2.0,
+    "bbox": 2.0,
+    "giou": 2.0,
+    "confidence": 2.0,
 }
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
@@ -106,6 +113,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "trainer_kind": "detr",
         "model_cls": MuSSED,
         "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": deepcopy(MUSSED_DEFAULT_LOSS_WEIGHTS),
         "batch_size": 20,
     },
     # -------------------------------------------------------------------

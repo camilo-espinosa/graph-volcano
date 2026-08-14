@@ -32,7 +32,7 @@ from utils.validation_plots import plot_event_validation
 
 DEFAULT_DETR_LOSS_WEIGHTS = {
     "class_loss": 2.0,
-    "bbox_loss": 5.0,
+    "bbox_loss": 2.0,
     "giou_loss": 2.0,
     "unmatched_query": 2.0,
 }
@@ -546,6 +546,12 @@ def train_one_event_detection_fold(
         mean_recall = (
             float(np.mean(class_recall_scores)) if class_recall_scores else 0.0
         )
+
+        if float(avg_train_loss) < float(best_train_loss):
+            best_train_loss = float(avg_train_loss)
+
+        if float(avg_val_loss) < float(best_val_loss):
+            best_val_loss = float(avg_val_loss)
 
         is_best_val_mean_f1_epoch = mean_f1 > best_val_mean_f1
         if is_best_val_mean_f1_epoch:
