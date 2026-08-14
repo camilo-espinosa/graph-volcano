@@ -36,3 +36,6 @@ architecture.pdf
 model_reqs.md
 working notes.md
 scripts/04_cross-volcano.py
+
+*.md
+!README.md
