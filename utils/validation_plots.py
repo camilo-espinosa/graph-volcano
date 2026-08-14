@@ -23,9 +23,6 @@ import torch
 from utils import data_utils
 from utils.detection_prediction_utils import normalize_prediction_intervals
 
-# Keep delivered attention artifacts compact for plotting diagnostics.
-MAX_TEMPORAL_ATTN_POINTS = 16
-
 
 def plot_segmentation_validation(
     model: torch.nn.Module,
@@ -153,7 +150,7 @@ def plot_event_validation(
     class_names: list = None,
     extract_attention: bool = True,
     attention_mode: str = "full",
-    forward_batch_size: int = 5,
+    forward_batch_size: int = 2,
 ) -> int:
     """
     Generate validation plots for event detection models (MuSSED).
@@ -168,7 +165,7 @@ def plot_event_validation(
         class_names: List of class names
         extract_attention: Backward-compat flag. If False, attention_mode is forced to "none"
         attention_mode: One of {"none", "station", "full"}
-        forward_batch_size: Max plotting forward micro-batch size
+        forward_batch_size: Max plotting forward micro-batch size (capped at 2)
 
     Returns:
         Number of plots saved
@@ -193,6 +190,7 @@ def plot_event_validation(
         )
     if forward_batch_size < 1:
         raise ValueError(f"forward_batch_size must be >= 1, got {forward_batch_size}.")
+    forward_batch_size = min(forward_batch_size, 2)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -981,20 +979,6 @@ class TemporalAttentionHook(AttentionHook):
         row_max = attn_np.max(axis=-1, keepdims=True)
         attn_np = (attn_np - row_min) / (row_max - row_min + 1e-8)
         attn_np = np.clip(attn_np, 0.0, 1.0)
-
-        # Downsample temporal attention traces for compact delivery to plotting.
-        if (
-            isinstance(MAX_TEMPORAL_ATTN_POINTS, int)
-            and MAX_TEMPORAL_ATTN_POINTS > 0
-            and attn_np.shape[1] > MAX_TEMPORAL_ATTN_POINTS
-        ):
-            idx = np.linspace(
-                0,
-                attn_np.shape[1] - 1,
-                num=MAX_TEMPORAL_ATTN_POINTS,
-                dtype=np.int64,
-            )
-            attn_np = attn_np[:, idx]
 
         self.attention_weights = attn_np.astype(np.float16)
         module.last_attn_weights = None

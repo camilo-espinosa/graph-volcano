@@ -570,19 +570,6 @@ def train_one_event_detection_fold(
                 checkpoints_dir / "best_f1.pt",
             )
 
-            # Generate validation event plots on best epoch
-            saved_plot_count = plot_event_validation(
-                model=model,
-                dataloader=val_loader,
-                device=device,
-                output_dir=val_plot_dir,
-                epoch=epoch,
-                samples_per_class=config.get("val_plot_samples_per_class", 2),
-                extract_attention=True,
-                attention_mode=config.get("best_epoch_attention_mode", "station"),
-                forward_batch_size=config.get("val_plot_forward_batch_size", 5),
-            )
-
             # Confusion matrix from the same matching pass used for F1/IoU.
             val_cm = detection_summary["confusion_matrix"]
 
@@ -600,6 +587,7 @@ def train_one_event_detection_fold(
                 out_path=cm_dir / f"confusion_matrix_epoch_{epoch:03d}.png",
                 title=f"Event Detection Confusion Matrix - Fold {fold_id} - Epoch {epoch + 1}",
             )
+            saved_plot_count = 0
         else:
             epochs_without_improvement += 1
             saved_plot_count = 0
@@ -722,7 +710,7 @@ def train_one_event_detection_fold(
             samples_per_class=config.get("val_plot_samples_per_class", 2),
             extract_attention=True,
             attention_mode=config.get("final_attention_mode", "full"),
-            forward_batch_size=config.get("val_plot_forward_batch_size", 5),
+            forward_batch_size=min(2, config.get("val_plot_forward_batch_size", 2)),
         )
         print(
             "Final best-checkpoint attention plots saved: "

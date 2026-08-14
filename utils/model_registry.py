@@ -72,7 +72,7 @@ MUSSED_BASE_KWARGS: dict[str, Any] = {
     "num_decoder_layers": 1,
     "decoder_dropout": 0.05,
     "use_temporal_projection": False,
-    "station_attention_mode": "per_level_memory_levels",
+    "station_feature_fusion": "max",
     "interval_output_format": "center_duration",
 }
 
@@ -288,7 +288,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "batch_size": 20,
     },
     # -------------------------------------------------------------------
-    # Stage 5: station attention mode
+    # Stage 5: station fusion mode
     # -------------------------------------------------------------------
     "mussed_s5_a_pl": {
         "family": "detr",
@@ -303,7 +303,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "station_attention_mode": "bottleneck_only",
+            "station_feature_fusion": "max",
         },
         "batch_size": 20,
     },
@@ -313,7 +313,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_cls": MuSSED,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
-            "station_attention_mode": "shared_memory_levels",
+            "station_feature_fusion": "mean",
         },
         "batch_size": 20,
     },
