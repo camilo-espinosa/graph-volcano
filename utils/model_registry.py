@@ -90,6 +90,14 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # -------------------------------------------------------------------
     # Targeted probe: expressive shared detection head
     # -------------------------------------------------------------------
+    "mussed_base": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
+        "loss_weights": deepcopy(MUSSED_DEFAULT_LOSS_WEIGHTS),
+        "batch_size": 20,
+    },
     "mussed_head384_shared_trunk": {
         "family": "detr",
         "trainer_kind": "detr",
@@ -105,14 +113,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "use_temporal_projection": True,
             "memory_levels": [0, 1, 2],
         },
-        "batch_size": 20,
-    },
-    "mussed_base": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
-        "loss_weights": deepcopy(MUSSED_DEFAULT_LOSS_WEIGHTS),
         "batch_size": 20,
     },
     # -------------------------------------------------------------------
