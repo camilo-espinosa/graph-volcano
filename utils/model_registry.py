@@ -72,7 +72,6 @@ MUSSED_BASE_KWARGS: dict[str, Any] = {
     "num_decoder_layers": 1,
     "decoder_dropout": 0.05,
     "use_temporal_projection": False,
-    "station_feature_fusion": "max",
     "interval_output_format": "center_duration",
 }
 
@@ -288,36 +287,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "batch_size": 20,
     },
     # -------------------------------------------------------------------
-    # Stage 5: station fusion mode
-    # -------------------------------------------------------------------
-    "mussed_s5_a_pl": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": deepcopy(MUSSED_BASE_KWARGS),
-        "batch_size": 20,
-    },
-    "mussed_s5_a_bo": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "station_feature_fusion": "max",
-        },
-        "batch_size": 20,
-    },
-    "mussed_s5_a_sm": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "station_feature_fusion": "mean",
-        },
-        "batch_size": 20,
-    },
-    # -------------------------------------------------------------------
     # Stage 6: decoder depth (run last)
     # -------------------------------------------------------------------
     "mussed_s6_n1": {
@@ -344,6 +313,51 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "num_decoder_layers": 3,
+        },
+        "batch_size": 20,
+    },
+    # -------------------------------------------------------------------
+    # Stage 7: native-resolution multiscale memory
+    # Only memory_levels changes; all other architecture/training settings
+    # remain fixed to the established MuSSED baseline.
+    # -------------------------------------------------------------------
+    "mussed_s7_m0_l3": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [],
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m1_l23": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [2],
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m2_l123": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [1, 2],
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
         },
         "batch_size": 20,
     },

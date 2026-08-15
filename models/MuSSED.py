@@ -76,16 +76,6 @@ def _validate_memory_levels(
     return tuple(levels)
 
 
-def _validate_station_feature_fusion(value: str) -> str:
-    allowed_values = {"max", "mean"}
-    if value not in allowed_values:
-        raise ValueError(
-            "station_feature_fusion must be one of "
-            f"{sorted(allowed_values)}, got {value!r}."
-        )
-    return value
-
-
 def _validate_detection_head_mode(value: str) -> str:
     allowed_values = {"independent", "shared_trunk"}
     if value not in allowed_values:
@@ -206,8 +196,9 @@ class MultiStationTemporalEncoder(nn.Module):
 
     Each station is processed independently by shared convolutions. Stations
     interact once via attention at the deepest level, a temporal bottleneck
-    attention injects global context, and stations are merged with a fixed
-    permutation-invariant reduction over the station axis.
+    attention injects global context, and fusion is fixed by design:
+    bottleneck uses station-attention-derived weights while non-bottleneck
+    memory levels use plain max over stations.
 
     Input:  [B, S, T]  (or [B, S, 1, T]); each station is a single waveform.
     Output: [B, C, T'] with C = filters_root * 2**(depth - 1) and
@@ -228,7 +219,6 @@ class MultiStationTemporalEncoder(nn.Module):
         station_attn_ff_mult: int,
         station_mask_abs_sum_threshold: float = 0.0,
         memory_levels: Sequence[int] = (),
-        station_feature_fusion: str = "max",
     ):
         super().__init__()
         if depth < 2:
@@ -247,9 +237,6 @@ class MultiStationTemporalEncoder(nn.Module):
         self.strides = _broadcast_level_param("stride", stride, self.depth - 1)
         self.use_bottleneck_attention = bool(bottleneck_attention)
         self.station_mask_abs_sum_threshold = float(station_mask_abs_sum_threshold)
-        self.station_feature_fusion = _validate_station_feature_fusion(
-            station_feature_fusion
-        )
         self.memory_levels = _validate_memory_levels(memory_levels, self.depth)
 
         # Shared per-station stem: 1 channel -> filters_root.
@@ -342,32 +329,49 @@ class MultiStationTemporalEncoder(nn.Module):
         return y.reshape(bsz, n_stations, channels, y.shape[-1])
 
     @staticmethod
-    def _merge_stations(
+    def _merge_stations_max(
         x: torch.Tensor,
         station_missing_mask: torch.Tensor,
-        mode: str,
     ) -> torch.Tensor:
-        if mode == "max":
-            valid_mask = (~station_missing_mask)[:, :, None, None]
-            x_masked = torch.where(valid_mask, x, torch.full_like(x, -torch.inf))
-            merged = x_masked.max(dim=1).values
-            if not torch.isfinite(merged).all():
-                raise RuntimeError(
-                    "Non-finite values encountered during max station fusion."
-                )
-            return merged
+        valid_mask = (~station_missing_mask)[:, :, None, None]
+        x_masked = torch.where(valid_mask, x, torch.full_like(x, -torch.inf))
+        merged = x_masked.max(dim=1).values
+        if not torch.isfinite(merged).all():
+            raise RuntimeError(
+                "Non-finite values encountered during max station fusion."
+            )
+        return merged
 
-        if mode == "mean":
-            valid = (~station_missing_mask).to(x.dtype)[:, :, None, None]
-            summed = (x * valid).sum(dim=1)
-            counts = valid.sum(dim=1)
-            if (counts <= 0).any():
-                raise RuntimeError(
-                    "Mean station fusion requires at least one valid station per sample."
-                )
-            return summed / counts
-
-        raise ValueError(f"Unsupported station fusion mode: {mode!r}.")
+    @staticmethod
+    def _merge_bottleneck_with_attention(
+        x: torch.Tensor,
+        station_missing_mask: torch.Tensor,
+        station_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if station_weights is None:
+            raise RuntimeError(
+                "Missing bottleneck station-attention weights for station fusion."
+            )
+        if station_weights.shape != station_missing_mask.shape:
+            raise RuntimeError(
+                "Station-attention weights and station mask shape mismatch: "
+                f"{tuple(station_weights.shape)} vs {tuple(station_missing_mask.shape)}."
+            )
+        weights = station_weights.to(dtype=x.dtype)
+        weights = weights.masked_fill(station_missing_mask, 0.0)
+        weight_sums = weights.sum(dim=1, keepdim=True)
+        if (weight_sums <= 0).any():
+            raise RuntimeError(
+                "Encountered zero bottleneck station-attention weight sum "
+                "after masking missing stations."
+            )
+        normalized_weights = weights / weight_sums
+        merged = (x * normalized_weights[:, :, None, None]).sum(dim=1)
+        if not torch.isfinite(merged).all():
+            raise RuntimeError(
+                "Non-finite values encountered during bottleneck station fusion."
+            )
+        return merged
 
     def forward(
         self, x: torch.Tensor, return_extra_level_features: bool = False
@@ -396,6 +400,7 @@ class MultiStationTemporalEncoder(nn.Module):
         x = x * station_valid_scale
 
         raw_level_station_features: dict[int, torch.Tensor] = {}
+        bottleneck_station_weights: torch.Tensor | None = None
         self.station_attention.capture_attention_weights = (
             self.capture_attention_weights
         )
@@ -410,6 +415,7 @@ class MultiStationTemporalEncoder(nn.Module):
                 x = self.station_attention(
                     x, station_key_padding_mask=station_missing_mask
                 )
+                bottleneck_station_weights = self.station_attention.last_station_weights
                 x = x * station_valid_scale
             if conv_down is not None:
                 x = self._pad_for_downsample(
@@ -428,21 +434,20 @@ class MultiStationTemporalEncoder(nn.Module):
             x = x.reshape(bsz, n_stations, channels, t_len)
             x = x * station_valid_scale
 
-        # Permutation-invariant station fusion.
-        bottleneck_features = self._merge_stations(
+        # Bottleneck uses station-attention-derived weighted fusion.
+        bottleneck_features = self._merge_bottleneck_with_attention(
             x,
             station_missing_mask,
-            mode=self.station_feature_fusion,
+            bottleneck_station_weights,
         )  # [B, C, T']
         self.last_bottleneck_effective_stride = self.bottleneck_stride
 
         extra_level_features: dict[int, torch.Tensor] = {}
         self.last_extra_level_effective_strides = {}
         for level in self.memory_levels:
-            level_features = self._merge_stations(
+            level_features = self._merge_stations_max(
                 raw_level_station_features[level],
                 station_missing_mask,
-                mode=self.station_feature_fusion,
             )
             extra_level_features[level] = level_features
             self.last_extra_level_effective_strides[level] = float(
@@ -738,9 +743,8 @@ class MuSSED(nn.Module):
         station_attn_ff_mult: int = 2,
         station_mask_abs_sum_threshold: float = 0.0,
         memory_levels: Sequence[int] = (),
-        station_feature_fusion: str = "max",
         # --- Detection decoder / heads ---
-        num_queries: int = 10,
+        num_queries: int = 1,
         query_dim: int = 128,
         hidden_dim: int = 256,
         decoder_ffn_dim: int | None = None,
@@ -789,7 +793,6 @@ class MuSSED(nn.Module):
             station_attn_ff_mult=station_attn_ff_mult,
             station_mask_abs_sum_threshold=station_mask_abs_sum_threshold,
             memory_levels=memory_levels,
-            station_feature_fusion=station_feature_fusion,
         )
 
         encoder_channels = self.encoder.output_channels
