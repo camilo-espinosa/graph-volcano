@@ -587,7 +587,19 @@ def train_one_event_detection_fold(
                 out_path=cm_dir / f"confusion_matrix_epoch_{epoch:03d}.png",
                 title=f"Event Detection Confusion Matrix - Fold {fold_id} - Epoch {epoch + 1}",
             )
-            saved_plot_count = 0
+
+            # Save plots on every F1 improvement epoch without attention overlays.
+            saved_plot_count = plot_event_validation(
+                model=model,
+                dataloader=val_loader,
+                device=device,
+                output_dir=val_plot_dir / f"epoch_{epoch + 1:03d}_best_f1",
+                epoch=int(epoch),
+                samples_per_class=config.get("val_plot_samples_per_class", 2),
+                extract_attention=False,
+                attention_mode="none",
+                forward_batch_size=min(2, config.get("val_plot_forward_batch_size", 2)),
+            )
         else:
             epochs_without_improvement += 1
             saved_plot_count = 0

@@ -59,7 +59,7 @@ MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
 CONFIG = {
     "volcano": "NVCHVC",
     "batch_size": 16,
-    "epochs": 2,
+    "epochs": 100,
     "early_stop_patience": 15,
     "lr": 5e-4,
     "lr_final": 1e-6,

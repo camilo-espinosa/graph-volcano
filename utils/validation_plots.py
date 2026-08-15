@@ -916,8 +916,24 @@ class StationAttentionHook(AttentionHook):
     def _hook_fn(self, module, input, output):
         """
         Capture station attention from attention module.
-        Uses StationAttentionBlock.last_attn_weights with shape [B, H, S, S].
+        Uses StationAttentionBlock.last_station_weights with shape [B, S].
         """
+        station_weights = getattr(module, "last_station_weights", None)
+        if station_weights is not None:
+            if (
+                not isinstance(station_weights, torch.Tensor)
+                or station_weights.ndim != 2
+            ):
+                raise RuntimeError(
+                    "Station attention capture expected tensor [B, S] in last_station_weights."
+                )
+            attn_np = station_weights.detach().cpu().numpy()
+            batch_min = attn_np.min(axis=-1, keepdims=True)
+            batch_max = attn_np.max(axis=-1, keepdims=True)
+            attn_np = (attn_np - batch_min) / (batch_max - batch_min + 1e-8)
+            self.attention_weights = np.clip(attn_np, 0.0, 1.0).astype(np.float16)
+            return
+
         aggregated = getattr(module, "last_station_weights_aggregate", None)
         if isinstance(aggregated, torch.Tensor):
             if aggregated.ndim != 2:
