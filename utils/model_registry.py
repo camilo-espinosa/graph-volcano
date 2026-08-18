@@ -88,6 +88,207 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # Progressive search set: keep encoder fixed and keep num_queries=1.
     # ===================================================================
     # -------------------------------------------------------------------
+    # Stage 7: native-resolution multiscale memory
+    # Only memory_levels changes; all other architecture/training settings
+    # remain fixed to the established MuSSED baseline.
+    # -------------------------------------------------------------------
+    "mussed_s7_m3_l0123": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_f384": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "decoder_ffn_dim": 384,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_n2": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "num_decoder_layers": 2,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_n2_f384": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "num_decoder_layers": 2,
+            "decoder_ffn_dim": 384,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_n2_f384_h384": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "num_decoder_layers": 2,
+            "decoder_ffn_dim": 384,
+            "head_hidden_dim": 384,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_q192": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "query_dim": 192,
+            "use_temporal_projection": True,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_loc_b6_g3": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+        },
+        "loss_weights": {
+            "class": 2.0,
+            "bbox": 6.0,
+            "giou": 3.0,
+            "confidence": 2.0,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_n3": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "num_decoder_layers": 3,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_f192": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "decoder_ffn_dim": 192,
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_shared_trunk": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "detection_head_mode": "shared_trunk",
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_f192_shared_trunk": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "decoder_ffn_dim": 192,
+            "detection_head_mode": "shared_trunk",
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_f384_shared_trunk": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "decoder_ffn_dim": 384,
+            "detection_head_mode": "shared_trunk",
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_n2_shared_trunk": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "num_decoder_layers": 2,
+            "detection_head_mode": "shared_trunk",
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m3_l0123_n3_shared_trunk": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "num_decoder_layers": 3,
+            "detection_head_mode": "shared_trunk",
+        },
+        "batch_size": 20,
+    },
+    "mussed_s7_m1_l23": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [2],
+        },
+        "batch_size": 20,
+    },  
+    "mussed_s7_m2_l123": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [1, 2],
+        },
+        "batch_size": 20,
+    },           
+    "mussed_s7_m0_l3": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [],
+        },
+        "batch_size": 20,
+    },
+    # -------------------------------------------------------------------
     # Targeted probe: expressive shared detection head
     # -------------------------------------------------------------------
     "mussed_base": {
@@ -316,51 +517,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         },
         "batch_size": 20,
     },
-    # -------------------------------------------------------------------
-    # Stage 7: native-resolution multiscale memory
-    # Only memory_levels changes; all other architecture/training settings
-    # remain fixed to the established MuSSED baseline.
-    # -------------------------------------------------------------------
-    "mussed_s7_m0_l3": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [],
-        },
-        "batch_size": 20,
-    },
-    "mussed_s7_m1_l23": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [2],
-        },
-        "batch_size": 20,
-    },
-    "mussed_s7_m2_l123": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [1, 2],
-        },
-        "batch_size": 20,
-    },
-    "mussed_s7_m3_l0123": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [0, 1, 2],
-        },
-        "batch_size": 20,
-    },
+
     # # ===================================================================
     # # ACTIVE: 5-FOLD SELECTION
     # # ===================================================================
