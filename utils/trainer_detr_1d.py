@@ -231,9 +231,9 @@ class DETRTrainer:
         f1_score = self.metrics_fn.compute_f1(
             predictions_for_metrics,
             all_targets,
-            iou_threshold=0.5,
+            iou_threshold=0.3,
         )
-        metrics_dict["F1@0.5"] = f1_score
+        metrics_dict["F1@0.3"] = f1_score
 
         # Add loss to metrics
         metrics_dict["loss_val"] = total_loss / num_batches
@@ -305,7 +305,7 @@ class DETRTrainer:
                 history["val_metrics"].append(val_metrics)
 
                 current_map = val_metrics.get("mAP", 0.0)
-                f1_score = val_metrics.get("F1@0.5", 0.0)
+                f1_score = val_metrics.get("F1@0.3", 0.0)
                 mean_iou = np.mean(
                     [
                         val_metrics.get(f"mAP@{t:.1f}", 0.0)
@@ -315,7 +315,7 @@ class DETRTrainer:
 
                 print(
                     f"  Val Loss: {val_metrics['loss_val']:.4f} | "
-                    f"mAP: {current_map:.4f} | F1@0.5: {f1_score:.4f} | Mean IoU: {mean_iou:.4f}"
+                    f"mAP: {current_map:.4f} | F1@0.3: {f1_score:.4f} | Mean IoU: {mean_iou:.4f}"
                 )
 
                 # Save best checkpoint

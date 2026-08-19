@@ -12,7 +12,7 @@ from utils.detection_prediction_utils import normalize_prediction_intervals
 from utils.detr_event_loss import DETREventLoss
 from utils.event_detection_metrics import EventDetectionMetrics
 from utils.event_targets import batch_segmentation_to_events
-from utils.trainer_detection import _resolve_detr_loss_weights
+from utils.trainer_detection import _resolve_detr_eval_matching, _resolve_detr_loss_weights
 from utils.train_utils import (
     MultiStation1DDataset,
     UNetPatchDataset,
@@ -271,6 +271,7 @@ def evaluate_detr_checkpoint(
     )
 
     loss_weights = _resolve_detr_loss_weights(model_spec=model_spec, config={})
+    eval_matching = _resolve_detr_eval_matching(model_spec=model_spec, config={})
     loss_fn = DETREventLoss(num_classes=6, loss_weights=loss_weights)
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
@@ -309,7 +310,9 @@ def evaluate_detr_checkpoint(
     detection_summary = metrics_fn.compute_detection_summary(
         all_predictions,
         all_targets,
-        iou_threshold=0.5,
+        iou_threshold=float(eval_matching["match_iou_threshold"]),
+        matching_strategy=str(eval_matching["matching_strategy"]),
+        overlap_recall_threshold=float(eval_matching["overlap_recall_threshold"]),
     )
     f1_per_class = [
         float(detection_summary["per_class_f1"].get(class_id, 0.0))

@@ -24,9 +24,9 @@ from utils.train_utils import (
     BalancedBatchSampler,
 )
 from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.model_registry import get_model_spec
+from utils.model_registry import DETR_EVAL_DEFAULTS, get_model_spec
 from utils.detr_event_loss import DETREventLoss
-from utils.event_detection_metrics import EventDetectionMetrics
+from utils.event_detection_metrics import EventDetectionMetrics, is_interval_match
 from utils.event_targets import batch_segmentation_to_events
 from utils.validation_plots import plot_event_validation
 
@@ -74,10 +74,56 @@ def _resolve_detr_loss_weights(model_spec: dict, config: dict) -> dict[str, floa
     return resolved
 
 
+def _resolve_detr_eval_matching(model_spec: dict, config: dict) -> dict[str, float | str]:
+    """Resolve DETR evaluation matching settings with config > model spec > defaults."""
+    resolved: dict[str, float | str] = dict(DETR_EVAL_DEFAULTS)
+
+    spec_eval = model_spec.get("eval_matching")
+    if isinstance(spec_eval, dict):
+        resolved.update(spec_eval)
+
+    config_eval: dict[str, float | str] = {}
+    if "match_iou_threshold" in config:
+        config_eval["match_iou_threshold"] = float(config["match_iou_threshold"])
+    if "matching_strategy" in config:
+        config_eval["matching_strategy"] = str(config["matching_strategy"])
+    if "overlap_recall_threshold" in config:
+        config_eval["overlap_recall_threshold"] = float(
+            config["overlap_recall_threshold"]
+        )
+    resolved.update(config_eval)
+
+    strategy = str(resolved.get("matching_strategy", "iou")).strip().lower()
+    if strategy not in {"iou", "overlap_recall", "dual"}:
+        raise ValueError(
+            "matching_strategy must be one of {'iou', 'overlap_recall', 'dual'}, "
+            f"got {strategy!r}."
+        )
+
+    iou_threshold = float(resolved.get("match_iou_threshold", 0.3))
+    overlap_threshold = float(resolved.get("overlap_recall_threshold", 0.8))
+
+    if not (0.0 <= iou_threshold <= 1.0):
+        raise ValueError(
+            f"match_iou_threshold must be in [0, 1], got {iou_threshold}."
+        )
+    if not (0.0 <= overlap_threshold <= 1.0):
+        raise ValueError(
+            "overlap_recall_threshold must be in [0, 1], got "
+            f"{overlap_threshold}."
+        )
+
+    return {
+        "match_iou_threshold": iou_threshold,
+        "matching_strategy": strategy,
+        "overlap_recall_threshold": overlap_threshold,
+    }
+
+
 def compute_event_confusion_matrix(
     all_predictions: dict,
     all_targets: list,
-    iou_threshold: float = 0.5,
+    iou_threshold: float = 0.3,
     num_classes: int = 6,
 ) -> np.ndarray:
     """
@@ -219,6 +265,260 @@ def compute_event_confusion_matrix(
     return cm
 
 
+def build_validation_event_predictions_dataframe(
+    all_predictions: dict,
+    all_targets: list,
+    iou_threshold: float = 0.3,
+    matching_strategy: str = "iou",
+    overlap_recall_threshold: float = 0.8,
+) -> pd.DataFrame:
+    """
+    Build per-event validation prediction records for DETR evaluation.
+
+    The returned dataframe has one row per:
+      - matched target event (correct class or class mismatch),
+      - missed target event (false negative),
+      - unmatched predicted event (false positive).
+
+    This uses the same greedy IoU matching strategy used for confusion/F1 logic,
+    and reuses already-collected validation predictions/targets.
+    """
+    normalized_predictions = normalize_prediction_intervals(all_predictions)
+    class_logits = np.asarray(normalized_predictions["class_logits"])  # [B, Nq, C]
+    pred_starts = np.asarray(normalized_predictions["start"])  # [B, Nq, 1]
+    pred_ends = np.asarray(normalized_predictions["end"])  # [B, Nq, 1]
+    pred_centers = np.asarray(normalized_predictions["center"])  # [B, Nq, 1]
+
+    if class_logits.ndim != 3:
+        raise ValueError(
+            f"Expected class_logits to be [B, Nq, C], got shape {class_logits.shape}."
+        )
+    if pred_starts.shape[:2] != class_logits.shape[:2]:
+        raise ValueError(
+            f"Start shape mismatch: starts {pred_starts.shape} vs class_logits {class_logits.shape}."
+        )
+    if pred_ends.shape[:2] != class_logits.shape[:2]:
+        raise ValueError(
+            f"End shape mismatch: ends {pred_ends.shape} vs class_logits {class_logits.shape}."
+        )
+    if pred_centers.shape[:2] != class_logits.shape[:2]:
+        raise ValueError(
+            f"Center shape mismatch: centers {pred_centers.shape} vs class_logits {class_logits.shape}."
+        )
+
+    batch_size, n_queries, _ = class_logits.shape
+    if len(all_targets) != batch_size:
+        raise ValueError(
+            f"Target length mismatch: targets={len(all_targets)} vs predictions batch={batch_size}."
+        )
+
+    def temporal_iou(
+        pred_start: float,
+        pred_end: float,
+        target_start: float,
+        target_end: float,
+    ) -> float:
+        ps = float(np.clip(pred_start, 0.0, 1.0))
+        pe = float(np.clip(pred_end, 0.0, 1.0))
+        ts = float(np.clip(target_start, 0.0, 1.0))
+        te = float(np.clip(target_end, 0.0, 1.0))
+
+        if ps > pe:
+            ps, pe = pe, ps
+        if ts > te:
+            ts, te = te, ts
+
+        inter = max(0.0, min(pe, te) - max(ps, ts))
+        union = (pe - ps) + (te - ts) - inter
+        if union <= 1e-8:
+            return 0.0
+        return float(inter / union)
+
+    rows: list[dict] = []
+
+    for sample_idx in range(batch_size):
+        probs = softmax(class_logits[sample_idx], axis=-1)  # [Nq, C]
+
+        sample_preds: list[dict] = []
+        for query_idx in range(n_queries):
+            pred_class = int(np.argmax(probs[query_idx]))
+            if pred_class == 0:
+                continue
+
+            pred_bg_prob = float(probs[query_idx, 0])
+            pred_non_bg_conf = float(1.0 - pred_bg_prob)
+            pred_start = float(np.clip(pred_starts[sample_idx, query_idx, 0], 0.0, 1.0))
+            pred_end = float(np.clip(pred_ends[sample_idx, query_idx, 0], 0.0, 1.0))
+            pred_center = float(
+                np.clip(pred_centers[sample_idx, query_idx, 0], 0.0, 1.0)
+            )
+            if pred_start > pred_end:
+                pred_start, pred_end = pred_end, pred_start
+
+            sample_preds.append(
+                {
+                    "query_idx": int(query_idx),
+                    "class_id": pred_class,
+                    "start": pred_start,
+                    "end": pred_end,
+                    "center": pred_center,
+                    "duration": float(max(0.0, pred_end - pred_start)),
+                    "background_probability": pred_bg_prob,
+                    "pred_confidence": pred_non_bg_conf,
+                }
+            )
+
+        sample_preds.sort(key=lambda item: item["pred_confidence"], reverse=True)
+        matched_pred = np.zeros(len(sample_preds), dtype=bool)
+
+        for target_idx, target in enumerate(all_targets[sample_idx]):
+            true_class = int(target.class_id)
+            if true_class == 0:
+                continue
+
+            true_start = float(np.clip(target.start_norm, 0.0, 1.0))
+            true_end = float(np.clip(target.end_norm, 0.0, 1.0))
+            if true_start > true_end:
+                true_start, true_end = true_end, true_start
+            true_center = float(0.5 * (true_start + true_end))
+            true_duration = float(max(0.0, true_end - true_start))
+
+            best_pred_idx = -1
+            best_iou = 0.0
+            for pred_idx, pred in enumerate(sample_preds):
+                if matched_pred[pred_idx]:
+                    continue
+                iou = temporal_iou(
+                    pred["start"],
+                    pred["end"],
+                    true_start,
+                    true_end,
+                )
+                if iou > best_iou:
+                    best_iou = iou
+                    best_pred_idx = pred_idx
+
+            is_match = False
+            if best_pred_idx >= 0:
+                pred = sample_preds[best_pred_idx]
+                is_match, best_iou, _ = is_interval_match(
+                    pred["start"],
+                    pred["end"],
+                    true_start,
+                    true_end,
+                    matching_strategy=matching_strategy,
+                    match_iou_threshold=float(iou_threshold),
+                    overlap_recall_threshold=float(overlap_recall_threshold),
+                )
+
+            if best_pred_idx >= 0 and is_match:
+                matched_pred[best_pred_idx] = True
+                pred = sample_preds[best_pred_idx]
+                predicted_class = int(pred["class_id"])
+                rows.append(
+                    {
+                        "sample_idx": int(sample_idx),
+                        "target_idx": int(target_idx),
+                        "pred_rank_idx": int(best_pred_idx),
+                        "pred_query_idx": int(pred["query_idx"]),
+                        "match_type": (
+                            "matched_correct_class"
+                            if predicted_class == true_class
+                            else "matched_wrong_class"
+                        ),
+                        "true_class": int(true_class),
+                        "predicted_class": int(predicted_class),
+                        "temporal_iou": float(best_iou),
+                        "true_start": true_start,
+                        "true_end": true_end,
+                        "true_duration": true_duration,
+                        "true_center": true_center,
+                        "pred_start": float(pred["start"]),
+                        "pred_end": float(pred["end"]),
+                        "pred_duration": float(pred["duration"]),
+                        "pred_center": float(pred["center"]),
+                        "pred_confidence": float(pred["pred_confidence"]),
+                        "pred_background_probability": float(
+                            pred["background_probability"]
+                        ),
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "sample_idx": int(sample_idx),
+                        "target_idx": int(target_idx),
+                        "pred_rank_idx": -1,
+                        "pred_query_idx": -1,
+                        "match_type": "missed_detection",
+                        "true_class": int(true_class),
+                        "predicted_class": 0,
+                        "temporal_iou": 0.0,
+                        "true_start": true_start,
+                        "true_end": true_end,
+                        "true_duration": true_duration,
+                        "true_center": true_center,
+                        "pred_start": np.nan,
+                        "pred_end": np.nan,
+                        "pred_duration": np.nan,
+                        "pred_center": np.nan,
+                        "pred_confidence": np.nan,
+                        "pred_background_probability": np.nan,
+                    }
+                )
+
+        for pred_idx, pred in enumerate(sample_preds):
+            if matched_pred[pred_idx]:
+                continue
+
+            rows.append(
+                {
+                    "sample_idx": int(sample_idx),
+                    "target_idx": -1,
+                    "pred_rank_idx": int(pred_idx),
+                    "pred_query_idx": int(pred["query_idx"]),
+                    "match_type": "unmatched_prediction",
+                    "true_class": 0,
+                    "predicted_class": int(pred["class_id"]),
+                    "temporal_iou": 0.0,
+                    "true_start": np.nan,
+                    "true_end": np.nan,
+                    "true_duration": np.nan,
+                    "true_center": np.nan,
+                    "pred_start": float(pred["start"]),
+                    "pred_end": float(pred["end"]),
+                    "pred_duration": float(pred["duration"]),
+                    "pred_center": float(pred["center"]),
+                    "pred_confidence": float(pred["pred_confidence"]),
+                    "pred_background_probability": float(pred["background_probability"]),
+                }
+            )
+
+    columns = [
+        "sample_idx",
+        "target_idx",
+        "pred_rank_idx",
+        "pred_query_idx",
+        "match_type",
+        "true_class",
+        "predicted_class",
+        "temporal_iou",
+        "true_start",
+        "true_end",
+        "true_duration",
+        "true_center",
+        "pred_start",
+        "pred_end",
+        "pred_duration",
+        "pred_center",
+        "pred_confidence",
+        "pred_background_probability",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns)
+
+
 def train_one_event_detection_fold(
     model_key_or_kwargs: str | dict,
     fold_id: int,
@@ -239,6 +539,7 @@ def train_one_event_detection_fold(
         config: Training config dict with keys:
             - batch_size, lr, lr_final, epochs
             - early_stop_patience, val_plot_events
+            - val_plot_misdetected_events_per_class
             - detection-specific: loss weights for class, bbox, giou, unmatched
 
     Returns:
@@ -247,10 +548,11 @@ def train_one_event_detection_fold(
 
     checkpoints_dir = fold_out_dir / "checkpoints"
     reports_dir = fold_out_dir / "reports"
+    val_predictions_dir = reports_dir / "validation_predictions"
     val_plot_dir = fold_out_dir / "validation_event_plots"
     cm_dir = fold_out_dir / "confusion_matrices"
 
-    for p in (checkpoints_dir, reports_dir, val_plot_dir, cm_dir):
+    for p in (checkpoints_dir, reports_dir, val_predictions_dir, val_plot_dir, cm_dir):
         p.mkdir(parents=True, exist_ok=True)
 
     # Load datasets
@@ -279,7 +581,18 @@ def train_one_event_detection_fold(
 
     # Initialize loss function and metrics
     loss_weights = _resolve_detr_loss_weights(spec, config)
+    eval_matching = _resolve_detr_eval_matching(spec, config)
+    match_iou_threshold = float(eval_matching["match_iou_threshold"])
+    matching_strategy = str(eval_matching["matching_strategy"])
+    overlap_recall_threshold = float(eval_matching["overlap_recall_threshold"])
+
     print(f"Resolved DETR loss weights for {model_key}: {loss_weights}")
+    print(
+        "Resolved DETR eval matching for "
+        f"{model_key}: strategy={matching_strategy} "
+        f"iou_threshold={match_iou_threshold:.3f} "
+        f"overlap_recall_threshold={overlap_recall_threshold:.3f}"
+    )
     loss_fn = DETREventLoss(num_classes=6, loss_weights=loss_weights)
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
@@ -332,8 +645,9 @@ def train_one_event_detection_fold(
 
     best_train_loss = float("inf")
     best_val_loss = float("inf")
-    best_val_mean_f1 = float("-inf")  # F1@0.5 for events
+    best_val_mean_f1 = float("-inf")
     best_epoch = -1
+    best_val_loss_epoch = -1
     epochs_without_improvement = 0
 
     metrics_rows = []
@@ -492,7 +806,26 @@ def train_one_event_detection_fold(
         detection_summary = metrics_fn.compute_detection_summary(
             all_predictions,
             all_targets,
-            iou_threshold=0.5,
+            iou_threshold=match_iou_threshold,
+            matching_strategy=matching_strategy,
+            overlap_recall_threshold=overlap_recall_threshold,
+        )
+
+        # Build per-event validation prediction rows once per epoch from already
+        # collected predictions/targets (no additional model forward pass).
+        val_predictions_df = build_validation_event_predictions_dataframe(
+            all_predictions,
+            all_targets,
+            iou_threshold=match_iou_threshold,
+            matching_strategy=matching_strategy,
+            overlap_recall_threshold=overlap_recall_threshold,
+        )
+        val_predictions_latest_path = val_predictions_dir / "val_predictions_latest.csv"
+        val_predictions_df.to_csv(
+            val_predictions_latest_path,
+            index=False,
+            sep=";",
+            decimal=",",
         )
         per_class_f1_dict = detection_summary["per_class_f1"]
         per_class_iou_dict = detection_summary["per_class_iou"]
@@ -550,14 +883,23 @@ def train_one_event_detection_fold(
         if float(avg_train_loss) < float(best_train_loss):
             best_train_loss = float(avg_train_loss)
 
-        if float(avg_val_loss) < float(best_val_loss):
-            best_val_loss = float(avg_val_loss)
-
+        is_best_val_loss_epoch = float(avg_val_loss) < float(best_val_loss)
         is_best_val_mean_f1_epoch = mean_f1 > best_val_mean_f1
+        val_cm = detection_summary["confusion_matrix"]
+
+        saved_plot_count = 0
+        max_misdetected_events_per_class = int(
+            config.get(
+                "val_plot_misdetected_events_per_class",
+                config.get("val_plot_samples_per_class", 2),
+            )
+        )
+        should_reset_early_stop = False
+
         if is_best_val_mean_f1_epoch:
             best_val_mean_f1 = mean_f1
             best_epoch = int(epoch)
-            epochs_without_improvement = 0
+            should_reset_early_stop = True
 
             torch.save(
                 {
@@ -580,36 +922,84 @@ def train_one_event_detection_fold(
                 out_path=cm_dir / "confusion_matrix_val_best_f1.png",
                 title=f"Event Detection Confusion Matrix - Fold {fold_id} - Best F1",
             )
-            # Save per-epoch record (historical)
+
+        if is_best_val_loss_epoch:
+            best_val_loss = float(avg_val_loss)
+            best_val_loss_epoch = int(epoch)
+            should_reset_early_stop = True
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": avg_val_loss,
+                    "f1_score": mean_f1,
+                },
+                checkpoints_dir / "best_val_loss.pt",
+            )
+
+            save_confusion_matrix_image(
+                cm=val_cm,
+                labels=["Background", "VT", "LP", "TR", "AV", "IC"],
+                out_path=cm_dir / "confusion_matrix_val_best_val_loss.png",
+                title=(
+                    f"Event Detection Confusion Matrix - Fold {fold_id} - Best Val Loss"
+                ),
+            )
+
+        if is_best_val_mean_f1_epoch or is_best_val_loss_epoch:
+            if is_best_val_mean_f1_epoch and is_best_val_loss_epoch:
+                improvement_tag = "best_f1_best_val_loss"
+            elif is_best_val_mean_f1_epoch:
+                improvement_tag = "best_f1"
+            else:
+                improvement_tag = "best_val_loss"
+
+            saved_plot_count += plot_event_validation(
+                model=model,
+                dataloader=val_loader,
+                device=device,
+                output_dir=val_plot_dir / f"epoch_{epoch + 1:03d}_{improvement_tag}",
+                epoch=int(epoch),
+                samples_per_class=config.get("val_plot_samples_per_class", 2),
+                extract_attention=False,
+                attention_mode="none",
+                forward_batch_size=min(2, config.get("val_plot_forward_batch_size", 2)),
+                misdetected_only=True,
+                max_misdetected_events_per_class=max_misdetected_events_per_class,
+                match_iou_threshold=match_iou_threshold,
+                matching_strategy=matching_strategy,
+                overlap_recall_threshold=overlap_recall_threshold,
+            )
+
+            val_predictions_df.to_csv(
+                val_predictions_dir
+                / f"val_predictions_epoch_{epoch + 1:03d}_{improvement_tag}.csv",
+                index=False,
+                sep=";",
+                decimal=",",
+            )
+
+        if should_reset_early_stop:
+            epochs_without_improvement = 0
+            # Save per-epoch record (historical) whenever either best metric improves.
             save_confusion_matrix_image(
                 cm=val_cm,
                 labels=["Background", "VT", "LP", "TR", "AV", "IC"],
                 out_path=cm_dir / f"confusion_matrix_epoch_{epoch:03d}.png",
                 title=f"Event Detection Confusion Matrix - Fold {fold_id} - Epoch {epoch + 1}",
             )
-
-            # Save plots on every F1 improvement epoch without attention overlays.
-            saved_plot_count = plot_event_validation(
-                model=model,
-                dataloader=val_loader,
-                device=device,
-                output_dir=val_plot_dir / f"epoch_{epoch + 1:03d}_best_f1",
-                epoch=int(epoch),
-                samples_per_class=config.get("val_plot_samples_per_class", 2),
-                extract_attention=False,
-                attention_mode="none",
-                forward_batch_size=min(2, config.get("val_plot_forward_batch_size", 2)),
-            )
         else:
             epochs_without_improvement += 1
-            saved_plot_count = 0
 
         # Save metrics rows for CSV export
         current_lr = float(optimizer.param_groups[0]["lr"])
 
         # Main CSV: ordered list format identical to segmentation models for comparison
         # [lr, epoch, train_loss, val_loss, VT_f1, LP_f1, TR_f1, AV_f1, IC_f1, mean_f1, VT_iou, LP_iou, TR_iou, AV_iou, IC_iou, mean_iou]
-        # For event detection: use per-class F1@0.5 scores and per-class IoU scores
+        # For event detection: use per-class F1 and per-class IoU from the
+        # configured matching criterion.
         vt_f1, lp_f1, tr_f1, av_f1, ic_f1 = class_f1_scores
         vt_iou, lp_iou, tr_iou, av_iou, ic_iou = class_iou_scores
 
@@ -633,8 +1023,9 @@ def train_one_event_detection_fold(
         ]
         metrics_rows.append(metrics_row)
 
-        # Detection metrics CSV (additional metrics specific to event detection): ordered list format
-        # [epoch, mAP@0.1, mAP@0.3, mAP@0.5, mAP@0.7, mAP@0.9, mAP, mean_f1, F1_VT@0.5, F1_LP@0.5, F1_TR@0.5, F1_AV@0.5, F1_IC@0.5]
+        # Detection metrics CSV (additional metrics specific to event detection):
+        # [epoch, mAP@0.1, mAP@0.3, mAP@0.5, mAP@0.7, mAP@0.9, mAP,
+        #  F1_match, VT_f1_match, LP_f1_match, TR_f1_match, AV_f1_match, IC_f1_match]
         detection_row = [
             int(epoch + 1),
             float(detection_metrics.get("mAP@0.1", 0.0)),
@@ -663,12 +1054,14 @@ def train_one_event_detection_fold(
             f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f} unmatched={avg_val_loss_unmatched_query:.4f}]\n"
             f"Metrics:     mean_f1={mean_f1:.4f} mean_precision={mean_precision:.4f} "
             f"mean_recall={mean_recall:.4f} mean_iou={mean_iou:.4f} "
-            f"best_epoch={best_epoch + 1} no_improve={epochs_without_improvement}/{config['early_stop_patience']}\n"
+            f"best_epoch_f1={best_epoch + 1} best_epoch_val_loss={best_val_loss_epoch + 1} "
+            f"no_improve={epochs_without_improvement}/{config['early_stop_patience']}\n"
             f"mAP:         {detection_metrics.get('mAP', 0.0):.4f} "
             f"(@ 0.1: {detection_metrics.get('mAP@0.1', 0.0):.4f}, "
             f"0.5: {detection_metrics.get('mAP@0.5', 0.0):.4f}, "
             f"0.9: {detection_metrics.get('mAP@0.9', 0.0):.4f})\n"
             f"Plots:       {saved_plot_count} validation event plots saved\n"
+            f"Val rows:    {len(val_predictions_df)} rows saved to {val_predictions_latest_path.name}\n"
             f"======================================================================"
         )
 
@@ -723,6 +1116,16 @@ def train_one_event_detection_fold(
             extract_attention=True,
             attention_mode=config.get("final_attention_mode", "full"),
             forward_batch_size=min(2, config.get("val_plot_forward_batch_size", 2)),
+            misdetected_only=True,
+            max_misdetected_events_per_class=int(
+                config.get(
+                    "val_plot_misdetected_events_per_class",
+                    config.get("val_plot_samples_per_class", 2),
+                )
+            ),
+            match_iou_threshold=match_iou_threshold,
+            matching_strategy=matching_strategy,
+            overlap_recall_threshold=overlap_recall_threshold,
         )
         print(
             "Final best-checkpoint attention plots saved: "
@@ -773,7 +1176,9 @@ def train_one_event_detection_fold(
     test_detection_summary = metrics_fn.compute_detection_summary(
         all_test_predictions,
         all_test_targets,
-        iou_threshold=0.5,
+        iou_threshold=match_iou_threshold,
+        matching_strategy=matching_strategy,
+        overlap_recall_threshold=overlap_recall_threshold,
     )
     test_f1_per_class = [
         float(test_detection_summary["per_class_f1"].get(class_id, 0.0))
@@ -812,7 +1217,9 @@ def train_one_event_detection_fold(
     test_f1 = metrics_fn.compute_f1(
         all_test_predictions,
         all_test_targets,
-        iou_threshold=0.5,
+        iou_threshold=match_iou_threshold,
+        matching_strategy=matching_strategy,
+        overlap_recall_threshold=overlap_recall_threshold,
     )
 
     fold_elapsed_sec = float(time.time() - fold_start)
@@ -834,10 +1241,13 @@ def train_one_event_detection_fold(
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
         "test_iou_per_class": [float(x) for x in test_iou_per_class],
         "test_mAP": float(test_metrics.get("mAP", 0.0)),
+        "matching_strategy": matching_strategy,
+        "match_iou_threshold": float(match_iou_threshold),
+        "overlap_recall_threshold": float(overlap_recall_threshold),
         "fold_elapsed_seconds": fold_elapsed_sec,
     }
     fold_summary.update(test_metrics)
-    fold_summary["test_F1@0.5"] = float(test_f1)
+    fold_summary[f"test_F1@{match_iou_threshold:.2f}"] = float(test_f1)
 
     # Save fold summary
     summary_path = reports_dir / "fold_summary.json"
@@ -848,7 +1258,7 @@ def train_one_event_detection_fold(
     print(
         f"Fold {fold_id} complete | Best Epoch: {best_epoch + 1} | "
         f"Test Macro-F1(active): {test_macro_f1_active:.4f} | "
-        f"Test F1@0.5(global): {test_f1:.4f} | "
+        f"Test F1(match criterion): {test_f1:.4f} | "
         f"Test mAP: {test_metrics.get('mAP', 0.0):.4f} | "
         f"Elapsed: {fold_elapsed_sec / 60:.1f} min"
     )

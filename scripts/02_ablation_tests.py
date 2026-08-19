@@ -49,7 +49,7 @@ from utils.train_utils import (
 from utils.trainer_segmentation import train_one_segmentation_fold
 from utils.trainer_detection import train_one_event_detection_fold
 from utils.fold_io_utils import is_training_fold_complete
-from utils.model_registry import MODEL_SPECS, get_model_spec
+from utils.model_registry import DETR_EVAL_DEFAULTS, MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
 
 # Default run set. Override with --models if needed.
@@ -69,9 +69,13 @@ CONFIG = {
     "save_confusion_matrix_each_epoch": False,
     "seed": 42,
     "val_plot_samples_per_class": 2,
+    "val_plot_misdetected_events_per_class": 10,
     "val_plot_forward_batch_size": 2,
     "best_epoch_attention_mode": "station",
     "final_attention_mode": "full",
+    "match_iou_threshold": float(DETR_EVAL_DEFAULTS["match_iou_threshold"]),
+    "matching_strategy": str(DETR_EVAL_DEFAULTS["matching_strategy"]),
+    "overlap_recall_threshold": float(DETR_EVAL_DEFAULTS["overlap_recall_threshold"]),
 }
 FOLDS = range(1, 6)
 
@@ -249,6 +253,7 @@ def main() -> None:
                 "batch_size": spec["batch_size"],
                 "model_kwargs": spec["model_kwargs"],
                 "loss_weights": resolve_detr_loss_weights(spec),
+                "eval_matching": spec.get("eval_matching", {}),
             }
             for name, spec in selected_specs.items()
         },

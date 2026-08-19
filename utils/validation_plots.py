@@ -22,6 +22,7 @@ import torch
 
 from utils import data_utils
 from utils.detection_prediction_utils import normalize_prediction_intervals
+from utils.event_detection_metrics import is_interval_match
 
 
 def plot_segmentation_validation(
@@ -151,6 +152,11 @@ def plot_event_validation(
     extract_attention: bool = True,
     attention_mode: str = "full",
     forward_batch_size: int = 2,
+    misdetected_only: bool = False,
+    max_misdetected_events_per_class: Optional[int] = None,
+    match_iou_threshold: float = 0.3,
+    matching_strategy: str = "iou",
+    overlap_recall_threshold: float = 0.8,
 ) -> int:
     """
     Generate validation plots for event detection models (MuSSED).
@@ -166,6 +172,14 @@ def plot_event_validation(
         extract_attention: Backward-compat flag. If False, attention_mode is forced to "none"
         attention_mode: One of {"none", "station", "full"}
         forward_batch_size: Max plotting forward micro-batch size (capped at 2)
+        misdetected_only: If True, save only samples containing misdetected events
+            (missed detections or wrong-class detections) against GT.
+        max_misdetected_events_per_class: Max number of misdetected events to save
+            per class (1..C-1). Defaults to samples_per_class when None.
+        match_iou_threshold: IoU threshold used to match predicted/target events.
+        matching_strategy: One of {"iou", "overlap_recall", "dual"}.
+        overlap_recall_threshold: Minimum target coverage when using
+            overlap-recall-based matching.
 
     Returns:
         Number of plots saved
@@ -192,11 +206,35 @@ def plot_event_validation(
         raise ValueError(f"forward_batch_size must be >= 1, got {forward_batch_size}.")
     forward_batch_size = min(forward_batch_size, 2)
 
+    if max_misdetected_events_per_class is None:
+        max_misdetected_events_per_class = int(samples_per_class)
+    if max_misdetected_events_per_class < 0:
+        raise ValueError(
+            "max_misdetected_events_per_class must be >= 0, got "
+            f"{max_misdetected_events_per_class}."
+        )
+    if not (0.0 <= float(match_iou_threshold) <= 1.0):
+        raise ValueError(
+            f"match_iou_threshold must be in [0, 1], got {match_iou_threshold}."
+        )
+    matching_strategy = str(matching_strategy).strip().lower()
+    if matching_strategy not in {"iou", "overlap_recall", "dual"}:
+        raise ValueError(
+            "matching_strategy must be one of {'iou', 'overlap_recall', 'dual'}, "
+            f"got {matching_strategy!r}."
+        )
+    if not (0.0 <= float(overlap_recall_threshold) <= 1.0):
+        raise ValueError(
+            "overlap_recall_threshold must be in [0, 1], got "
+            f"{overlap_recall_threshold}."
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
     plot_count = 0
     class_counts: dict = {}  # {class_id: n_saved}
+    class_event_counts: dict = {}  # {class_id: n_misdetected_events_saved}
     num_non_bg_classes: int | None = None
 
     need_station_attention = attention_mode in {"station", "full"}
@@ -209,35 +247,172 @@ def plot_event_validation(
         try_attach_temporal_attention_hook(model) if need_temporal_attention else None
     )
 
+    from utils.event_targets import segmentation_to_events
+
+    def _as_query_vector(values: np.ndarray, name: str) -> np.ndarray:
+        array = np.asarray(values)
+        if array.ndim == 1:
+            return array
+        if array.ndim == 2 and array.shape[1] == 1:
+            return array[:, 0]
+        raise ValueError(
+            f"{name} must have shape [Nq] or [Nq, 1], got shape {array.shape}."
+        )
+
+    def _temporal_iou(
+        pred_start: float,
+        pred_end: float,
+        target_start: float,
+        target_end: float,
+    ) -> float:
+        ps = float(np.clip(pred_start, 0.0, 1.0))
+        pe = float(np.clip(pred_end, 0.0, 1.0))
+        ts = float(np.clip(target_start, 0.0, 1.0))
+        te = float(np.clip(target_end, 0.0, 1.0))
+
+        if ps > pe:
+            ps, pe = pe, ps
+        if ts > te:
+            ts, te = te, ts
+
+        inter = max(0.0, min(pe, te) - max(ps, ts))
+        union = (pe - ps) + (te - ts) - inter
+        if union <= 1e-8:
+            return 0.0
+        return float(inter / union)
+
+    def _collect_misdetected_event_counts(
+        y_true_sample: np.ndarray,
+        normalized_outputs_sample: dict,
+    ) -> tuple[dict[int, int], dict]:
+        gt_events = segmentation_to_events(
+            torch.from_numpy(y_true_sample),
+            normalize=True,
+        )
+
+        class_logits = np.asarray(normalized_outputs_sample["class_logits"])
+        starts = _as_query_vector(normalized_outputs_sample["starts"], "starts")
+        ends = _as_query_vector(normalized_outputs_sample["ends"], "ends")
+        centers = _as_query_vector(normalized_outputs_sample["centers"], "centers")
+        if class_logits.ndim != 2:
+            raise ValueError(
+                "class_logits must have shape [Nq, C], "
+                f"got shape {class_logits.shape}."
+            )
+        if not (
+            len(starts) == len(ends) == len(centers) == int(class_logits.shape[0])
+        ):
+            raise ValueError(
+                "Prediction length mismatch for sample: expected equal query counts for "
+                f"centers ({len(centers)}), starts ({len(starts)}), "
+                f"ends ({len(ends)}), and class_logits ({class_logits.shape[0]})."
+            )
+
+        class_probs = torch.softmax(torch.from_numpy(class_logits), dim=-1).numpy()
+        pred_events: list[dict] = []
+        for q_idx in range(len(starts)):
+            pred_class = int(np.argmax(class_probs[q_idx]))
+            if pred_class == 0:
+                continue
+            pred_events.append(
+                {
+                    "class_id": pred_class,
+                    "start": float(starts[q_idx]),
+                    "end": float(ends[q_idx]),
+                    "confidence": float(1.0 - class_probs[q_idx, 0]),
+                }
+            )
+
+        pred_events.sort(key=lambda item: item["confidence"], reverse=True)
+        matched_pred = np.zeros(len(pred_events), dtype=bool)
+        misdetected_event_counts: dict[int, int] = {}
+
+        for target in gt_events:
+            if int(target.class_id) == 0:
+                continue
+
+            true_class = int(target.class_id)
+            best_pred_idx = -1
+            best_iou = 0.0
+            for p_idx, pred in enumerate(pred_events):
+                if matched_pred[p_idx]:
+                    continue
+                iou = _temporal_iou(
+                    pred["start"],
+                    pred["end"],
+                    target.start_norm,
+                    target.end_norm,
+                )
+                if iou > best_iou:
+                    best_iou = iou
+                    best_pred_idx = p_idx
+
+            is_match = False
+            if best_pred_idx >= 0:
+                pred = pred_events[best_pred_idx]
+                is_match, best_iou, _ = is_interval_match(
+                    pred["start"],
+                    pred["end"],
+                    target.start_norm,
+                    target.end_norm,
+                    matching_strategy=matching_strategy,
+                    match_iou_threshold=float(match_iou_threshold),
+                    overlap_recall_threshold=float(overlap_recall_threshold),
+                )
+
+            if best_pred_idx >= 0 and is_match:
+                matched_pred[best_pred_idx] = True
+                pred_class = int(pred_events[best_pred_idx]["class_id"])
+                if pred_class != true_class:
+                    misdetected_event_counts[true_class] = (
+                        misdetected_event_counts.get(true_class, 0) + 1
+                    )
+            else:
+                misdetected_event_counts[true_class] = (
+                    misdetected_event_counts.get(true_class, 0) + 1
+                )
+
+        return misdetected_event_counts, gt_events
+
     with torch.inference_mode():
         for batch_idx, batch in enumerate(dataloader):
             y_onehot = batch[1]
             if num_non_bg_classes is None:
                 num_non_bg_classes = int(y_onehot.shape[1] - 1)
 
-            remaining_classes = [
-                c
-                for c in range(1, y_onehot.shape[1])
-                if class_counts.get(c, 0) < samples_per_class
-            ]
+            if misdetected_only:
+                remaining_classes = [
+                    c
+                    for c in range(1, y_onehot.shape[1])
+                    if class_event_counts.get(c, 0)
+                    < int(max_misdetected_events_per_class)
+                ]
+            else:
+                remaining_classes = [
+                    c
+                    for c in range(1, y_onehot.shape[1])
+                    if class_counts.get(c, 0) < samples_per_class
+                ]
             if not remaining_classes:
                 break
 
-            # Forward only samples that can still contribute to the remaining quotas.
-            selected_indices: list[int] = []
             y_onehot_np = y_onehot.numpy()
-            remaining_set = set(remaining_classes)
-            for sample_idx in range(y_onehot_np.shape[0]):
-                sample_classes = {
-                    c
-                    for c in range(1, y_onehot_np.shape[1])
-                    if y_onehot_np[sample_idx, c].any()
-                }
-                if sample_classes & remaining_set:
-                    selected_indices.append(sample_idx)
+            selected_indices = list(range(y_onehot_np.shape[0]))
+            if not misdetected_only:
+                # Forward only samples that can still contribute to the remaining quotas.
+                selected_indices = []
+                remaining_set = set(remaining_classes)
+                for sample_idx in range(y_onehot_np.shape[0]):
+                    sample_classes = {
+                        c
+                        for c in range(1, y_onehot_np.shape[1])
+                        if y_onehot_np[sample_idx, c].any()
+                    }
+                    if sample_classes & remaining_set:
+                        selected_indices.append(sample_idx)
 
-            if not selected_indices:
-                continue
+                if not selected_indices:
+                    continue
 
             for chunk_start in range(0, len(selected_indices), forward_batch_size):
                 chunk_indices = selected_indices[
@@ -292,11 +467,6 @@ def plot_event_validation(
                     ]
                     if not sample_classes:
                         continue
-                    if not any(
-                        class_counts.get(c, 0) < samples_per_class
-                        for c in sample_classes
-                    ):
-                        continue
 
                     station_attn = (
                         station_attn_batch[sample_idx]
@@ -322,6 +492,30 @@ def plot_event_validation(
                                 normalized_outputs[model_key][sample_idx].cpu().numpy()
                             )
 
+                    if misdetected_only:
+                        misdetected_event_counts, _ = _collect_misdetected_event_counts(
+                            y_true_sample=y_sample,
+                            normalized_outputs_sample=outputs_sample,
+                        )
+                        if not misdetected_event_counts:
+                            continue
+
+                        eligible_classes = [
+                            c
+                            for c, event_count in misdetected_event_counts.items()
+                            if event_count > 0
+                            and class_event_counts.get(c, 0)
+                            < int(max_misdetected_events_per_class)
+                        ]
+                        if not eligible_classes:
+                            continue
+                    else:
+                        if not any(
+                            class_counts.get(c, 0) < samples_per_class
+                            for c in sample_classes
+                        ):
+                            continue
+
                     plot_event_sample(
                         x=xb[sample_idx].cpu().numpy(),
                         y_true=y_sample,
@@ -335,28 +529,59 @@ def plot_event_validation(
                         temporal_attn=temporal_attn,
                     )
                     plot_count += 1
-                    for c in sample_classes:
-                        class_counts[c] = class_counts.get(c, 0) + 1
 
+                    if misdetected_only:
+                        for c in eligible_classes:
+                            current = int(class_event_counts.get(c, 0))
+                            add_count = int(misdetected_event_counts.get(c, 0))
+                            quota = int(max_misdetected_events_per_class)
+                            class_event_counts[c] = min(quota, current + add_count)
+
+                        if num_non_bg_classes is not None and all(
+                            class_event_counts.get(c, 0)
+                            >= int(max_misdetected_events_per_class)
+                            for c in range(1, num_non_bg_classes + 1)
+                        ):
+                            break
+                    else:
+                        for c in sample_classes:
+                            class_counts[c] = class_counts.get(c, 0) + 1
+
+                        if num_non_bg_classes is not None and all(
+                            class_counts.get(c, 0) >= samples_per_class
+                            for c in range(1, num_non_bg_classes + 1)
+                        ):
+                            break
+
+                del xb, y_onehot_chunk, outputs, station_attn_batch, temporal_attn_batch
+
+                if misdetected_only:
+                    if num_non_bg_classes is not None and all(
+                        class_event_counts.get(c, 0)
+                        >= int(max_misdetected_events_per_class)
+                        for c in range(1, num_non_bg_classes + 1)
+                    ):
+                        break
+                else:
                     if num_non_bg_classes is not None and all(
                         class_counts.get(c, 0) >= samples_per_class
                         for c in range(1, num_non_bg_classes + 1)
                     ):
                         break
 
-                del xb, y_onehot_chunk, outputs, station_attn_batch, temporal_attn_batch
-
+            if misdetected_only:
+                if num_non_bg_classes is not None and all(
+                    class_event_counts.get(c, 0)
+                    >= int(max_misdetected_events_per_class)
+                    for c in range(1, num_non_bg_classes + 1)
+                ):
+                    break
+            else:
                 if num_non_bg_classes is not None and all(
                     class_counts.get(c, 0) >= samples_per_class
                     for c in range(1, num_non_bg_classes + 1)
                 ):
                     break
-
-            if num_non_bg_classes is not None and all(
-                class_counts.get(c, 0) >= samples_per_class
-                for c in range(1, num_non_bg_classes + 1)
-            ):
-                break
 
     # Clean up hooks
     if station_hook is not None:

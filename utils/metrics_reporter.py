@@ -52,7 +52,7 @@ def format_epoch_summary_detection(
     train_loss_class: float,
     train_loss_bbox: float,
     val_loss: float,
-    mean_f1: float,  # F1@0.5 from events
+        mean_f1: float,
     mAP: float,
     best_epoch: int,
     epochs_without_improvement: int,
@@ -205,12 +205,12 @@ def save_training_history_detection(
                 "mAP@0.7",
                 "mAP@0.9",
                 "mAP",
-                "F1@0.5",
-                "AP_VT@0.5",
-                "AP_LP@0.5",
-                "AP_TR@0.5",
-                "AP_AV@0.5",
-                "AP_IC@0.5",
+                "F1_match",
+                "VT_f1_match",
+                "LP_f1_match",
+                "TR_f1_match",
+                "AV_f1_match",
+                "IC_f1_match",
             ],
         )
         detection_df.to_csv(
@@ -234,33 +234,31 @@ def map_detection_metrics_to_compatible_columns(
     Args:
         mAP_dict: Detection metrics dict with keys like:
             - "mAP": overall mAP
-            - "F1@0.5": F1 score at IoU=0.5
-            - "AP_VT@0.5": AP for VT class at IoU=0.5
-            - "AP_LP@0.5", "AP_TR@0.5", "AP_AV@0.5", "AP_IC@0.5"
+            - "F1_match": F1 score under selected matching criterion
+            - "VT_f1_match": VT-class F1 under selected matching criterion
+            - "LP_f1_match", "TR_f1_match", "AV_f1_match", "IC_f1_match"
 
     Returns:
         Tuple of:
-        - per_class_f1: [VT, LP, TR, AV, IC] F1 scores (mapped from AP)
-        - per_class_iou: [VT, LP, TR, AV, IC] IoU scores (mapped from AP)
-        - mean_f1: Overall F1@0.5
+        - per_class_f1: [VT, LP, TR, AV, IC] F1 scores
+        - per_class_iou: [VT, LP, TR, AV, IC] IoU proxy scores
+        - mean_f1: Overall F1 under selected matching criterion
         - mean_iou: Overall mAP (as proxy for mean IoU)
     """
-    # For detection models:
-    # - mean_f1 = F1@0.5 (from detection metrics)
-    # - per_class_f1 = AP@0.5 for each class (as proxy for F1)
-    # - mean_iou = mAP (average precision across all IoU thresholds)
+    # For detection models: use the criterion-specific class F1 values and keep
+    # mAP as the cross-threshold overlap-quality proxy.
 
     per_class_f1 = [
-        mAP_dict.get("AP_VT@0.5", 0.0),
-        mAP_dict.get("AP_LP@0.5", 0.0),
-        mAP_dict.get("AP_TR@0.5", 0.0),
-        mAP_dict.get("AP_AV@0.5", 0.0),
-        mAP_dict.get("AP_IC@0.5", 0.0),
+        mAP_dict.get("VT_f1_match", 0.0),
+        mAP_dict.get("LP_f1_match", 0.0),
+        mAP_dict.get("TR_f1_match", 0.0),
+        mAP_dict.get("AV_f1_match", 0.0),
+        mAP_dict.get("IC_f1_match", 0.0),
     ]
 
     per_class_iou = per_class_f1.copy()  # Same as F1 for detection
 
-    mean_f1 = mAP_dict.get("F1@0.5", 0.0)
+    mean_f1 = mAP_dict.get("F1_match", 0.0)
     mean_iou = mAP_dict.get("mAP", 0.0)
 
     return per_class_f1, per_class_iou, mean_f1, mean_iou

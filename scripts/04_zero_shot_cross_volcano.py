@@ -452,6 +452,7 @@ def main() -> None:
                 "display_name": MODEL_SPECS[key]["display_name"],
                 "batch_size": int(MODEL_SPECS[key]["batch_size"]),
                 "model_kwargs": MODEL_SPECS[key]["model_kwargs"],
+                "eval_matching": MODEL_SPECS[key].get("eval_matching", {}),
             }
             for key in selected_models
         },

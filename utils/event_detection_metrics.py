@@ -15,6 +15,91 @@ from utils.detection_prediction_utils import normalize_prediction_intervals
 from utils.event_targets import EventInterval
 
 
+def temporal_iou(
+    pred_start: float,
+    pred_end: float,
+    target_start: float,
+    target_end: float,
+) -> float:
+    """Compute temporal IoU between predicted and target intervals."""
+    pred_start = np.clip(pred_start, 0, 1)
+    pred_end = np.clip(pred_end, 0, 1)
+    target_start = np.clip(target_start, 0, 1)
+    target_end = np.clip(target_end, 0, 1)
+
+    if pred_start > pred_end:
+        pred_start, pred_end = pred_end, pred_start
+    if target_start > target_end:
+        target_start, target_end = target_end, target_start
+
+    inter_start = max(pred_start, target_start)
+    inter_end = min(pred_end, target_end)
+    inter_len = max(0.0, inter_end - inter_start)
+    union_len = (pred_end - pred_start) + (target_end - target_start) - inter_len
+
+    if union_len < 1e-7:
+        return 0.0
+
+    return float(inter_len / union_len)
+
+
+def temporal_overlap_recall(
+    pred_start: float,
+    pred_end: float,
+    target_start: float,
+    target_end: float,
+) -> float:
+    """Compute target coverage = intersection / target_duration."""
+    pred_start = np.clip(pred_start, 0, 1)
+    pred_end = np.clip(pred_end, 0, 1)
+    target_start = np.clip(target_start, 0, 1)
+    target_end = np.clip(target_end, 0, 1)
+
+    if pred_start > pred_end:
+        pred_start, pred_end = pred_end, pred_start
+    if target_start > target_end:
+        target_start, target_end = target_end, target_start
+
+    inter_start = max(pred_start, target_start)
+    inter_end = min(pred_end, target_end)
+    inter_len = max(0.0, inter_end - inter_start)
+    target_len = max(0.0, target_end - target_start)
+
+    if target_len < 1e-7:
+        return 0.0
+
+    return float(inter_len / target_len)
+
+
+def is_interval_match(
+    pred_start: float,
+    pred_end: float,
+    target_start: float,
+    target_end: float,
+    *,
+    matching_strategy: str,
+    match_iou_threshold: float,
+    overlap_recall_threshold: float,
+) -> tuple[bool, float, float]:
+    """Return (is_match, iou, overlap_recall) using the configured strategy."""
+    iou = temporal_iou(pred_start, pred_end, target_start, target_end)
+    overlap = temporal_overlap_recall(pred_start, pred_end, target_start, target_end)
+
+    if matching_strategy == "iou":
+        return bool(iou >= float(match_iou_threshold)), float(iou), float(overlap)
+    if matching_strategy == "overlap_recall":
+        return bool(overlap >= float(overlap_recall_threshold)), float(iou), float(overlap)
+    if matching_strategy == "dual":
+        return bool(
+            iou >= float(match_iou_threshold)
+            or overlap >= float(overlap_recall_threshold)
+        ), float(iou), float(overlap)
+    raise ValueError(
+        "matching_strategy must be one of {'iou', 'overlap_recall', 'dual'}, "
+        f"got {matching_strategy!r}."
+    )
+
+
 class EventDetectionMetrics:
     """
     Compute event detection metrics at various temporal IoU thresholds.
@@ -251,37 +336,15 @@ class EventDetectionMetrics:
         pred_start: float, pred_end: float, target_start: float, target_end: float
     ) -> float:
         """Compute temporal IoU."""
-        # Clamp to [0, 1]
-        pred_start = np.clip(pred_start, 0, 1)
-        pred_end = np.clip(pred_end, 0, 1)
-        target_start = np.clip(target_start, 0, 1)
-        target_end = np.clip(target_end, 0, 1)
-
-        # Ensure start < end
-        if pred_start > pred_end:
-            pred_start, pred_end = pred_end, pred_start
-        if target_start > target_end:
-            target_start, target_end = target_end, target_start
-
-        # Intersection
-        inter_start = max(pred_start, target_start)
-        inter_end = min(pred_end, target_end)
-        inter_len = max(0, inter_end - inter_start)
-
-        # Union
-        union_len = (pred_end - pred_start) + (target_end - target_start) - inter_len
-
-        # IoU
-        if union_len < 1e-7:
-            return 0.0
-
-        return float(inter_len / union_len)
+        return temporal_iou(pred_start, pred_end, target_start, target_end)
 
     def compute_detection_summary(
         self,
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
-        iou_threshold: float = 0.5,
+        iou_threshold: float = 0.3,
+        matching_strategy: str = "iou",
+        overlap_recall_threshold: float = 0.8,
     ) -> Dict[str, object]:
         """
         Compute confusion matrix and per-class metrics from one shared matching pass.
@@ -368,7 +431,20 @@ class EventDetectionMetrics:
                         best_iou = iou
                         best_pred_idx = p_idx
 
-                if best_pred_idx >= 0 and best_iou >= iou_threshold:
+                is_match = False
+                if best_pred_idx >= 0:
+                    pred = sample_preds[best_pred_idx]
+                    is_match, best_iou, _ = is_interval_match(
+                        pred["start"],
+                        pred["end"],
+                        target.start_norm,
+                        target.end_norm,
+                        matching_strategy=matching_strategy,
+                        match_iou_threshold=float(iou_threshold),
+                        overlap_recall_threshold=float(overlap_recall_threshold),
+                    )
+
+                if best_pred_idx >= 0 and is_match:
                     matched_pred[best_pred_idx] = True
                     pred_class = int(sample_preds[best_pred_idx]["class_id"])
                     cm[true_class, pred_class] += 1
@@ -427,7 +503,9 @@ class EventDetectionMetrics:
         self,
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
-        iou_threshold: float = 0.5,
+        iou_threshold: float = 0.3,
+        matching_strategy: str = "iou",
+        overlap_recall_threshold: float = 0.8,
     ) -> float:
         """
         Compute F1 score at a specific IoU threshold.
@@ -508,7 +586,20 @@ class EventDetectionMetrics:
                     best_iou = iou
                     best_target_idx = t_idx
 
-            if best_iou >= iou_threshold and best_target_idx >= 0:
+            is_match = False
+            if best_target_idx >= 0:
+                _, target = all_targets[best_target_idx]
+                is_match, best_iou, _ = is_interval_match(
+                    pred.start_norm,
+                    pred.end_norm,
+                    target.start_norm,
+                    target.end_norm,
+                    matching_strategy=matching_strategy,
+                    match_iou_threshold=float(iou_threshold),
+                    overlap_recall_threshold=float(overlap_recall_threshold),
+                )
+
+            if is_match and best_target_idx >= 0:
                 tp += 1
                 matched[best_target_idx] = True
 
@@ -525,7 +616,9 @@ class EventDetectionMetrics:
         self,
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
-        iou_threshold: float = 0.5,
+        iou_threshold: float = 0.3,
+        matching_strategy: str = "iou",
+        overlap_recall_threshold: float = 0.8,
     ) -> Dict[int, float]:
         """
         Compute per-class F1 scores at a specific IoU threshold.
@@ -537,6 +630,8 @@ class EventDetectionMetrics:
             predictions=predictions,
             targets=targets,
             iou_threshold=iou_threshold,
+            matching_strategy=matching_strategy,
+            overlap_recall_threshold=overlap_recall_threshold,
         )
 
         return dict(summary["per_class_f1"])
@@ -545,7 +640,9 @@ class EventDetectionMetrics:
         self,
         predictions: Dict[str, np.ndarray],
         targets: list[list[EventInterval]],
-        iou_threshold: float = 0.5,
+        iou_threshold: float = 0.3,
+        matching_strategy: str = "iou",
+        overlap_recall_threshold: float = 0.8,
     ) -> Dict[int, float]:
         """
         Compute per-class IoU scores (average IoU of matched predictions per class).
@@ -557,5 +654,7 @@ class EventDetectionMetrics:
             predictions=predictions,
             targets=targets,
             iou_threshold=iou_threshold,
+            matching_strategy=matching_strategy,
+            overlap_recall_threshold=overlap_recall_threshold,
         )
         return dict(summary["per_class_iou"])
