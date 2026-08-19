@@ -587,11 +587,11 @@ class DETRTransformerDecoder(nn.Module):
 
 
 class DetectionHead(nn.Module):
-    """Single-event conv head over fused multiscale temporal features.
+    """Single-event prediction head over fused temporal features.
 
-    Input is a single fused feature map [B, C, T] (no query decoder). The head
-    emits one event per sample while preserving MuSSED output keys with an
-    explicit singleton query dimension [B, 1, ...].
+    Input is a fused feature map [B, C, T]. The head emits one event per
+    sample while preserving MuSSED output keys with an explicit singleton query
+    dimension [B, 1, ...].
     """
 
     def __init__(
@@ -609,31 +609,38 @@ class DetectionHead(nn.Module):
         )
         # Kept for constructor compatibility with prior configs.
         self.detection_head_mode = _validate_detection_head_mode(detection_head_mode)
-        self.trunk_dims = tuple() if trunk_dims is None else tuple(int(v) for v in trunk_dims)
+        self.trunk_dims = (
+            tuple() if trunk_dims is None else tuple(int(v) for v in trunk_dims)
+        )
 
         if input_dim < 1 or hidden_dim < 1:
             raise ValueError(
                 f"input_dim and hidden_dim must be >= 1, got {input_dim}, {hidden_dim}."
             )
 
-        self.trunk = nn.Sequential(
-            nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(hidden_dim, eps=1e-3),
-            nn.ReLU(),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(hidden_dim, eps=1e-3),
-            nn.ReLU(),
-        )
-
-        self.class_head = nn.Linear(hidden_dim, num_classes)
-        self.center_logits_head = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+        # Feature trunk moved into MuSSED multiscale fusion block.
+        self.class_head = nn.Linear(input_dim, num_classes)
+        self.center_logits_head = nn.Conv1d(input_dim, 1, kernel_size=1)
 
         if self.interval_output_format == "start_end":
-            self.start_head = nn.Linear(hidden_dim, 1)
-            self.end_head = nn.Linear(hidden_dim, 1)
+            self.start_head = nn.Linear(input_dim, 1)
+            self.end_head = nn.Linear(input_dim, 1)
             self.duration_head = None
+            self.duration_conv = None
+            self.duration_value_head = None
+            self.duration_weight_head = None
         else:
-            self.duration_head = nn.Linear(hidden_dim, 1)
+            duration_hidden = max(8, input_dim // 4)
+            self.duration_conv = nn.Sequential(
+                nn.Conv1d(
+                    input_dim, duration_hidden, kernel_size=3, padding=1, bias=False
+                ),
+                nn.BatchNorm1d(duration_hidden, eps=1e-3),
+                nn.ReLU(),
+            )
+            self.duration_value_head = nn.Conv1d(duration_hidden, 1, kernel_size=1)
+            self.duration_weight_head = nn.Conv1d(duration_hidden, 1, kernel_size=1)
+            self.duration_head = None
             self.start_head = None
             self.end_head = None
 
@@ -656,7 +663,7 @@ class DetectionHead(nn.Module):
         if x.ndim != 3:
             raise ValueError(f"DetectionHead expects [B, C, T], got {tuple(x.shape)}.")
 
-        feat = self.trunk(x)
+        feat = x
         pooled = feat.mean(dim=-1)
 
         class_logits = self.class_head(pooled)[:, None, :]
@@ -687,7 +694,16 @@ class DetectionHead(nn.Module):
             predictions["end"] = end
             predictions["center"] = 0.5 * (start + end)
         else:
-            predictions["duration"] = torch.sigmoid(self.duration_head(pooled))[:, None, :]
+            duration_feat = self.duration_conv(feat)
+            duration_values = torch.sigmoid(
+                self.duration_value_head(duration_feat)
+            ).squeeze(1)
+            duration_weights = torch.softmax(
+                self.duration_weight_head(duration_feat).squeeze(1),
+                dim=-1,
+            )
+            duration = (duration_weights * duration_values).sum(dim=-1, keepdim=True)
+            predictions["duration"] = duration[:, None, :]
 
         return predictions
 
@@ -701,8 +717,9 @@ class MuSSED(nn.Module):
 
     Architecture:
     - Temporal Encoder: multi-station aware, produces [B, C, T']
-    - Multiscale fusion: projected memories concatenated at shared resolution
-    - Detection Head: one event (class, interval) per sample
+        - Multiscale fusion: projected memories concatenated at shared resolution,
+            then learned 1x1 + 3x3 temporal fusion
+        - Detection head: one event (class, interval) per sample
     """
 
     def __init__(
@@ -801,9 +818,19 @@ class MuSSED(nn.Module):
             }
         )
 
+        fusion_input_dim = query_dim * (1 + len(self.memory_levels))
+        self.multiscale_fusion = nn.Sequential(
+            nn.Conv1d(fusion_input_dim, query_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(query_dim, eps=1e-3),
+            nn.ReLU(),
+            nn.Conv1d(query_dim, query_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(query_dim, eps=1e-3),
+            nn.ReLU(),
+        )
+
         # Detection heads.
         self.detection_head = DetectionHead(
-            input_dim=query_dim * (1 + len(self.memory_levels)),
+            input_dim=query_dim,
             hidden_dim=head_hidden_dim_resolved,
             num_classes=num_classes,
             interval_output_format=interval_output_format,
@@ -815,7 +842,9 @@ class MuSSED(nn.Module):
         self.num_queries = 1
         self.num_classes = num_classes
         self.interval_output_format = self.detection_head.interval_output_format
-        self.decoder_ffn_dim = int(hidden_dim) if decoder_ffn_dim is None else int(decoder_ffn_dim)
+        self.decoder_ffn_dim = (
+            int(hidden_dim) if decoder_ffn_dim is None else int(decoder_ffn_dim)
+        )
         self.head_hidden_dim = head_hidden_dim_resolved
         self.num_decoder_heads = int(num_decoder_heads)
         self.num_decoder_layers = int(num_decoder_layers)
@@ -856,7 +885,7 @@ class MuSSED(nn.Module):
         if self.use_temporal_projection:
             encoder_proj = self.temporal_proj(encoder_proj)  # [B, T', query_dim]
         bottleneck_emb = self.memory_level_embeddings["bottleneck"].transpose(1, 2)
-        memory_parts = [(encoder_proj.transpose(1, 2) + bottleneck_emb)]
+        memory_parts = [encoder_proj.transpose(1, 2) + bottleneck_emb]
 
         for level in self.memory_levels:
             level_features = extra_level_features[level]
@@ -882,6 +911,7 @@ class MuSSED(nn.Module):
                     )
                 )
         fused_memory = torch.cat(aligned_parts, dim=1)
+        fused_memory = self.multiscale_fusion(fused_memory)
 
         # 4. Predict event properties directly from fused temporal memory.
         predictions = self.detection_head(fused_memory)
