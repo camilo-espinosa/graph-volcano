@@ -76,16 +76,6 @@ def _validate_memory_levels(
     return tuple(levels)
 
 
-def _validate_detection_head_mode(value: str) -> str:
-    allowed_values = {"independent", "shared_trunk"}
-    if value not in allowed_values:
-        raise ValueError(
-            "detection_head_mode must be one of "
-            f"{sorted(allowed_values)}, got {value!r}."
-        )
-    return value
-
-
 class StationAttentionBlock(nn.Module):
     """Self-attention across stations, applied to time-pooled descriptors.
 
@@ -459,133 +449,6 @@ class MultiStationTemporalEncoder(nn.Module):
         return bottleneck_features
 
 
-class _DETRDecoderLayer(nn.Module):
-    """Transformer decoder layer exposing cross-attention weights."""
-
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        dim_feedforward: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-
-    def forward(
-        self,
-        tgt: torch.Tensor,
-        memory: torch.Tensor,
-        capture_cross_attention: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        self_attn_out, _ = self.self_attn(tgt, tgt, tgt, need_weights=False)
-        tgt = self.norm1(tgt + self.dropout1(self_attn_out))
-
-        cross_attn_out, cross_attn_weights = self.cross_attn(
-            tgt,
-            memory,
-            memory,
-            need_weights=capture_cross_attention,
-            average_attn_weights=False,
-        )
-        tgt = self.norm2(tgt + self.dropout2(cross_attn_out))
-
-        ff_out = self.linear2(self.dropout(F.gelu(self.linear1(tgt))))
-        tgt = self.norm3(tgt + self.dropout3(ff_out))
-
-        if not capture_cross_attention:
-            return tgt, None
-        return tgt, cross_attn_weights
-
-
-class DETRTransformerDecoder(nn.Module):
-    """
-    Minimal DETR transformer decoder with self-attention on queries
-    and cross-attention to temporal features.
-    """
-
-    def __init__(
-        self,
-        d_model: int = 256,
-        nhead: int = 4,
-        num_decoder_layers: int = 3,
-        dim_feedforward: int = 512,
-        dropout: float = 0.1,
-        capture_attention_weights: bool = False,
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.layers = nn.ModuleList(
-            [
-                _DETRDecoderLayer(
-                    d_model=d_model,
-                    nhead=nhead,
-                    dim_feedforward=dim_feedforward,
-                    dropout=dropout,
-                )
-                for _ in range(num_decoder_layers)
-            ]
-        )
-        self.capture_attention_weights = bool(capture_attention_weights)
-        self.last_cross_attn_weights: torch.Tensor | None = None
-
-    def forward(
-        self,
-        queries: torch.Tensor,  # [B, Nq, d_model]
-        memory: torch.Tensor,  # [B, T', d_model]
-    ) -> torch.Tensor:
-        """
-        Args:
-            queries: [B, Nq, d_model] learnable queries
-            memory: [B, T', d_model] encoder features (temporal)
-
-        Returns:
-            decoder_output: [B, Nq, d_model] decoded queries
-        """
-        x = queries
-        self.last_cross_attn_weights = None
-        for layer in self.layers:
-            x, cross_attn_weights = layer(
-                x,
-                memory,
-                capture_cross_attention=self.capture_attention_weights,
-            )
-            if self.capture_attention_weights and cross_attn_weights is not None:
-                self.last_cross_attn_weights = cross_attn_weights.detach()
-        return x
-
-    def attention_weights_by_level(
-        self, level_boundaries: dict[str, tuple[int, int]]
-    ) -> dict[str, torch.Tensor]:
-        if self.last_cross_attn_weights is None:
-            raise RuntimeError(
-                "No captured decoder cross-attention weights. "
-                "Set capture_attention_weights=True and run a forward pass first."
-            )
-        normalized_weights = (
-            self.last_cross_attn_weights
-            / self.last_cross_attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        )
-        by_level: dict[str, torch.Tensor] = {}
-        for level_name, (start, end) in level_boundaries.items():
-            by_level[level_name] = normalized_weights[..., start:end].sum(dim=-1)
-        return by_level
-
-
 class DetectionHead(nn.Module):
     """Single-event prediction head over fused temporal features.
 
@@ -607,16 +470,13 @@ class DetectionHead(nn.Module):
         self.interval_output_format = _validate_interval_output_format(
             interval_output_format
         )
-        # Kept for constructor compatibility with prior configs.
-        self.detection_head_mode = _validate_detection_head_mode(detection_head_mode)
+        self.detection_head_mode = detection_head_mode
         self.trunk_dims = (
             tuple() if trunk_dims is None else tuple(int(v) for v in trunk_dims)
         )
 
-        if input_dim < 1 or hidden_dim < 1:
-            raise ValueError(
-                f"input_dim and hidden_dim must be >= 1, got {input_dim}, {hidden_dim}."
-            )
+        if input_dim < 1:
+            raise ValueError(f"input_dim must be >= 1, got {input_dim}.")
 
         # Feature trunk moved into MuSSED multiscale fusion block.
         self.class_head = nn.Linear(input_dim, num_classes)
@@ -748,20 +608,16 @@ class MuSSED(nn.Module):
         num_decoder_layers: int = 2,
         decoder_dropout: float = 0.1,
         use_temporal_projection: bool = False,
-        interval_output_format: str = "start_end",
+        interval_output_format: str = "center_duration",
         detection_head_mode: str = "independent",
         head_trunk_dims: Sequence[int] | None = None,
     ):
         super().__init__()
 
-        head_hidden_dim_resolved = (
-            int(hidden_dim) if head_hidden_dim is None else int(head_hidden_dim)
-        )
-        if head_hidden_dim_resolved < 1:
-            raise ValueError(
-                "head_hidden_dim must be >= 1 after resolution, got "
-                f"{head_hidden_dim_resolved}."
-            )
+        # Legacy-unused args retained for API/config compatibility only:
+        # num_queries, hidden_dim, decoder_ffn_dim, head_hidden_dim,
+        # num_decoder_heads, num_decoder_layers, decoder_dropout,
+        # detection_head_mode, head_trunk_dims.
 
         # Build temporal encoder.
         self.encoder = MultiStationTemporalEncoder(
@@ -831,7 +687,9 @@ class MuSSED(nn.Module):
         # Detection heads.
         self.detection_head = DetectionHead(
             input_dim=query_dim,
-            hidden_dim=head_hidden_dim_resolved,
+            hidden_dim=(
+                int(hidden_dim) if head_hidden_dim is None else int(head_hidden_dim)
+            ),
             num_classes=num_classes,
             interval_output_format=interval_output_format,
             detection_head_mode=detection_head_mode,
@@ -842,13 +700,11 @@ class MuSSED(nn.Module):
         self.num_queries = 1
         self.num_classes = num_classes
         self.interval_output_format = self.detection_head.interval_output_format
-        self.decoder_ffn_dim = (
-            int(hidden_dim) if decoder_ffn_dim is None else int(decoder_ffn_dim)
-        )
-        self.head_hidden_dim = head_hidden_dim_resolved
-        self.num_decoder_heads = int(num_decoder_heads)
-        self.num_decoder_layers = int(num_decoder_layers)
-        self.decoder_dropout = float(decoder_dropout)
+        self.decoder_ffn_dim = decoder_ffn_dim
+        self.head_hidden_dim = head_hidden_dim
+        self.num_decoder_heads = num_decoder_heads
+        self.num_decoder_layers = num_decoder_layers
+        self.decoder_dropout = decoder_dropout
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -930,56 +786,3 @@ class MuSSED(nn.Module):
         """Unfreeze encoder parameters."""
         for param in self.encoder.parameters():
             param.requires_grad = True
-
-
-class SinusoidalPositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding computed on the fly for any length.
-
-    Unlike a fixed pre-allocated table, encodings are generated per forward
-    call from the requested sequence length, so the model is robust to inputs
-    of arbitrary size without a hard-coded maximum.
-    """
-
-    def __init__(self, d_model: int):
-        super().__init__()
-        if d_model % 2 != 0:
-            raise ValueError(
-                f"positional encoding requires an even d_model, got {d_model}."
-            )
-        self.d_model = int(d_model)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float)
-            * -(math.log(10000.0) / d_model)
-        )
-        self.register_buffer("div_term", div_term, persistent=False)
-
-    def forward(
-        self,
-        length: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        stride: float = 1.0,
-    ) -> torch.Tensor:
-        """
-        Args:
-            length: sequence length T to encode
-            device: device for the returned tensor
-            dtype: dtype for the returned tensor
-            stride: temporal stride used to map tokens onto a shared real-time axis
-
-        Returns:
-            positional encoding: [1, T, d_model]
-        """
-        if length < 1:
-            raise ValueError(f"sequence length must be >= 1, got {length}.")
-        if stride <= 0:
-            raise ValueError(f"stride must be > 0, got {stride}.")
-        position = (
-            torch.arange(length, device=device, dtype=torch.float) * float(stride)
-        ).unsqueeze(1)
-        angles = position * self.div_term.to(device=device)  # [T, d_model / 2]
-        pe = torch.zeros(length, self.d_model, device=device)
-        pe[:, 0::2] = torch.sin(angles)
-        pe[:, 1::2] = torch.cos(angles)
-        return pe.unsqueeze(0).to(dtype)  # [1, T, d_model]
