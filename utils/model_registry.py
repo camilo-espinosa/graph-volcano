@@ -101,17 +101,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # Only memory_levels changes; all other architecture/training settings
     # remain fixed to the established MuSSED baseline.
     # -------------------------------------------------------------------
-    "mussed_v1_base": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED_v1,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim":96,
-        },
-        "batch_size": 20,
-    },   
+
     "mussed_v0_base": {
         "family": "detr",
         "trainer_kind": "detr",
@@ -119,21 +109,90 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim":96,
         },
         "batch_size": 20,
     },
-    "mussed_base": {
+    "mussed_v0_base_loss_c4_b2_g2_u2": {
         "family": "detr",
         "trainer_kind": "detr",
-        "model_cls": MuSSED,
+        "model_cls": MuSSED_v0,
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "memory_levels": [0, 1, 2],
+        },
+        "batch_size": 20,
+        "loss_weights": {
+            "class": 4.0,
+            "bbox": 2.0,
+            "giou": 2.0,
+            "confidence": 2.0,
+        },
+    },
+    "mussed_v0_base_loss_c3_b2_g2_u1": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+        },
+        "batch_size": 20,
+        "loss_weights": {
+            "class": 3.0,
+            "bbox": 2.0,
+            "giou": 2.0,
+            "confidence": 1.0,
+        },
+    },
+    "mussed_v0_base_loss_c3_b2_g2_u2": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+        },
+        "batch_size": 20,
+        "loss_weights": {
+            "class": 3.0,
+            "bbox": 2.0,
+            "giou": 2.0,
+            "confidence": 2.0,
+        },
+    },    
+    "mussed_v0_base_l2": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [2],
             "decoder_ffn_dim":96,
         },
         "batch_size": 20,
     },
+    "mussed_v0_base_l12": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [1, 2],
+            "decoder_ffn_dim":96,
+        },
+        "batch_size": 20,
+    },
+    # "mussed_base": {
+    #     "family": "detr",
+    #     "trainer_kind": "detr",
+    #     "model_cls": MuSSED,
+    #     "model_kwargs": {
+    #         **deepcopy(MUSSED_BASE_KWARGS),
+    #         "memory_levels": [0, 1, 2],
+    #         "decoder_ffn_dim":96,
+    #     },
+    #     "batch_size": 20,
+    # },
     "mussed_ffn_192": {
         "family": "detr",
         "trainer_kind": "detr",
