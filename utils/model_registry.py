@@ -160,6 +160,54 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "confidence": 2.0,
         },
     },    
+    "mussed_v0_base_loss_c4_b2_g4_u2": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+        },
+        "batch_size": 20,
+        "loss_weights": {
+            "class": 4.0,
+            "bbox": 2.0,
+            "giou": 4.0,
+            "confidence": 2.0,
+        },
+    },    
+    "mussed_v0_base_loss_c4_b2_g4_u1": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+        },
+        "batch_size": 20,
+        "loss_weights": {
+            "class": 4.0,
+            "bbox": 2.0,
+            "giou": 4.0,
+            "confidence": 1.0,
+        },
+    },    
+    "mussed_v0_base_loss_c4_b3_g4_u1": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+        },
+        "batch_size": 20,
+        "loss_weights": {
+            "class": 4.0,
+            "bbox": 2.0,
+            "giou": 4.0,
+            "confidence": 2.0,
+        },
+    },    
     "mussed_v0_base_l2": {
         "family": "detr",
         "trainer_kind": "detr",
@@ -194,17 +242,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     #     },
     #     "batch_size": 20,
     # },
-    "mussed_ffn_192": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim": 192,
-        },
-        "batch_size": 20,
-    },
     # # ===================================================================
     # # ACTIVE: 5-FOLD SELECTION
     # # ===================================================================
