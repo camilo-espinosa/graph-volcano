@@ -101,45 +101,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # Only memory_levels changes; all other architecture/training settings
     # remain fixed to the established MuSSED baseline.
     # -------------------------------------------------------------------
-<<<<<<< HEAD
 
-=======
-    "mussed_v0_heavy_multilevel_detr": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED_v0,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim": 96,
-            "use_detr_detection_head": True,
-        },
-        "batch_size": 20,
-    },
-    "mussed_v0_heavy_multilevel_detr_ffn_192": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED_v0,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim": 192,
-            "use_detr_detection_head": True,
-        },
-        "batch_size": 20,
-    },
-    "mussed_v1_base": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED_v1,
-        "model_kwargs": {
-            **deepcopy(MUSSED_BASE_KWARGS),
-            "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim": 96,
-        },
-        "batch_size": 20,
-    },
->>>>>>> a1be44b2125ae84dc67bd6404a4c0fbbe9a6fe7d
     "mussed_v0_base": {
         "family": "detr",
         "trainer_kind": "detr",
@@ -157,7 +119,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "memory_levels": [0, 1, 2],
-<<<<<<< HEAD
         },
         "batch_size": 20,
         "loss_weights": {
@@ -207,9 +168,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             **deepcopy(MUSSED_BASE_KWARGS),
             "memory_levels": [2],
             "decoder_ffn_dim":96,
-=======
             "decoder_ffn_dim": 96,
->>>>>>> a1be44b2125ae84dc67bd6404a4c0fbbe9a6fe7d
         },
         "batch_size": 20,
     },
