@@ -101,6 +101,30 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     # Only memory_levels changes; all other architecture/training settings
     # remain fixed to the established MuSSED baseline.
     # -------------------------------------------------------------------
+    "mussed_v0_heavy_multilevel_detr": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "decoder_ffn_dim": 96,
+            "use_detr_detection_head": True,
+        },
+        "batch_size": 20,
+    },
+    "mussed_v0_heavy_multilevel_detr_ffn_192": {
+        "family": "detr",
+        "trainer_kind": "detr",
+        "model_cls": MuSSED_v0,
+        "model_kwargs": {
+            **deepcopy(MUSSED_BASE_KWARGS),
+            "memory_levels": [0, 1, 2],
+            "decoder_ffn_dim": 192,
+            "use_detr_detection_head": True,
+        },
+        "batch_size": 20,
+    },
     "mussed_v1_base": {
         "family": "detr",
         "trainer_kind": "detr",
@@ -108,10 +132,10 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim":96,
+            "decoder_ffn_dim": 96,
         },
         "batch_size": 20,
-    },   
+    },
     "mussed_v0_base": {
         "family": "detr",
         "trainer_kind": "detr",
@@ -119,7 +143,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim":96,
+            "decoder_ffn_dim": 96,
         },
         "batch_size": 20,
     },
@@ -130,7 +154,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim":96,
+            "decoder_ffn_dim": 96,
         },
         "batch_size": 20,
     },
@@ -141,7 +165,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {
             **deepcopy(MUSSED_BASE_KWARGS),
             "memory_levels": [0, 1, 2],
-            "decoder_ffn_dim":192,
+            "decoder_ffn_dim": 192,
         },
         "batch_size": 20,
     },
