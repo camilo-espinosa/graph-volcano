@@ -40,6 +40,7 @@ from utils.fold_io_utils import (
 )
 from utils.model_registry import MODEL_SPECS
 from utils.active_eval_utils import (
+    evaluate_detr_checkpoint,
     evaluate_multistation_checkpoint as evaluate_multistation_checkpoint_on_target,
     evaluate_unet_checkpoint as evaluate_unet_checkpoint_on_target,
     load_checkpoint_into_model,
@@ -68,7 +69,6 @@ DEFAULT_CROSS_DATA_ROOT = (
     PROJECT_ROOT / "data" / "prepared_data" / "progressive_finetuning"
 )
 DEFAULT_OUTPUT_NAME = "zero_shot_cross_volcano"
-DEFAULT_SCRAMBLE_STATIONS = False
 DEFAULT_POINTER_NAME = "pointer_zero_shot_cross_volcano.json"
 
 
@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=None,
+        default=48,
         help=(
             "Evaluation batch size override. When omitted, each model uses its "
             "registry batch_size."
@@ -146,24 +146,11 @@ def parse_args() -> argparse.Namespace:
         help="Save confusion matrix image per evaluated ablation/fold/target.",
     )
     parser.add_argument(
-        "--scramble-stations",
-        dest="scramble_stations",
-        action="store_true",
-        help="Randomly permute station order per sample before evaluation.",
-    )
-    parser.add_argument(
-        "--no-scramble-stations",
-        dest="scramble_stations",
-        action="store_false",
-        help="Keep the original station order during evaluation.",
-    )
-    parser.add_argument(
         "--station-scramble-seed",
         type=int,
         default=42,
         help="Base seed used to build deterministic per-sample station permutations.",
     )
-    parser.set_defaults(scramble_stations=DEFAULT_SCRAMBLE_STATIONS)
     return parser.parse_args()
 
 
@@ -436,7 +423,7 @@ def main() -> None:
         "allow_missing_models": bool(args.allow_missing_models),
         "allow_missing_folds": bool(args.allow_missing_folds),
         "save_confusion_matrices": bool(args.save_confusion_matrices),
-        "scramble_stations": bool(args.scramble_stations),
+        "scramble_stations": False,
         "station_scramble_seed": int(args.station_scramble_seed),
         "unet_shape": {
             "init_features": int(init_features),
@@ -449,7 +436,6 @@ def main() -> None:
         "folds": [int(f) for f in FOLDS],
         "model_specs": {
             key: {
-                "display_name": MODEL_SPECS[key]["display_name"],
                 "batch_size": int(MODEL_SPECS[key]["batch_size"]),
                 "model_kwargs": MODEL_SPECS[key]["model_kwargs"],
                 "eval_matching": MODEL_SPECS[key].get("eval_matching", {}),
@@ -467,7 +453,7 @@ def main() -> None:
     print(f"Output dir: {out_dir}")
     print(f"Models ({len(selected_models)}): {selected_models}")
     print(f"Targets ({len(selected_targets)}): {selected_targets}")
-    print(f"Scramble stations: {bool(args.scramble_stations)}")
+    print(f"Scramble stations: {False}")
     print(f"Device: {device}")
     print("=" * 80)
 
@@ -514,7 +500,7 @@ def main() -> None:
         trainer_kind = str(model_spec["trainer_kind"])
         model_kwargs = dict(model_spec["model_kwargs"])
 
-        print(f"\n[MODEL] {model_key} ({model_spec['display_name']})")
+        print(f"\n[MODEL] {model_key}")
         model_root = ablations_root / model_key
         if not model_root.exists():
             msg = f"Missing model folder: {model_root}"
@@ -612,7 +598,7 @@ def main() -> None:
                             test_npz_path=test_npz_path,
                             batch_size=batch_size,
                             device=device,
-                            scramble_stations=bool(args.scramble_stations),
+                            scramble_stations=False,
                             station_scramble_seed=int(args.station_scramble_seed),
                         )
                     elif trainer_kind == "2d":
@@ -655,7 +641,7 @@ def main() -> None:
                             device=device,
                             dice_weight=float(dice_weight),
                             ce_weight=float(ce_weight),
-                            scramble_stations=bool(args.scramble_stations),
+                            scramble_stations=False,
                             station_scramble_seed=int(args.station_scramble_seed),
                             class_names=CLASS_NAMES,
                             len_window=LEN_WINDOW,
@@ -663,6 +649,42 @@ def main() -> None:
                         )
                         iou_all_classes = [float("nan")] * len(ALL_CLASS_NAMES)
                         mean_iou_all = float("nan")
+                    elif trainer_kind == "detr":
+                        model = model_spec["model_cls"](**model_kwargs).to(device)
+                        ignore_checkpoint_keys = ()
+                        # Backward compatibility: some MuSSED checkpoints contain
+                        # a persisted event_queries tensor even when runtime model
+                        # config does not define that parameter.
+                        if getattr(model, "event_queries", None) is None:
+                            ignore_checkpoint_keys = ("event_queries",)
+                        load_checkpoint_into_model(
+                            model=model,
+                            checkpoint_path=ckpt_path,
+                            device=device,
+                            trainer_kind=trainer_kind,
+                            ignore_checkpoint_keys=ignore_checkpoint_keys,
+                        )
+                        (
+                            f1_per_class,
+                            mean_f1,
+                            iou_per_class,
+                            mean_iou,
+                            iou_all_classes,
+                            mean_iou_all,
+                            eval_loss,
+                            cm,
+                            n_samples,
+                            active_event_ids,
+                            _,
+                        ) = evaluate_detr_checkpoint(
+                            model=model,
+                            test_npz_path=test_npz_path,
+                            batch_size=batch_size,
+                            device=device,
+                            scramble_stations=False,
+                            station_scramble_seed=int(args.station_scramble_seed),
+                            model_spec=model_spec,
+                        )
                     else:
                         raise ValueError(
                             f"Unsupported trainer kind '{trainer_kind}' for key '{model_key}'"
@@ -670,7 +692,7 @@ def main() -> None:
 
                     row = {
                         "model_key": model_key,
-                        "model_display_name": str(model_spec["display_name"]),
+                        "model_display_name": str(model_key),
                         "fold": int(fold_id),
                         "repeat_id": int(repeat_id),
                         "target_volcano": target_name,

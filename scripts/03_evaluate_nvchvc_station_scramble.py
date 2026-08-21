@@ -488,7 +488,6 @@ def main() -> None:
                         checkpoint_path=ckpt_path,
                         device=device,
                         trainer_kind=trainer_kind,
-                        allowed_missing_keys=("station_dist",),
                         ignore_checkpoint_keys=("station_dist",),
                     )
                 else:
@@ -497,6 +496,7 @@ def main() -> None:
                         checkpoint_path=ckpt_path,
                         device=device,
                         trainer_kind=trainer_kind,
+                        ignore_checkpoint_keys=("event_queries",),
                     )
                 (
                     f1_per_class,
@@ -569,6 +569,7 @@ def main() -> None:
                     checkpoint_path=ckpt_path,
                     device=device,
                     trainer_kind=trainer_kind,
+                    ignore_checkpoint_keys=("event_queries",)
                 )
                 (
                     f1_per_class,

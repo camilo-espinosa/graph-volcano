@@ -120,6 +120,32 @@ def _resolve_detr_eval_matching(model_spec: dict, config: dict) -> dict[str, flo
     }
 
 
+def _checkpoint_state_dict_for_model(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Build a checkpoint-safe state dict aligned with the active MuSSED head mode."""
+    state = dict(model.state_dict())
+    use_detr_head = bool(getattr(model, "use_detr_detection_head", False))
+
+    if use_detr_head:
+        # DETR mode should not serialize direct-head parameters.
+        drop_prefixes = ("detection_head.",)
+    else:
+        # Direct-head mode should not serialize DETR-only parameters.
+        drop_prefixes = (
+            "event_queries",
+            "decoder.",
+            "detr_detection_head.",
+            "positional_encoding.",
+        )
+
+    keys_to_drop = [
+        key for key in state.keys() if any(key.startswith(prefix) for prefix in drop_prefixes)
+    ]
+    for key in keys_to_drop:
+        state.pop(key, None)
+
+    return state
+
+
 def compute_event_confusion_matrix(
     all_predictions: dict,
     all_targets: list,
@@ -904,10 +930,13 @@ def train_one_event_detection_fold(
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": _checkpoint_state_dict_for_model(model),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_loss": avg_val_loss,
                     "f1_score": mean_f1,
+                    "use_detr_detection_head": bool(
+                        getattr(model, "use_detr_detection_head", False)
+                    ),
                 },
                 checkpoints_dir / "best_f1.pt",
             )
@@ -931,10 +960,13 @@ def train_one_event_detection_fold(
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": _checkpoint_state_dict_for_model(model),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_loss": avg_val_loss,
                     "f1_score": mean_f1,
+                    "use_detr_detection_head": bool(
+                        getattr(model, "use_detr_detection_head", False)
+                    ),
                 },
                 checkpoints_dir / "best_val_loss.pt",
             )

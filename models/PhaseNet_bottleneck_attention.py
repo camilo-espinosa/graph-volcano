@@ -7,17 +7,17 @@ class PhaseNetBottleneckAttention(nn.Module):
 
     def __init__(
         self,
-        in_channels=3,
-        classes=3,
+        in_channels=8,
+        classes=6,
         out_channels=None,
         depth=5,
         kernel_size=7,
-        stride=4,
-        filters_root=8,
+        stride=2,
+        filters_root=32,
         norm="std",
-        feature_dropout=0.0,
+        feature_dropout=0.2,
         bottleneck_attn_heads=4,
-        bottleneck_attn_dropout=0.0,
+        bottleneck_attn_dropout=0.2,
         bottleneck_attn_ff_mult=2,
         **kwargs,
     ):

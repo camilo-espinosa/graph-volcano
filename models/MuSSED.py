@@ -1,12 +1,21 @@
 """
 MuSSED: Multi-Station Seismic Event Detection
 
-Standalone DETR-style event detector for multi-station seismic waveforms. The
-model emits a fixed set of events (class + temporal interval)
-directly, avoiding per-timestep segmentation and catalog post-processing.
+Standalone single-event detector for multi-station seismic waveforms. By default,
+the model uses a direct detection head that emits one event per sample
+(class + normalized temporal interval). Optionally supports a DETR-style decoder
+for multi-event detection via use_detr_detection_head parameter.
 
-This module is fully self-contained and does not depend on the MuSSeg
-segmentation model.
+Architecture:
+- MultiStationTemporalEncoder: U-Net-like encoder with weight-shared per-station
+  convolutions, station-interaction via attention at the bottleneck, and multiscale
+  memory levels for feature fusion.
+- Detection Head: Directly predicts class and event interval from fused multiscale
+  features. Supports interval output as (start, end) or (center, duration).
+  Optional DETR decoder for multi-query detection.
+
+This module is fully self-contained and does not depend on the MuSSeg segmentation
+model, though it shares the same encoder architecture.
 """
 
 from __future__ import annotations
@@ -513,10 +522,7 @@ class _DETRDecoderLayer(nn.Module):
 
 
 class DETRTransformerDecoder(nn.Module):
-    """
-    Minimal DETR transformer decoder with self-attention on queries
-    and cross-attention to temporal features.
-    """
+    """Minimal DETR transformer decoder over temporal memory tokens."""
 
     def __init__(
         self,
@@ -546,16 +552,8 @@ class DETRTransformerDecoder(nn.Module):
     def forward(
         self,
         queries: torch.Tensor,  # [B, Nq, d_model]
-        memory: torch.Tensor,  # [B, T', d_model]
+        memory: torch.Tensor,  # [B, T, d_model]
     ) -> torch.Tensor:
-        """
-        Args:
-            queries: [B, Nq, d_model] learnable queries
-            memory: [B, T', d_model] encoder features (temporal)
-
-        Returns:
-            decoder_output: [B, Nq, d_model] decoded queries
-        """
         x = queries
         self.last_cross_attn_weights = None
         for layer in self.layers:
@@ -568,38 +566,124 @@ class DETRTransformerDecoder(nn.Module):
                 self.last_cross_attn_weights = cross_attn_weights.detach()
         return x
 
-    def attention_weights_by_level(
-        self, level_boundaries: dict[str, tuple[int, int]]
-    ) -> dict[str, torch.Tensor]:
-        if self.last_cross_attn_weights is None:
-            raise RuntimeError(
-                "No captured decoder cross-attention weights. "
-                "Set capture_attention_weights=True and run a forward pass first."
-            )
-        normalized_weights = (
-            self.last_cross_attn_weights
-            / self.last_cross_attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        )
-        by_level: dict[str, torch.Tensor] = {}
-        for level_name, (start, end) in level_boundaries.items():
-            by_level[level_name] = normalized_weights[..., start:end].sum(dim=-1)
-        return by_level
-
 
 class DetectionHead(nn.Module):
-    """Per-query prediction heads: class and temporal interval.
+    """Single-event prediction head over fused temporal features.
 
-    Supports two interval parameterizations controlled by
-    ``interval_output_format``:
-
-    - ``center_duration``: predicts ``center`` and ``duration`` (both in [0, 1]).
-        ``start/end`` are materialized later by normalization utilities.
-    - ``start_end``: predicts ``start`` and ``end`` directly (both in [0, 1]),
-        then enforces temporal ordering via element-wise min/max.
-
-    In both modes, a ``center`` key is returned so downstream loss/matching code
-    can use a shared interface.
+    Input is a fused feature map [B, C, T]. The head emits one event per
+    sample while preserving MuSSED output keys with an explicit singleton query
+    dimension [B, 1, ...].
     """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_classes: int = 6,
+        interval_output_format: str = "start_end",
+        detection_head_mode: str = "independent",
+    ):
+        super().__init__()
+        self.interval_output_format = _validate_interval_output_format(
+            interval_output_format
+        )
+        self.detection_head_mode = _validate_detection_head_mode(detection_head_mode)
+
+        if input_dim < 1:
+            raise ValueError(f"input_dim must be >= 1, got {input_dim}.")
+
+        # Feature trunk moved into MuSSED multiscale fusion block.
+        self.class_head = nn.Linear(input_dim, num_classes)
+        self.center_logits_head = nn.Conv1d(input_dim, 1, kernel_size=1)
+
+        if self.interval_output_format == "start_end":
+            self.start_head = nn.Linear(input_dim, 1)
+            self.end_head = nn.Linear(input_dim, 1)
+            self.duration_head = None
+            self.duration_conv = None
+            self.duration_value_head = None
+            self.duration_weight_head = None
+        else:
+            duration_hidden = max(8, input_dim // 4)
+            self.duration_conv = nn.Sequential(
+                nn.Conv1d(
+                    input_dim, duration_hidden, kernel_size=3, padding=1, bias=False
+                ),
+                nn.BatchNorm1d(duration_hidden, eps=1e-3),
+                nn.ReLU(),
+            )
+            self.duration_value_head = nn.Conv1d(duration_hidden, 1, kernel_size=1)
+            self.duration_weight_head = nn.Conv1d(duration_hidden, 1, kernel_size=1)
+            self.duration_head = None
+            self.start_head = None
+            self.end_head = None
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            x: [B, C, T]
+
+        Returns:
+            Dict with keys:
+                - class_logits: [B, 1, num_classes]
+                - if interval_output_format == "start_end":
+                    - start: [B, 1, 1] in [0, 1]
+                    - end: [B, 1, 1] in [0, 1]
+                    - center: [B, 1, 1] in [0, 1]
+                - if interval_output_format == "center_duration":
+                    - center: [B, 1, 1] in [0, 1]
+                    - duration: [B, 1, 1] in [0, 1]
+        """
+        if x.ndim != 3:
+            raise ValueError(f"DetectionHead expects [B, C, T], got {tuple(x.shape)}.")
+
+        feat = x
+        pooled = feat.mean(dim=-1)
+
+        class_logits = self.class_head(pooled)[:, None, :]
+
+        center_logits = self.center_logits_head(feat).squeeze(1)
+        center_weights = torch.softmax(center_logits, dim=-1)
+        time_grid = torch.linspace(
+            0.0,
+            1.0,
+            steps=center_weights.shape[-1],
+            device=center_weights.device,
+            dtype=center_weights.dtype,
+        )
+        center = (center_weights * time_grid[None, :]).sum(dim=-1, keepdim=True)
+        center = center[:, None, :]
+
+        predictions: Dict[str, torch.Tensor] = {
+            "class_logits": class_logits,
+            "center": center,
+        }
+
+        if self.interval_output_format == "start_end":
+            raw_start = torch.sigmoid(self.start_head(pooled))[:, None, :]
+            raw_end = torch.sigmoid(self.end_head(pooled))[:, None, :]
+            start = torch.minimum(raw_start, raw_end)
+            end = torch.maximum(raw_start, raw_end)
+            predictions["start"] = start
+            predictions["end"] = end
+            predictions["center"] = 0.5 * (start + end)
+        else:
+            duration_feat = self.duration_conv(feat)
+            duration_values = torch.sigmoid(
+                self.duration_value_head(duration_feat)
+            ).squeeze(1)
+            duration_weights = torch.softmax(
+                self.duration_weight_head(duration_feat).squeeze(1),
+                dim=-1,
+            )
+            duration = (duration_weights * duration_values).sum(dim=-1, keepdim=True)
+            predictions["duration"] = duration[:, None, :]
+
+        return predictions
+
+
+class DETRDetectionHead(nn.Module):
+    """Per-query DETR-style prediction heads: class and temporal interval."""
 
     def __init__(
         self,
@@ -679,21 +763,10 @@ class DetectionHead(nn.Module):
                 self.end_head = None
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            x: [B, Nq, input_dim]
-
-        Returns:
-            Dict with keys:
-                - class_logits: [B, Nq, num_classes] (raw logits)
-                - if interval_output_format == "start_end":
-                    - start: [B, Nq, 1] in [0, 1]
-                    - end: [B, Nq, 1] in [0, 1]
-                    - center: [B, Nq, 1] in [0, 1]
-                - if interval_output_format == "center_duration":
-                    - center: [B, Nq, 1] in [0, 1]
-                    - duration: [B, Nq, 1] in [0, 1]
-        """
+        if x.ndim != 3:
+            raise ValueError(
+                f"DETRDetectionHead expects [B, Nq, D], got {tuple(x.shape)}."
+            )
         head_input = x if self.shared_trunk is None else self.shared_trunk(x)
         predictions = {"class_logits": self.class_head(head_input)}
         if self.interval_output_format == "start_end":
@@ -713,18 +786,56 @@ class DetectionHead(nn.Module):
         return predictions
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding computed on the fly for any length."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        if d_model % 2 != 0:
+            raise ValueError(
+                f"positional encoding requires an even d_model, got {d_model}."
+            )
+        self.d_model = int(d_model)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * -(math.log(10000.0) / d_model)
+        )
+        self.register_buffer("div_term", div_term, persistent=False)
+
+    def forward(
+        self,
+        length: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        stride: float = 1.0,
+    ) -> torch.Tensor:
+        if length < 1:
+            raise ValueError(f"sequence length must be >= 1, got {length}.")
+        if stride <= 0:
+            raise ValueError(f"stride must be > 0, got {stride}.")
+        position = (
+            torch.arange(length, device=device, dtype=torch.float) * float(stride)
+        ).unsqueeze(1)
+        angles = position * self.div_term.to(device=device)  # [T, d_model / 2]
+        pe = torch.zeros(length, self.d_model, device=device)
+        pe[:, 0::2] = torch.sin(angles)
+        pe[:, 1::2] = torch.cos(angles)
+        return pe.unsqueeze(0).to(dtype)  # [1, T, d_model]
+
+
 class MuSSED(nn.Module):
     """
     MuSSED: Multi-Station Seismic Event Detection
 
-    DETR-inspired event detection architecture.
-    Detects a fixed set of events (not per-timestep segmentation).
+    Single-event detection architecture with a MuSSeg-like encoder and
+    a direct multiscale conv head.
 
     Architecture:
     - Temporal Encoder: multi-station aware, produces [B, C, T']
-    - Event Queries: learnable set of Nq queries
-    - Transformer Decoder: self-attention on queries + cross-attention to features
-    - Detection Head: per-query predictions (class, interval)
+        - Multiscale fusion: projected memories concatenated at shared resolution,
+            then learned 1x1 + 3x3 temporal fusion
+        - Detection head: one event (class, interval) per sample
     """
 
     def __init__(
@@ -733,17 +844,17 @@ class MuSSED(nn.Module):
         # --- Encoder (fixed to the best MuSSeg NVCHVC config by default) ---
         depth: int = 4,
         kernel_size: int | Sequence[int] = 127,
-        stride: int | Sequence[int] = 2,
-        dilation: int | Sequence[int] = 1,
+        stride: int | Sequence[int] = [2, 2, 2],
+        dilation: int | Sequence[int] = [1, 1, 1, 1],
         filters_root: int = 16,
         bottleneck_attention: bool = True,
         bottleneck_attn_heads: int = 4,
         bottleneck_attn_ff_mult: int = 2,
         station_attn_heads: int = 4,
         station_attn_ff_mult: int = 2,
-        station_mask_abs_sum_threshold: float = 0.0,
-        memory_levels: Sequence[int] = (),
-        # --- Detection decoder / heads ---
+        station_mask_abs_sum_threshold: float = 1e1,
+        memory_levels: Sequence[int] = (0, 1, 2),
+        # --- Detection head ---
         num_queries: int = 1,
         query_dim: int = 128,
         hidden_dim: int = 256,
@@ -753,14 +864,21 @@ class MuSSED(nn.Module):
         num_decoder_layers: int = 2,
         decoder_dropout: float = 0.1,
         use_temporal_projection: bool = False,
-        interval_output_format: str = "start_end",
+        use_detr_detection_head: bool = False,
+        interval_output_format: str = "center_duration",
         detection_head_mode: str = "independent",
         head_trunk_dims: Sequence[int] | None = None,
     ):
         super().__init__()
 
-        if num_queries < 1:
+        if int(num_queries) < 1:
             raise ValueError(f"num_queries must be >= 1, got {num_queries}.")
+        if query_dim % num_decoder_heads != 0 and use_detr_detection_head:
+            raise ValueError(
+                f"query_dim ({query_dim}) must be divisible by "
+                f"num_decoder_heads ({num_decoder_heads}) when "
+                "use_detr_detection_head=True."
+            )
 
         decoder_ffn_dim_resolved = (
             int(hidden_dim) if decoder_ffn_dim is None else int(decoder_ffn_dim)
@@ -818,18 +936,7 @@ class MuSSED(nn.Module):
             }
         )
 
-        # Transformer attention requires the model dim to split evenly across heads.
-        if query_dim % num_decoder_heads != 0:
-            raise ValueError(
-                f"query_dim ({query_dim}) must be divisible by "
-                f"num_decoder_heads ({num_decoder_heads})."
-            )
-
-        # Learnable event queries.
         self.num_queries = int(num_queries)
-        self.event_queries = nn.Parameter(
-            torch.randn(1, self.num_queries, query_dim) / (query_dim**0.5)
-        )
         self.memory_level_embeddings = nn.ParameterDict(
             {
                 "bottleneck": nn.Parameter(
@@ -844,34 +951,65 @@ class MuSSED(nn.Module):
             }
         )
 
-        # Sinusoidal positional encoding, computed on the fly for any length.
-        self.positional_encoding = SinusoidalPositionalEncoding(query_dim)
-
-        # DETR transformer decoder.
-        self.decoder = DETRTransformerDecoder(
-            d_model=query_dim,
-            nhead=num_decoder_heads,
-            num_decoder_layers=num_decoder_layers,
-            dim_feedforward=decoder_ffn_dim_resolved,
-            dropout=decoder_dropout,
-            capture_attention_weights=False,
+        fusion_input_dim = query_dim * (1 + len(self.memory_levels))
+        self.multiscale_fusion = nn.Sequential(
+            nn.Conv1d(fusion_input_dim, query_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(query_dim, eps=1e-3),
+            nn.ReLU(),
+            nn.Conv1d(query_dim, query_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(query_dim, eps=1e-3),
+            nn.ReLU(),
         )
 
-        # Detection heads.
-        self.detection_head = DetectionHead(
-            input_dim=query_dim,
-            hidden_dim=head_hidden_dim_resolved,
-            num_classes=num_classes,
-            interval_output_format=interval_output_format,
-            detection_head_mode=detection_head_mode,
-            trunk_dims=head_trunk_dims,
-        )
+        self.use_detr_detection_head = bool(use_detr_detection_head)
+        if self.use_detr_detection_head:
+            self.positional_encoding = SinusoidalPositionalEncoding(query_dim)
+            self.decoder = DETRTransformerDecoder(
+                d_model=query_dim,
+                nhead=num_decoder_heads,
+                num_decoder_layers=num_decoder_layers,
+                dim_feedforward=decoder_ffn_dim_resolved,
+                dropout=decoder_dropout,
+                capture_attention_weights=False,
+            )
+            self.event_queries = nn.Parameter(
+                torch.randn(1, self.num_queries, query_dim) / (query_dim**0.5)
+            )
+            self.detr_detection_head = DETRDetectionHead(
+                input_dim=query_dim,
+                hidden_dim=head_hidden_dim_resolved,
+                num_classes=num_classes,
+                interval_output_format=interval_output_format,
+                detection_head_mode=detection_head_mode,
+                trunk_dims=head_trunk_dims,
+            )
+            self.detection_head = None
+        else:
+            self.positional_encoding = None
+            self.decoder = None
+            self.event_queries = None
+            self.detr_detection_head = None
+            self.detection_head = DetectionHead(
+                input_dim=query_dim,
+                hidden_dim=head_hidden_dim_resolved,
+                num_classes=num_classes,
+                interval_output_format=interval_output_format,
+                detection_head_mode=detection_head_mode,
+            )
 
         self.query_dim = query_dim
         self.num_classes = num_classes
-        self.interval_output_format = self.detection_head.interval_output_format
+        if self.use_detr_detection_head:
+            self.interval_output_format = (
+                self.detr_detection_head.interval_output_format
+            )
+        else:
+            self.interval_output_format = self.detection_head.interval_output_format
         self.decoder_ffn_dim = decoder_ffn_dim_resolved
         self.head_hidden_dim = head_hidden_dim_resolved
+        self.num_decoder_heads = num_decoder_heads
+        self.num_decoder_layers = num_decoder_layers
+        self.decoder_dropout = decoder_dropout
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -895,8 +1033,6 @@ class MuSSED(nn.Module):
                     - duration: [B, Nq, 1] normalized event duration in [0, 1]
                 - encoder_features: [B, C, T'] for interpretability
         """
-        batch_size = x.shape[0]
-
         # 1. Encode temporal features
         encoder_out = self.encoder(x, return_extra_level_features=True)
         if isinstance(encoder_out, tuple):
@@ -905,45 +1041,66 @@ class MuSSED(nn.Module):
             encoder_features = encoder_out
             extra_level_features = {}
 
-        # 2. Project encoder features (optional)
+        # 2. Project each memory level to query_dim and collect channel-first maps.
         encoder_proj = encoder_features.transpose(1, 2)  # [B, T', C]
         if self.use_temporal_projection:
             encoder_proj = self.temporal_proj(encoder_proj)  # [B, T', query_dim]
-        encoder_proj = encoder_proj + self.memory_level_embeddings["bottleneck"]
-
-        # 3. Add positional encoding in shared real-time coordinates.
-        pos_enc = self.positional_encoding(
-            encoder_proj.shape[1],
-            device=encoder_proj.device,
-            dtype=encoder_proj.dtype,
-            stride=self.encoder.last_bottleneck_effective_stride,
-        )
-        memory_parts = [encoder_proj + pos_enc]
+        bottleneck_emb = self.memory_level_embeddings["bottleneck"].transpose(1, 2)
+        memory_parts = [encoder_proj.transpose(1, 2) + bottleneck_emb]
 
         for level in self.memory_levels:
             level_features = extra_level_features[level]
             level_proj = self.memory_level_projections[str(level)](
                 level_features.transpose(1, 2)
             )
-            level_proj = level_proj + self.memory_level_embeddings[str(level)]
-            level_pos_enc = self.positional_encoding(
-                level_proj.shape[1],
-                device=level_proj.device,
-                dtype=level_proj.dtype,
-                stride=self.encoder.last_extra_level_effective_strides[level],
+            level_emb = self.memory_level_embeddings[str(level)].transpose(1, 2)
+            memory_parts.append(level_proj.transpose(1, 2) + level_emb)
+
+        # 3. Upsample all memory levels to a shared temporal length and concatenate.
+        target_len = max(part.shape[-1] for part in memory_parts)
+        aligned_parts: list[torch.Tensor] = []
+        for part in memory_parts:
+            if part.shape[-1] == target_len:
+                aligned_parts.append(part)
+            else:
+                aligned_parts.append(
+                    F.interpolate(
+                        part,
+                        size=target_len,
+                        mode="linear",
+                        align_corners=False,
+                    )
+                )
+        # 4. Predict event properties.
+        if self.use_detr_detection_head:
+            level_strides = [self.encoder.last_bottleneck_effective_stride]
+            level_strides.extend(
+                self.encoder.last_extra_level_effective_strides[level]
+                for level in self.memory_levels
             )
-            memory_parts.append(level_proj + level_pos_enc)
+            shared_stride = float(min(level_strides))
 
-        memory = torch.cat(memory_parts, dim=1)
+            # Heavy mode: keep levels separate and flatten [L, T] into memory tokens.
+            level_tokens = torch.stack(
+                [part.transpose(1, 2) for part in aligned_parts],
+                dim=1,
+            )  # [B, L, T, D]
+            temporal_pos = self.positional_encoding(
+                level_tokens.shape[2],
+                device=level_tokens.device,
+                dtype=level_tokens.dtype,
+                stride=shared_stride,
+            )
+            level_tokens = level_tokens + temporal_pos[:, None, :, :]
+            memory_tokens = level_tokens.flatten(start_dim=1, end_dim=2)  # [B, L*T, D]
 
-        # 4. Expand queries to batch size
-        queries = self.event_queries.expand(batch_size, -1, -1)  # [B, Nq, query_dim]
-
-        # 5. Decode (transformer decoder)
-        decoder_out = self.decoder(queries, memory)  # [B, Nq, query_dim]
-
-        # 6. Predict event properties
-        predictions = self.detection_head(decoder_out)
+            queries = self.event_queries.expand(memory_tokens.shape[0], -1, -1)
+            decoder_out = self.decoder(queries, memory_tokens)
+            predictions = self.detr_detection_head(decoder_out)
+        else:
+            fused_memory = torch.cat(aligned_parts, dim=1)
+            fused_memory = self.multiscale_fusion(fused_memory)
+            predictions = self.detection_head(fused_memory)
 
         # Add encoder features for interpretability
         predictions["encoder_features"] = encoder_features
@@ -959,56 +1116,3 @@ class MuSSED(nn.Module):
         """Unfreeze encoder parameters."""
         for param in self.encoder.parameters():
             param.requires_grad = True
-
-
-class SinusoidalPositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding computed on the fly for any length.
-
-    Unlike a fixed pre-allocated table, encodings are generated per forward
-    call from the requested sequence length, so the model is robust to inputs
-    of arbitrary size without a hard-coded maximum.
-    """
-
-    def __init__(self, d_model: int):
-        super().__init__()
-        if d_model % 2 != 0:
-            raise ValueError(
-                f"positional encoding requires an even d_model, got {d_model}."
-            )
-        self.d_model = int(d_model)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float)
-            * -(math.log(10000.0) / d_model)
-        )
-        self.register_buffer("div_term", div_term, persistent=False)
-
-    def forward(
-        self,
-        length: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        stride: float = 1.0,
-    ) -> torch.Tensor:
-        """
-        Args:
-            length: sequence length T to encode
-            device: device for the returned tensor
-            dtype: dtype for the returned tensor
-            stride: temporal stride used to map tokens onto a shared real-time axis
-
-        Returns:
-            positional encoding: [1, T, d_model]
-        """
-        if length < 1:
-            raise ValueError(f"sequence length must be >= 1, got {length}.")
-        if stride <= 0:
-            raise ValueError(f"stride must be > 0, got {stride}.")
-        position = (
-            torch.arange(length, device=device, dtype=torch.float) * float(stride)
-        ).unsqueeze(1)
-        angles = position * self.div_term.to(device=device)  # [T, d_model / 2]
-        pe = torch.zeros(length, self.d_model, device=device)
-        pe[:, 0::2] = torch.sin(angles)
-        pe[:, 1::2] = torch.cos(angles)
-        return pe.unsqueeze(0).to(dtype)  # [1, T, d_model]
