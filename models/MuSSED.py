@@ -200,6 +200,65 @@ class TemporalBottleneckAttention(nn.Module):
         return x.transpose(1, 2)  # [N, C, T]
 
 
+class TemporalPreHeadSelfAttention(nn.Module):
+    """Pre-norm transformer block over temporal embeddings before direct head.
+
+    Input/Output: [B, C, T]. The block applies self-attention over T and a
+    feed-forward residual branch, then returns [B, C, T].
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        heads: int = 4,
+        ff_mult: int = 2,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if channels % heads != 0:
+            raise ValueError(
+                f"pre-head temporal attention channels ({channels}) must be "
+                f"divisible by heads ({heads})."
+            )
+        if ff_mult < 1:
+            raise ValueError(f"ff_mult must be >= 1, got {ff_mult}.")
+        if dropout < 0 or dropout >= 1:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
+
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(
+            channels,
+            heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(channels)
+        self.ff = nn.Sequential(
+            nn.Linear(channels, channels * ff_mult),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(channels * ff_mult, channels),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(
+                "TemporalPreHeadSelfAttention expects [B, C, T], "
+                f"got {tuple(x.shape)}."
+            )
+        y = x.transpose(1, 2)  # [B, T, C]
+        attn_out, _ = self.attn(
+            self.norm1(y),
+            self.norm1(y),
+            self.norm1(y),
+            need_weights=False,
+        )
+        y = y + self.dropout(attn_out)
+        y = y + self.dropout(self.ff(self.norm2(y)))
+        return y.transpose(1, 2)
+
+
 class MultiStationTemporalEncoder(nn.Module):
     """U-Net-style temporal encoder with weight-shared per-station convolutions.
 
@@ -865,6 +924,10 @@ class MuSSED(nn.Module):
         decoder_dropout: float = 0.1,
         use_temporal_projection: bool = False,
         use_detr_detection_head: bool = False,
+        use_prehead_temporal_self_attention: bool = False,
+        prehead_temporal_attn_heads: int = 4,
+        prehead_temporal_attn_ff_mult: int = 2,
+        prehead_temporal_attn_dropout: float = 0.0,
         interval_output_format: str = "center_duration",
         detection_head_mode: str = "independent",
         head_trunk_dims: Sequence[int] | None = None,
@@ -997,6 +1060,24 @@ class MuSSED(nn.Module):
                 detection_head_mode=detection_head_mode,
             )
 
+        self.use_prehead_temporal_self_attention = bool(
+            use_prehead_temporal_self_attention
+        )
+        if self.use_prehead_temporal_self_attention and self.use_detr_detection_head:
+            raise ValueError(
+                "use_prehead_temporal_self_attention is supported only when "
+                "use_detr_detection_head=False."
+            )
+        if self.use_prehead_temporal_self_attention:
+            self.prehead_temporal_attention = TemporalPreHeadSelfAttention(
+                channels=query_dim,
+                heads=int(prehead_temporal_attn_heads),
+                ff_mult=int(prehead_temporal_attn_ff_mult),
+                dropout=float(prehead_temporal_attn_dropout),
+            )
+        else:
+            self.prehead_temporal_attention = None
+
         self.query_dim = query_dim
         self.num_classes = num_classes
         if self.use_detr_detection_head:
@@ -1100,6 +1181,8 @@ class MuSSED(nn.Module):
         else:
             fused_memory = torch.cat(aligned_parts, dim=1)
             fused_memory = self.multiscale_fusion(fused_memory)
+            if self.prehead_temporal_attention is not None:
+                fused_memory = self.prehead_temporal_attention(fused_memory)
             predictions = self.detection_head(fused_memory)
 
         # Add encoder features for interpretability

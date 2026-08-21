@@ -22,6 +22,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.active_eval_utils import load_checkpoint_into_model
+from utils.detection_prediction_utils import normalize_prediction_intervals
+from utils.detr_event_loss import DETREventLoss
+from utils.event_detection_metrics import EventDetectionMetrics
+from utils.event_targets import batch_segmentation_to_events
 from utils.fold_io_utils import append_row_csv
 from utils.finetune_utils import apply_finetune_protocol
 from utils.model_registry import MODEL_SPECS, build_model_from_spec, get_model_spec
@@ -59,6 +63,7 @@ SUBSET_FIXED_LR = {
 }
 
 CLASS_NAMES = ["VT", "LP", "TR", "AV", "IC"]
+DETR_CM_CLASS_NAMES = ["Background", *CLASS_NAMES]
 EVENT_CLASS_MAP = {
     1.0: "VT",
     2.0: "LP",
@@ -121,7 +126,7 @@ def parse_args() -> argparse.Namespace:
         help="Finetuning protocol key from utils.finetune_utils.",
     )
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--early-stop-patience", type=int, default=20)
+    parser.add_argument("--early-stop-patience", type=int, default=15)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr-final", type=float, default=1e-6)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -298,7 +303,24 @@ def _load_base_model(
     target_volcano: str,
 ) -> torch.nn.Module:
     spec = get_model_spec(model_key)
+    trainer_kind = str(spec["trainer_kind"])
     model_kwargs = dict(spec["model_kwargs"])
+
+    if trainer_kind == "detr":
+        model = build_model_from_spec(model_key, n_classes=6).to(device)
+        ignore_checkpoint_keys: tuple[str, ...] = ()
+        if getattr(model, "event_queries", None) is None:
+            # Backward compatibility for checkpoints that persisted event_queries.
+            ignore_checkpoint_keys = ("event_queries",)
+        load_checkpoint_into_model(
+            model,
+            checkpoint_path,
+            device,
+            trainer_kind=trainer_kind,
+            ignore_checkpoint_keys=ignore_checkpoint_keys,
+        )
+        return model
+
     uses_station_info = bool(
         model_kwargs.get("use_distance_attn_bias", False)
         or model_kwargs.get("use_distance_bottleneck_emb", False)
@@ -326,6 +348,138 @@ def _load_base_model(
             trainer_kind=str(spec["trainer_kind"]),
         )
     return model
+
+
+def _resolve_detr_loss_weights(spec: dict, config: dict) -> dict[str, float]:
+    defaults = {
+        "class_loss": 2.0,
+        "bbox_loss": 2.0,
+        "giou_loss": 2.0,
+        "unmatched_query": 2.0,
+    }
+    aliases = {
+        "class": "class_loss",
+        "bbox": "bbox_loss",
+        "giou": "giou_loss",
+        "confidence": "unmatched_query",
+        "class_loss": "class_loss",
+        "bbox_loss": "bbox_loss",
+        "giou_loss": "giou_loss",
+        "unmatched_query": "unmatched_query",
+    }
+
+    resolved = dict(defaults)
+    for source in (spec.get("loss_weights") or {}, config.get("loss_weights") or {}):
+        for key, value in source.items():
+            mapped = aliases.get(str(key))
+            if mapped is not None:
+                resolved[mapped] = float(value)
+    return resolved
+
+
+def _resolve_detr_eval_matching(spec: dict, config: dict) -> dict[str, float | str]:
+    resolved: dict[str, float | str] = {
+        "match_iou_threshold": 0.3,
+        "matching_strategy": "iou",
+        "overlap_recall_threshold": 0.8,
+    }
+
+    spec_eval = spec.get("eval_matching")
+    if isinstance(spec_eval, dict):
+        resolved.update(spec_eval)
+
+    if "match_iou_threshold" in config:
+        resolved["match_iou_threshold"] = float(config["match_iou_threshold"])
+    if "matching_strategy" in config:
+        resolved["matching_strategy"] = str(config["matching_strategy"])
+    if "overlap_recall_threshold" in config:
+        resolved["overlap_recall_threshold"] = float(config["overlap_recall_threshold"])
+
+    strategy = str(resolved["matching_strategy"]).strip().lower()
+    if strategy not in {"iou", "overlap_recall", "dual"}:
+        raise ValueError(
+            "matching_strategy must be one of {'iou', 'overlap_recall', 'dual'}, "
+            f"got {strategy!r}."
+        )
+    resolved["matching_strategy"] = strategy
+    return resolved
+
+
+def _evaluate_detr_loader(
+    *,
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    loss_fn: DETREventLoss,
+    metrics_fn: EventDetectionMetrics,
+    matching_cfg: dict[str, float | str],
+) -> tuple[list[float], float, list[float], float, float, np.ndarray, float]:
+    model.eval()
+    val_loss = 0.0
+    n_batches = 0
+    all_predictions = {
+        "class_logits": [],
+        "center": [],
+        "start": [],
+        "end": [],
+    }
+    all_targets = []
+
+    with torch.inference_mode():
+        for xb, y_onehot, _ in loader:
+            xb = xb.to(device)
+            predictions = normalize_prediction_intervals(model(xb))
+            targets = batch_segmentation_to_events(y_onehot, normalize=True)
+            all_targets.extend(targets)
+
+            loss_dict = loss_fn(predictions, targets)
+            val_loss += float(loss_dict["loss_total"].item())
+            n_batches += 1
+
+            for key in all_predictions:
+                all_predictions[key].append(predictions[key].detach().cpu().numpy())
+
+    if n_batches <= 0:
+        raise RuntimeError("DETR evaluation received an empty dataloader.")
+
+    for key in all_predictions:
+        all_predictions[key] = np.concatenate(all_predictions[key], axis=0)
+
+    detection_summary = metrics_fn.compute_detection_summary(
+        all_predictions,
+        all_targets,
+        iou_threshold=float(matching_cfg["match_iou_threshold"]),
+        matching_strategy=str(matching_cfg["matching_strategy"]),
+        overlap_recall_threshold=float(matching_cfg["overlap_recall_threshold"]),
+    )
+    detection_metrics = metrics_fn.evaluate_batch(all_predictions, all_targets)
+
+    per_class_f1 = detection_summary["per_class_f1"]
+    per_class_iou = detection_summary["per_class_iou"]
+    per_class_stats = detection_summary["per_class"]
+
+    active_event_class_ids = [
+        class_id
+        for class_id in range(1, 6)
+        if int(per_class_stats[class_id]["target_count"]) > 0
+    ]
+    if len(active_event_class_ids) == 0:
+        raise RuntimeError("No active event classes found in DETR evaluation split.")
+
+    mean_f1 = float(
+        np.mean([float(per_class_f1.get(class_id, 0.0)) for class_id in active_event_class_ids])
+    )
+    mean_iou = float(
+        np.mean([float(per_class_iou.get(class_id, 0.0)) for class_id in active_event_class_ids])
+    )
+
+    f1_per_class = [float(per_class_f1.get(class_id, 0.0)) for class_id in range(1, 6)]
+    iou_per_class = [float(per_class_iou.get(class_id, 0.0)) for class_id in range(1, 6)]
+    avg_loss = float(val_loss / n_batches)
+    cm = detection_summary["confusion_matrix"]
+    test_map = float(detection_metrics.get("mAP", 0.0))
+
+    return f1_per_class, mean_f1, iou_per_class, mean_iou, avg_loss, cm, test_map
 
 
 def _prepare_dataloaders(
@@ -385,6 +539,16 @@ def _train_one_run(
         target_volcano,
     )
     apply_finetune_protocol(model, config["protocol"])
+
+    spec = get_model_spec(model_key)
+    detr_loss_fn: DETREventLoss | None = None
+    detr_metrics_fn: EventDetectionMetrics | None = None
+    detr_matching_cfg: dict[str, float | str] | None = None
+    if str(trainer_kind) == "detr":
+        detr_loss_weights = _resolve_detr_loss_weights(spec, config)
+        detr_matching_cfg = _resolve_detr_eval_matching(spec, config)
+        detr_loss_fn = DETREventLoss(num_classes=6, loss_weights=detr_loss_weights)
+        detr_metrics_fn = EventDetectionMetrics(num_classes=6)
 
     train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = (
         _prepare_dataloaders(
@@ -459,7 +623,15 @@ def _train_one_run(
             y_onehot = y_onehot.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(xb)
+            if str(trainer_kind) == "detr":
+                if detr_loss_fn is None:
+                    raise RuntimeError("DETR loss function was not initialized.")
+                out = model(xb)
+                targets = batch_segmentation_to_events(y_onehot, normalize=True)
+                loss_dict = detr_loss_fn(out, targets)
+                loss = loss_dict["loss_total"]
+            else:
+                out = model(xb)
             if str(trainer_kind) == "2d":
                 loss, _, _ = combined_dice_ce_loss_2d(
                     out,
@@ -468,7 +640,7 @@ def _train_one_run(
                     dice_weight=float(config["dice_weight"]),
                     ce_weight=float(config["ce_weight"]),
                 )
-            else:
+            elif str(trainer_kind) == "1d":
                 loss, _, _ = combined_dice_ce_loss(
                     out,
                     y_onehot,
@@ -509,7 +681,7 @@ def _train_one_run(
                 im_size=int(config["im_size"]),
                 config=config,
             )
-        else:
+        elif str(trainer_kind) == "1d":
             (
                 val_f1_per_class,
                 val_mean_f1,
@@ -530,6 +702,33 @@ def _train_one_run(
                 save_event_plots=False,
                 max_event_plots=0,
                 epoch=epoch,
+            )
+        elif str(trainer_kind) == "detr":
+            if (
+                detr_loss_fn is None
+                or detr_metrics_fn is None
+                or detr_matching_cfg is None
+            ):
+                raise RuntimeError("DETR components were not initialized.")
+            (
+                val_f1_per_class,
+                val_mean_f1,
+                val_iou_per_class,
+                val_mean_iou,
+                val_loss,
+                val_cm,
+                _val_map,
+            ) = _evaluate_detr_loader(
+                model=model,
+                loader=val_loader,
+                device=device,
+                loss_fn=detr_loss_fn,
+                metrics_fn=detr_metrics_fn,
+                matching_cfg=detr_matching_cfg,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported trainer kind '{trainer_kind}' for model '{model_key}'."
             )
 
         improved = float(val_mean_f1) > float(best_val_mean_f1)
@@ -555,9 +754,10 @@ def _train_one_run(
                 best_ckpt_out,
             )
             best_cm_out = cm_dir / f"val_cm_best_f1_epoch_{epoch:03d}.png"
+            cm_labels = DETR_CM_CLASS_NAMES if str(trainer_kind) == "detr" else CLASS_NAMES
             save_confusion_matrix_image(
                 cm=val_cm,
-                labels=CLASS_NAMES,
+                labels=cm_labels,
                 out_path=best_cm_out,
                 title=f"Val CM - {model_key} - {target_volcano} - fold {repeat_idx:02d} - {subset_key}",
             )
@@ -627,7 +827,8 @@ def _train_one_run(
             im_size=int(config["im_size"]),
             config=config,
         )
-    else:
+        test_map = float("nan")
+    elif str(trainer_kind) == "1d":
         (
             test_f1_per_class,
             test_mean_f1,
@@ -649,6 +850,34 @@ def _train_one_run(
             max_event_plots=0,
             epoch=None,
         )
+        test_map = float("nan")
+    elif str(trainer_kind) == "detr":
+        if (
+            detr_loss_fn is None
+            or detr_metrics_fn is None
+            or detr_matching_cfg is None
+        ):
+            raise RuntimeError("DETR components were not initialized.")
+        (
+            test_f1_per_class,
+            test_mean_f1,
+            test_iou_per_class,
+            test_mean_iou,
+            test_loss,
+            test_cm,
+            test_map,
+        ) = _evaluate_detr_loader(
+            model=model,
+            loader=test_loader,
+            device=device,
+            loss_fn=detr_loss_fn,
+            metrics_fn=detr_metrics_fn,
+            matching_cfg=detr_matching_cfg,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported trainer kind '{trainer_kind}' for model '{model_key}'."
+        )
 
     elapsed = float(time.time() - run_start)
     row = {
@@ -667,6 +896,7 @@ def _train_one_run(
         "test_loss": float(test_loss),
         "test_mean_f1": float(test_mean_f1),
         "test_mean_iou": float(test_mean_iou),
+        "test_map": float(test_map),
         "elapsed_seconds": elapsed,
     }
     for idx, cls in enumerate(CLASS_NAMES):
@@ -680,9 +910,10 @@ def _train_one_run(
     print(f"[SAVE] fold summary={reports_dir / 'fold_summary.json'}")
 
     test_cm_out = cm_dir / "test_cm_best_f1.png"
+    cm_labels = DETR_CM_CLASS_NAMES if str(trainer_kind) == "detr" else CLASS_NAMES
     save_confusion_matrix_image(
         cm=test_cm,
-        labels=CLASS_NAMES,
+        labels=cm_labels,
         out_path=test_cm_out,
         title=f"Test CM - {model_key} - {target_volcano} - fold {repeat_idx:02d} - {subset_key}",
     )
@@ -711,8 +942,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     available_targets = discover_targets(data_root)
-    available_models = [k for k, v in MODEL_SPECS.items() if v.get("enabled", True)]
-    available_models.reverse()
+    available_models = [k for k, v in MODEL_SPECS.items()]
     selected_models = parse_csv_selection(args.models, available_models, "models")
     selected_targets = parse_csv_selection(args.targets, available_targets, "targets")
     selected_targets = _order_targets_cau_first(selected_targets)
@@ -808,6 +1038,7 @@ def main() -> None:
         "test_loss",
         "test_mean_f1",
         "test_mean_iou",
+        "test_map",
         "elapsed_seconds",
     ]
     for cls in CLASS_NAMES:
@@ -844,9 +1075,9 @@ def main() -> None:
                 raise KeyError(f"Unknown model key: {model_key}")
             spec = get_model_spec(model_key)
             trainer_kind = str(spec["trainer_kind"])
-            if trainer_kind not in {"1d", "2d"}:
+            if trainer_kind not in {"1d", "2d", "detr"}:
                 raise ValueError(
-                    f"Progressive finetuning currently supports only 1d/2d models; got {model_key} ({trainer_kind})"
+                    f"Progressive finetuning currently supports only 1d/2d/detr models; got {model_key} ({trainer_kind})"
                 )
 
             for repeat_idx in selected_folds:
