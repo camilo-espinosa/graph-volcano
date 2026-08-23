@@ -31,7 +31,7 @@ from utils.event_targets import batch_segmentation_to_events
 from utils.validation_plots import plot_event_validation
 
 DEFAULT_DETR_LOSS_WEIGHTS = {
-    "class_loss": 2.0,
+    "class_loss": 4.0,
     "bbox_loss": 2.0,
     "giou_loss": 2.0,
     "unmatched_query": 2.0,

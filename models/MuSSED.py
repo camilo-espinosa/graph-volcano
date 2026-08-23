@@ -259,6 +259,71 @@ class TemporalPreHeadSelfAttention(nn.Module):
         return y.transpose(1, 2)
 
 
+class LightweightTemporalUpsample(nn.Module):
+    """Lightweight learned temporal upsampling with depthwise ConvTranspose1d.
+
+    This module keeps parameter count low by using depthwise transposed
+    convolutions (groups=channels), followed by a pointwise refinement.
+    Designed for integer upsampling factors (e.g., 2x/4x/8x).
+    """
+
+    def __init__(self, channels: int, up_factor: int):
+        super().__init__()
+        if channels < 1:
+            raise ValueError(f"channels must be >= 1, got {channels}.")
+        if up_factor < 1:
+            raise ValueError(f"up_factor must be >= 1, got {up_factor}.")
+
+        self.up_factor = int(up_factor)
+        if self.up_factor == 1:
+            self.upsample = nn.Identity()
+            return
+
+        stages: list[nn.Module] = []
+        remaining = self.up_factor
+        while remaining % 2 == 0:
+            stages.extend(
+                [
+                    nn.ConvTranspose1d(
+                        channels,
+                        channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                        groups=channels,
+                        bias=False,
+                    ),
+                    nn.BatchNorm1d(channels, eps=1e-3),
+                    nn.ReLU(),
+                ]
+            )
+            remaining //= 2
+
+        if remaining != 1:
+            raise ValueError(
+                "LightweightTemporalUpsample currently supports power-of-two "
+                f"factors, got up_factor={self.up_factor}."
+            )
+
+        # Lightweight channel mixing after depthwise learned upsampling.
+        stages.extend(
+            [
+                nn.Conv1d(channels, channels, kernel_size=1, bias=False),
+                nn.BatchNorm1d(channels, eps=1e-3),
+                nn.ReLU(),
+            ]
+        )
+        self.upsample = nn.Sequential(*stages)
+
+    def forward(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
+        y = self.upsample(x)
+        if y.shape[-1] == target_len:
+            return y
+        if y.shape[-1] > target_len:
+            return y[..., :target_len]
+        return F.pad(y, (0, target_len - y.shape[-1]))
+
+
 class MultiStationTemporalEncoder(nn.Module):
     """U-Net-style temporal encoder with weight-shared per-station convolutions.
 
@@ -892,8 +957,9 @@ class MuSSED(nn.Module):
 
     Architecture:
     - Temporal Encoder: multi-station aware, produces [B, C, T']
-        - Multiscale fusion: projected memories concatenated at shared resolution,
-            then learned 1x1 + 3x3 temporal fusion
+        - Multiscale fusion: keep projected levels distinct as [B, C, L, T0],
+            learned lightweight upsampling for coarse levels, then level-attention
+            weighted fusion to [B, C, T0]
         - Detection head: one event (class, interval) per sample
     """
 
@@ -999,6 +1065,43 @@ class MuSSED(nn.Module):
             }
         )
 
+        # Build a deterministic level order and native reference level (T0).
+        stride_by_level: dict[str, float] = {
+            "bottleneck": float(self.encoder.bottleneck_stride),
+            **{
+                str(level): float(self.encoder.level_base_strides[level])
+                for level in self.memory_levels
+            },
+        }
+        if "0" in stride_by_level:
+            self.reference_memory_level = "0"
+        else:
+            self.reference_memory_level = min(
+                stride_by_level.keys(), key=lambda k: stride_by_level[k]
+            )
+        self.multiscale_memory_order = [self.reference_memory_level] + [
+            key
+            for key in sorted(stride_by_level.keys(), key=lambda k: stride_by_level[k])
+            if key != self.reference_memory_level
+        ]
+
+        reference_stride = stride_by_level[self.reference_memory_level]
+        self.memory_level_upsamplers = nn.ModuleDict()
+        for level_key in self.multiscale_memory_order:
+            level_stride = stride_by_level[level_key]
+            ratio = level_stride / reference_stride
+            up_factor = int(round(ratio))
+            if not math.isclose(ratio, float(up_factor), rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError(
+                    "Expected integer stride ratios for multiscale upsampling, "
+                    f"got ratio={ratio} from level {level_key} with stride "
+                    f"{level_stride} and reference stride {reference_stride}."
+                )
+            self.memory_level_upsamplers[level_key] = LightweightTemporalUpsample(
+                channels=query_dim,
+                up_factor=up_factor,
+            )
+
         self.num_queries = int(num_queries)
         self.memory_level_embeddings = nn.ParameterDict(
             {
@@ -1014,15 +1117,22 @@ class MuSSED(nn.Module):
             }
         )
 
-        fusion_input_dim = query_dim * (1 + len(self.memory_levels))
-        self.multiscale_fusion = nn.Sequential(
-            nn.Conv1d(fusion_input_dim, query_dim, kernel_size=1, bias=False),
-            nn.BatchNorm1d(query_dim, eps=1e-3),
+        # Level-aware weighted fusion: score each level, softmax over levels,
+        # and aggregate [B, C, L, T0] -> [B, C, T0].
+        level_fusion_hidden = max(4, query_dim // 8)
+        self.level_fusion_scorer = nn.Sequential(
+            nn.Conv1d(query_dim, level_fusion_hidden, kernel_size=1, bias=False),
             nn.ReLU(),
+            nn.Conv1d(level_fusion_hidden, 1, kernel_size=1, bias=True),
+        )
+
+        # Lightweight temporal refinement after level fusion.
+        self.multiscale_fusion = nn.Sequential(
             nn.Conv1d(query_dim, query_dim, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm1d(query_dim, eps=1e-3),
             nn.ReLU(),
         )
+        self.last_level_fusion_weights: torch.Tensor | None = None
 
         self.use_detr_detection_head = bool(use_detr_detection_head)
         if self.use_detr_detection_head:
@@ -1122,12 +1232,14 @@ class MuSSED(nn.Module):
             encoder_features = encoder_out
             extra_level_features = {}
 
-        # 2. Project each memory level to query_dim and collect channel-first maps.
+        # 2. Project memory levels to query_dim and keep levels distinct.
         encoder_proj = encoder_features.transpose(1, 2)  # [B, T', C]
         if self.use_temporal_projection:
             encoder_proj = self.temporal_proj(encoder_proj)  # [B, T', query_dim]
         bottleneck_emb = self.memory_level_embeddings["bottleneck"].transpose(1, 2)
-        memory_parts = [encoder_proj.transpose(1, 2) + bottleneck_emb]
+        memory_parts: dict[str, torch.Tensor] = {
+            "bottleneck": encoder_proj.transpose(1, 2) + bottleneck_emb
+        }
 
         for level in self.memory_levels:
             level_features = extra_level_features[level]
@@ -1135,37 +1247,32 @@ class MuSSED(nn.Module):
                 level_features.transpose(1, 2)
             )
             level_emb = self.memory_level_embeddings[str(level)].transpose(1, 2)
-            memory_parts.append(level_proj.transpose(1, 2) + level_emb)
+            memory_parts[str(level)] = level_proj.transpose(1, 2) + level_emb
 
-        # 3. Upsample all memory levels to a shared temporal length and concatenate.
-        target_len = max(part.shape[-1] for part in memory_parts)
+        # 3. Keep L0 at native resolution T0 and learned-upsample other levels.
+        target_len = memory_parts[self.reference_memory_level].shape[-1]
         aligned_parts: list[torch.Tensor] = []
-        for part in memory_parts:
-            if part.shape[-1] == target_len:
-                aligned_parts.append(part)
-            else:
-                aligned_parts.append(
-                    F.interpolate(
-                        part,
-                        size=target_len,
-                        mode="linear",
-                        align_corners=False,
-                    )
-                )
+        for level_key in self.multiscale_memory_order:
+            part = memory_parts[level_key]
+            part = self.memory_level_upsamplers[level_key](part, target_len)
+            aligned_parts.append(part)
+
+        # [B, C, L, T0], preserving level identity up to learned fusion.
+        multiscale_level_memory = torch.stack(aligned_parts, dim=2)
         # 4. Predict event properties.
         if self.use_detr_detection_head:
-            level_strides = [self.encoder.last_bottleneck_effective_stride]
-            level_strides.extend(
-                self.encoder.last_extra_level_effective_strides[level]
-                for level in self.memory_levels
+            shared_stride = float(
+                self.encoder.last_extra_level_effective_strides.get(
+                    0,
+                    min(
+                        [self.encoder.last_bottleneck_effective_stride]
+                        + list(self.encoder.last_extra_level_effective_strides.values())
+                    ),
+                )
             )
-            shared_stride = float(min(level_strides))
 
-            # Heavy mode: keep levels separate and flatten [L, T] into memory tokens.
-            level_tokens = torch.stack(
-                [part.transpose(1, 2) for part in aligned_parts],
-                dim=1,
-            )  # [B, L, T, D]
+            # Keep levels separate and flatten [L, T] into memory tokens.
+            level_tokens = multiscale_level_memory.permute(0, 2, 3, 1)  # [B, L, T, D]
             temporal_pos = self.positional_encoding(
                 level_tokens.shape[2],
                 device=level_tokens.device,
@@ -1179,7 +1286,14 @@ class MuSSED(nn.Module):
             decoder_out = self.decoder(queries, memory_tokens)
             predictions = self.detr_detection_head(decoder_out)
         else:
-            fused_memory = torch.cat(aligned_parts, dim=1)
+            level_summary = multiscale_level_memory.mean(dim=-1)  # [B, C, L]
+            level_logits = self.level_fusion_scorer(level_summary).squeeze(1)  # [B, L]
+            level_weights = torch.softmax(level_logits, dim=-1)
+            self.last_level_fusion_weights = level_weights.detach()
+
+            fused_memory = (
+                multiscale_level_memory * level_weights[:, None, :, None]
+            ).sum(dim=2)
             fused_memory = self.multiscale_fusion(fused_memory)
             if self.prehead_temporal_attention is not None:
                 fused_memory = self.prehead_temporal_attention(fused_memory)
