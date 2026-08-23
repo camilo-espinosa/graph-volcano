@@ -704,8 +704,9 @@ class DetectionHead(nn.Module):
         input_dim: int,
         hidden_dim: int,
         num_classes: int = 6,
-        interval_output_format: str = "start_end",
+        interval_output_format: str = "center_duration",
         detection_head_mode: str = "independent",
+        class_pool: str = "max"
     ):
         super().__init__()
         self.interval_output_format = _validate_interval_output_format(
@@ -719,7 +720,7 @@ class DetectionHead(nn.Module):
         # Feature trunk moved into MuSSED multiscale fusion block.
         self.class_head = nn.Linear(input_dim, num_classes)
         self.center_logits_head = nn.Conv1d(input_dim, 1, kernel_size=1)
-
+        self.class_pool = class_pool
         if self.interval_output_format == "start_end":
             self.start_head = nn.Linear(input_dim, 1)
             self.end_head = nn.Linear(input_dim, 1)
@@ -762,7 +763,10 @@ class DetectionHead(nn.Module):
             raise ValueError(f"DetectionHead expects [B, C, T], got {tuple(x.shape)}.")
 
         feat = x
-        pooled = feat.mean(dim=-1)
+        if self.class_pool == "avg":
+            pooled = feat.mean(dim=-1)
+        else:
+            pooled = feat.max(dim=-1).values
 
         class_logits = self.class_head(pooled)[:, None, :]
 
@@ -996,6 +1000,7 @@ class MuSSED(nn.Module):
         prehead_temporal_attn_dropout: float = 0.0,
         interval_output_format: str = "center_duration",
         detection_head_mode: str = "independent",
+        class_pool:str="max",
         head_trunk_dims: Sequence[int] | None = None,
     ):
         super().__init__()
@@ -1117,13 +1122,15 @@ class MuSSED(nn.Module):
             }
         )
 
-        # Level-aware weighted fusion: score each level, softmax over levels,
-        # and aggregate [B, C, L, T0] -> [B, C, T0].
-        level_fusion_hidden = max(4, query_dim // 8)
-        self.level_fusion_scorer = nn.Sequential(
-            nn.Conv1d(query_dim, level_fusion_hidden, kernel_size=1, bias=False),
-            nn.ReLU(),
-            nn.Conv1d(level_fusion_hidden, 1, kernel_size=1, bias=True),
+        # Lightweight temporal level attention over [B, L, T0] descriptors.
+        self.num_memory_levels = len(self.multiscale_memory_order)
+        self.level_temporal_scorer = nn.Conv1d(
+            in_channels=self.num_memory_levels,
+            out_channels=self.num_memory_levels,
+            kernel_size=3,
+            padding=1,
+            groups=self.num_memory_levels,
+            bias=True,
         )
 
         # Lightweight temporal refinement after level fusion.
@@ -1155,6 +1162,7 @@ class MuSSED(nn.Module):
                 interval_output_format=interval_output_format,
                 detection_head_mode=detection_head_mode,
                 trunk_dims=head_trunk_dims,
+                class_pool = class_pool,
             )
             self.detection_head = None
         else:
@@ -1286,13 +1294,13 @@ class MuSSED(nn.Module):
             decoder_out = self.decoder(queries, memory_tokens)
             predictions = self.detr_detection_head(decoder_out)
         else:
-            level_summary = multiscale_level_memory.mean(dim=-1)  # [B, C, L]
-            level_logits = self.level_fusion_scorer(level_summary).squeeze(1)  # [B, L]
-            level_weights = torch.softmax(level_logits, dim=-1)
+            level_summary = multiscale_level_memory.mean(dim=1)  # [B, L, T0]
+            level_logits = self.level_temporal_scorer(level_summary)  # [B, L, T0]
+            level_weights = torch.softmax(level_logits, dim=1)
             self.last_level_fusion_weights = level_weights.detach()
 
             fused_memory = (
-                multiscale_level_memory * level_weights[:, None, :, None]
+                multiscale_level_memory * level_weights[:, None, :, :]
             ).sum(dim=2)
             fused_memory = self.multiscale_fusion(fused_memory)
             if self.prehead_temporal_attention is not None:
