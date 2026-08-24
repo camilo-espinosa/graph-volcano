@@ -39,3 +39,6 @@ scripts/04_cross-volcano.py
 
 *.md
 !README.md
+figures/fig1_main_results.py
+figure_1_model_comparison.pdf
+figure_1_model_comparison.png
