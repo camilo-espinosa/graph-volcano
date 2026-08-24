@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from utils.active_eval_utils import load_checkpoint_into_model
 from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.detr_event_loss import DETREventLoss
+from utils.event_detection_loss import EventDetectionLoss
 from utils.event_detection_metrics import EventDetectionMetrics
 from utils.event_targets import batch_segmentation_to_events
 from utils.fold_io_utils import append_row_csv
@@ -63,7 +63,7 @@ SUBSET_FIXED_LR = {
 }
 
 CLASS_NAMES = ["VT", "LP", "TR", "AV", "IC"]
-DETR_CM_CLASS_NAMES = ["Background", *CLASS_NAMES]
+EVENT_DETECTION_CM_CLASS_NAMES = ["Background", *CLASS_NAMES]
 EVENT_CLASS_MAP = {
     1.0: "VT",
     2.0: "LP",
@@ -306,7 +306,7 @@ def _load_base_model(
     trainer_kind = str(spec["trainer_kind"])
     model_kwargs = dict(spec["model_kwargs"])
 
-    if trainer_kind == "detr":
+    if trainer_kind == "event_detection":
         model = build_model_from_spec(model_key, n_classes=6).to(device)
         load_checkpoint_into_model(
             model,
@@ -345,7 +345,7 @@ def _load_base_model(
     return model
 
 
-def _resolve_detr_loss_weights(spec: dict, config: dict) -> dict[str, float]:
+def _resolve_event_detection_loss_weights(spec: dict, config: dict) -> dict[str, float]:
     defaults = {
         "class_loss": 2.0,
         "bbox_loss": 2.0,
@@ -372,7 +372,7 @@ def _resolve_detr_loss_weights(spec: dict, config: dict) -> dict[str, float]:
     return resolved
 
 
-def _resolve_detr_eval_matching(spec: dict, config: dict) -> dict[str, float | str]:
+def _resolve_event_detection_eval_matching(spec: dict, config: dict) -> dict[str, float | str]:
     resolved: dict[str, float | str] = {
         "match_iou_threshold": 0.3,
         "matching_strategy": "iou",
@@ -400,12 +400,12 @@ def _resolve_detr_eval_matching(spec: dict, config: dict) -> dict[str, float | s
     return resolved
 
 
-def _evaluate_detr_loader(
+def _evaluate_event_detection_loader(
     *,
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
-    loss_fn: DETREventLoss,
+    loss_fn: EventDetectionLoss,
     metrics_fn: EventDetectionMetrics,
     matching_cfg: dict[str, float | str],
 ) -> tuple[list[float], float, list[float], float, float, np.ndarray, float]:
@@ -435,7 +435,7 @@ def _evaluate_detr_loader(
                 all_predictions[key].append(predictions[key].detach().cpu().numpy())
 
     if n_batches <= 0:
-        raise RuntimeError("DETR evaluation received an empty dataloader.")
+        raise RuntimeError("Event-detection evaluation received an empty dataloader.")
 
     for key in all_predictions:
         all_predictions[key] = np.concatenate(all_predictions[key], axis=0)
@@ -459,7 +459,7 @@ def _evaluate_detr_loader(
         if int(per_class_stats[class_id]["target_count"]) > 0
     ]
     if len(active_event_class_ids) == 0:
-        raise RuntimeError("No active event classes found in DETR evaluation split.")
+        raise RuntimeError("No active event classes found in event-detection evaluation split.")
 
     mean_f1 = float(
         np.mean([float(per_class_f1.get(class_id, 0.0)) for class_id in active_event_class_ids])
@@ -536,14 +536,14 @@ def _train_one_run(
     apply_finetune_protocol(model, config["protocol"])
 
     spec = get_model_spec(model_key)
-    detr_loss_fn: DETREventLoss | None = None
-    detr_metrics_fn: EventDetectionMetrics | None = None
-    detr_matching_cfg: dict[str, float | str] | None = None
-    if str(trainer_kind) == "detr":
-        detr_loss_weights = _resolve_detr_loss_weights(spec, config)
-        detr_matching_cfg = _resolve_detr_eval_matching(spec, config)
-        detr_loss_fn = DETREventLoss(num_classes=6, loss_weights=detr_loss_weights)
-        detr_metrics_fn = EventDetectionMetrics(num_classes=6)
+    event_detection_loss_fn: EventDetectionLoss | None = None
+    event_detection_metrics_fn: EventDetectionMetrics | None = None
+    event_detection_matching_cfg: dict[str, float | str] | None = None
+    if str(trainer_kind) == "event_detection":
+        event_detection_loss_weights = _resolve_event_detection_loss_weights(spec, config)
+        event_detection_matching_cfg = _resolve_event_detection_eval_matching(spec, config)
+        event_detection_loss_fn = EventDetectionLoss(num_classes=6, loss_weights=event_detection_loss_weights)
+        event_detection_metrics_fn = EventDetectionMetrics(num_classes=6)
 
     train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = (
         _prepare_dataloaders(
@@ -618,12 +618,12 @@ def _train_one_run(
             y_onehot = y_onehot.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            if str(trainer_kind) == "detr":
-                if detr_loss_fn is None:
-                    raise RuntimeError("DETR loss function was not initialized.")
+            if str(trainer_kind) == "event_detection":
+                if event_detection_loss_fn is None:
+                    raise RuntimeError("Event-detection loss function was not initialized.")
                 out = model(xb)
                 targets = batch_segmentation_to_events(y_onehot, normalize=True)
-                loss_dict = detr_loss_fn(out, targets)
+                loss_dict = event_detection_loss_fn(out, targets)
                 loss = loss_dict["loss_total"]
             else:
                 out = model(xb)
@@ -698,13 +698,13 @@ def _train_one_run(
                 max_event_plots=0,
                 epoch=epoch,
             )
-        elif str(trainer_kind) == "detr":
+        elif str(trainer_kind) == "event_detection":
             if (
-                detr_loss_fn is None
-                or detr_metrics_fn is None
-                or detr_matching_cfg is None
+                event_detection_loss_fn is None
+                or event_detection_metrics_fn is None
+                or event_detection_matching_cfg is None
             ):
-                raise RuntimeError("DETR components were not initialized.")
+                raise RuntimeError("Event-detection components were not initialized.")
             (
                 val_f1_per_class,
                 val_mean_f1,
@@ -713,13 +713,13 @@ def _train_one_run(
                 val_loss,
                 val_cm,
                 _val_map,
-            ) = _evaluate_detr_loader(
+            ) = _evaluate_event_detection_loader(
                 model=model,
                 loader=val_loader,
                 device=device,
-                loss_fn=detr_loss_fn,
-                metrics_fn=detr_metrics_fn,
-                matching_cfg=detr_matching_cfg,
+                loss_fn=event_detection_loss_fn,
+                metrics_fn=event_detection_metrics_fn,
+                matching_cfg=event_detection_matching_cfg,
             )
         else:
             raise ValueError(
@@ -749,7 +749,7 @@ def _train_one_run(
                 best_ckpt_out,
             )
             best_cm_out = cm_dir / f"val_cm_best_f1_epoch_{epoch:03d}.png"
-            cm_labels = DETR_CM_CLASS_NAMES if str(trainer_kind) == "detr" else CLASS_NAMES
+            cm_labels = EVENT_DETECTION_CM_CLASS_NAMES if str(trainer_kind) == "event_detection" else CLASS_NAMES
             save_confusion_matrix_image(
                 cm=val_cm,
                 labels=cm_labels,
@@ -846,13 +846,13 @@ def _train_one_run(
             epoch=None,
         )
         test_map = float("nan")
-    elif str(trainer_kind) == "detr":
+    elif str(trainer_kind) == "event_detection":
         if (
-            detr_loss_fn is None
-            or detr_metrics_fn is None
-            or detr_matching_cfg is None
+            event_detection_loss_fn is None
+            or event_detection_metrics_fn is None
+            or event_detection_matching_cfg is None
         ):
-            raise RuntimeError("DETR components were not initialized.")
+            raise RuntimeError("Event-detection components were not initialized.")
         (
             test_f1_per_class,
             test_mean_f1,
@@ -861,13 +861,13 @@ def _train_one_run(
             test_loss,
             test_cm,
             test_map,
-        ) = _evaluate_detr_loader(
+        ) = _evaluate_event_detection_loader(
             model=model,
             loader=test_loader,
             device=device,
-            loss_fn=detr_loss_fn,
-            metrics_fn=detr_metrics_fn,
-            matching_cfg=detr_matching_cfg,
+            loss_fn=event_detection_loss_fn,
+            metrics_fn=event_detection_metrics_fn,
+            matching_cfg=event_detection_matching_cfg,
         )
     else:
         raise ValueError(
@@ -905,7 +905,7 @@ def _train_one_run(
     print(f"[SAVE] fold summary={reports_dir / 'fold_summary.json'}")
 
     test_cm_out = cm_dir / "test_cm_best_f1.png"
-    cm_labels = DETR_CM_CLASS_NAMES if str(trainer_kind) == "detr" else CLASS_NAMES
+    cm_labels = EVENT_DETECTION_CM_CLASS_NAMES if str(trainer_kind) == "event_detection" else CLASS_NAMES
     save_confusion_matrix_image(
         cm=test_cm,
         labels=cm_labels,
@@ -1070,9 +1070,9 @@ def main() -> None:
                 raise KeyError(f"Unknown model key: {model_key}")
             spec = get_model_spec(model_key)
             trainer_kind = str(spec["trainer_kind"])
-            if trainer_kind not in {"1d", "2d", "detr"}:
+            if trainer_kind not in {"1d", "2d", "event_detection"}:
                 raise ValueError(
-                    f"Progressive finetuning currently supports only 1d/2d/detr models; got {model_key} ({trainer_kind})"
+                    f"Progressive finetuning currently supports only 1d/2d/event_detection models; got {model_key} ({trainer_kind})"
                 )
 
             for repeat_idx in selected_folds:

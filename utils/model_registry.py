@@ -19,8 +19,8 @@ MUSSED_DEFAULT_LOSS_WEIGHTS: dict[str, float] = {
     "confidence": 2.0,
 }
 
-# Shared defaults for DETR-style event matching used by training/evaluation/reporting.
-DETR_EVAL_DEFAULTS: dict[str, float | str] = {
+# Shared defaults for event-detection matching used by training/evaluation/reporting.
+EVENT_DETECTION_EVAL_DEFAULTS: dict[str, float | str] = {
     "match_iou_threshold": 0.3,
     "matching_strategy": "iou",  # one of: iou, overlap_recall, dual
     "overlap_recall_threshold": 0.8,
@@ -28,11 +28,11 @@ DETR_EVAL_DEFAULTS: dict[str, float | str] = {
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
    "MuSSED": {
-        "family": "detr",
-        "trainer_kind": "detr",
+        "family": "event_detection",
+        "trainer_kind": "event_detection",
         "model_cls": MuSSED,
         "model_kwargs": {},
-        "batch_size": 20,
+        "batch_size": 14,
     },    
 #     "MuSSeg": {
 #         "family": "phasenet",
@@ -137,7 +137,7 @@ MODEL_SPECS = {
         "trainer_kind": spec["trainer_kind"],
         "batch_size": spec["batch_size"],
         "loss_weights": deepcopy(spec.get("loss_weights", {})),
-        "eval_matching": deepcopy(spec.get("eval_matching", DETR_EVAL_DEFAULTS)),
+        "eval_matching": deepcopy(spec.get("eval_matching", EVENT_DETECTION_EVAL_DEFAULTS)),
     }
     for key, spec in MODEL_REGISTRY.items()
 }

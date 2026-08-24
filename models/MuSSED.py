@@ -5,13 +5,15 @@ Lean single-path event detector for multi-station seismic waveforms.
 
 Architecture:
 - MultiStationTemporalEncoder: U-Net-like encoder with weight-shared per-station
-  convolutions, station interaction via attention at the bottleneck, and optional
-  multiscale memory levels.
-- Multiscale Fusion: project each selected memory level to a shared query_dim,
-  learned upsampling to the highest temporal resolution, concatenate all levels,
-  and fuse with lightweight temporal convolutions.
-- Convolutional Query Detection Head: dense temporal query features with a
-  configurable kernel size, then per-query class and interval prediction.
+    convolutions, station interaction via attention at the bottleneck, and optional
+    multiscale memory levels.
+- Level-Aligned Memory Bank: project each selected memory level to a shared
+    query_dim and learned-upsample to a common temporal grid T0, keeping levels
+    separated as [B, D, L, T0].
+- Lightweight Fused Memory: level-temporal weighting merges [B, D, L, T0] into
+    [B, D, T0] before query decoding to reduce VRAM.
+- Segmentation-Aware Query Head: predicts class/confidence plus dense per-query
+    mask/start/end heatmaps; start/end are decoded by differentiable expectation.
 
 This module intentionally has no DETR path and no optional legacy branches.
 """
@@ -24,16 +26,6 @@ from typing import Dict, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def _validate_interval_output_format(value: str) -> str:
-    allowed_values = {"start_end", "center_duration"}
-    if value not in allowed_values:
-        raise ValueError(
-            "interval_output_format must be one of "
-            f"{sorted(allowed_values)}, got {value!r}."
-        )
-    return value
 
 
 def _broadcast_level_param(
@@ -498,8 +490,12 @@ class MultiStationTemporalEncoder(nn.Module):
         return bottleneck_features
 
 
-class QueryConvDetectionHead(nn.Module):
-    """Convolutional query head for event class and interval prediction."""
+class SegmentationQueryHead(nn.Module):
+    """Query head with dense segmentation supervision and differentiable boundaries.
+
+    Input: fused memory [B, D, T]. Outputs class/confidence, dense query mask
+    logits, start/end heatmap logits, and decoded normalized start/end times.
+    """
 
     def __init__(
         self,
@@ -507,13 +503,9 @@ class QueryConvDetectionHead(nn.Module):
         num_queries: int,
         query_head_channels: int,
         num_classes: int = 6,
-        interval_output_format: str = "center_duration",
         query_head_kernel_size: int = 31,
     ):
         super().__init__()
-        self.interval_output_format = _validate_interval_output_format(
-            interval_output_format
-        )
 
         if input_dim < 1:
             raise ValueError(f"input_dim must be >= 1, got {input_dim}.")
@@ -545,27 +537,16 @@ class QueryConvDetectionHead(nn.Module):
         )
 
         self.class_head = nn.Linear(self.query_head_channels, num_classes)
-        self.center_logits_head = nn.Conv1d(self.query_head_channels, 1, kernel_size=1)
-
-        if self.interval_output_format == "start_end":
-            self.start_logits_head = nn.Conv1d(self.query_head_channels, 1, kernel_size=1)
-            self.end_logits_head = nn.Conv1d(self.query_head_channels, 1, kernel_size=1)
-            self.duration_value_head = None
-            self.duration_weight_head = None
-        else:
-            self.start_logits_head = None
-            self.end_logits_head = None
-            self.duration_value_head = nn.Conv1d(
-                self.query_head_channels, 1, kernel_size=1
-            )
-            self.duration_weight_head = nn.Conv1d(
-                self.query_head_channels, 1, kernel_size=1
-            )
+        self.confidence_head = nn.Linear(self.query_head_channels, 1)
+        self.mask_logits_head = nn.Conv1d(self.query_head_channels, 1, kernel_size=1)
+        self.start_logits_head = nn.Conv1d(self.query_head_channels, 1, kernel_size=1)
+        self.end_logits_head = nn.Conv1d(self.query_head_channels, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         if x.ndim != 3:
             raise ValueError(
-                f"QueryConvDetectionHead expects [B, C, T], got {tuple(x.shape)}."
+                "SegmentationQueryHead expects [B, D, T], "
+                f"got {tuple(x.shape)}."
             )
 
         batch_size, _, t_len = x.shape
@@ -579,6 +560,7 @@ class QueryConvDetectionHead(nn.Module):
 
         pooled = query_features.max(dim=-1).values  # [B, Nq, H]
         class_logits = self.class_head(pooled)  # [B, Nq, C]
+        confidence_logits = self.confidence_head(pooled)
 
         flat_q = query_features.reshape(
             batch_size * self.num_queries,
@@ -594,45 +576,32 @@ class QueryConvDetectionHead(nn.Module):
             dtype=x.dtype,
         )[None, :]
 
-        center_logits = self.center_logits_head(flat_q).squeeze(1)
-        center_weights = torch.softmax(center_logits, dim=-1)
-        center = (center_weights * time_grid).sum(dim=-1, keepdim=True)
-        center = center.view(batch_size, self.num_queries, 1)
+        mask_logits = self.mask_logits_head(flat_q).squeeze(1)
+        start_logits = self.start_logits_head(flat_q).squeeze(1)
+        end_logits = self.end_logits_head(flat_q).squeeze(1)
+
+        start_weights = torch.softmax(start_logits, dim=-1)
+        end_weights = torch.softmax(end_logits, dim=-1)
+        start = (start_weights * time_grid).sum(dim=-1, keepdim=True)
+        end = (end_weights * time_grid).sum(dim=-1, keepdim=True)
+        start = start.view(batch_size, self.num_queries, 1)
+        end = end.view(batch_size, self.num_queries, 1)
 
         predictions: Dict[str, torch.Tensor] = {
             "class_logits": class_logits,
-            "center": center,
+            "confidence_logits": confidence_logits,
+            "mask_logits": mask_logits.view(batch_size, self.num_queries, t_len),
+            "start_heatmap_logits": start_logits.view(batch_size, self.num_queries, t_len),
+            "end_heatmap_logits": end_logits.view(batch_size, self.num_queries, t_len),
+            "start": torch.minimum(start, end),
+            "end": torch.maximum(start, end),
         }
-
-        if self.interval_output_format == "start_end":
-            start_logits = self.start_logits_head(flat_q).squeeze(1)
-            end_logits = self.end_logits_head(flat_q).squeeze(1)
-            start = (torch.softmax(start_logits, dim=-1) * time_grid).sum(
-                dim=-1, keepdim=True
-            )
-            end = (torch.softmax(end_logits, dim=-1) * time_grid).sum(
-                dim=-1, keepdim=True
-            )
-            start = start.view(batch_size, self.num_queries, 1)
-            end = end.view(batch_size, self.num_queries, 1)
-            predictions["start"] = torch.minimum(start, end)
-            predictions["end"] = torch.maximum(start, end)
-            predictions["center"] = 0.5 * (
-                predictions["start"] + predictions["end"]
-            )
-        else:
-            duration_values = torch.sigmoid(self.duration_value_head(flat_q).squeeze(1))
-            duration_weights = torch.softmax(
-                self.duration_weight_head(flat_q).squeeze(1), dim=-1
-            )
-            duration = (duration_weights * duration_values).sum(dim=-1, keepdim=True)
-            predictions["duration"] = duration.view(batch_size, self.num_queries, 1)
 
         return predictions
 
 
 class MuSSED(nn.Module):
-    """MuSSED: lean multi-station detector with multiscale concatenation fusion."""
+    """MuSSED: lean multi-station detector with fused-memory segmentation head."""
 
     def __init__(
         self,
@@ -653,7 +622,6 @@ class MuSSED(nn.Module):
         num_queries: int = 1,
         query_head_channels: int = 256,
         query_head_kernel_size: int = 31,
-        interval_output_format: str = "center_duration",
     ):
         super().__init__()
 
@@ -735,28 +703,33 @@ class MuSSED(nn.Module):
             }
         )
 
-        num_levels = len(self.multiscale_memory_order)
-        self.multiscale_concat_fusion = nn.Sequential(
-            nn.Conv1d(num_levels * query_dim, query_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(query_dim, eps=1e-3),
-            nn.ReLU(),
+        self.num_memory_levels = len(self.multiscale_memory_order)
+        self.level_temporal_scorer = nn.Conv1d(
+            in_channels=self.num_memory_levels,
+            out_channels=self.num_memory_levels,
+            kernel_size=3,
+            padding=1,
+            groups=self.num_memory_levels,
+            bias=True,
+        )
+        self.fused_refine = nn.Sequential(
             nn.Conv1d(query_dim, query_dim, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm1d(query_dim, eps=1e-3),
             nn.ReLU(),
         )
+        self.last_level_fusion_weights: torch.Tensor | None = None
 
-        self.detection_head = QueryConvDetectionHead(
+        self.detection_head = SegmentationQueryHead(
             input_dim=query_dim,
             num_queries=int(num_queries),
             query_head_channels=int(query_head_channels),
             num_classes=int(num_classes),
-            interval_output_format=interval_output_format,
             query_head_kernel_size=int(query_head_kernel_size),
         )
 
         self.query_dim = int(query_dim)
         self.num_classes = int(num_classes)
-        self.interval_output_format = self.detection_head.interval_output_format
+        self.interval_output_format = "start_end"
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         encoder_features, extra_level_features = self.encoder(
@@ -784,13 +757,15 @@ class MuSSED(nn.Module):
             part = self.memory_level_upsamplers[level_key](part, target_len)
             aligned_parts.append(part)
 
-        multiscale_level_memory = torch.stack(aligned_parts, dim=2)  # [B, D, L, T]
-        concat_memory = multiscale_level_memory.permute(0, 2, 1, 3).reshape(
-            multiscale_level_memory.shape[0],
-            multiscale_level_memory.shape[2] * multiscale_level_memory.shape[1],
-            multiscale_level_memory.shape[3],
+        multiscale_level_memory = torch.stack(aligned_parts, dim=2)  # [B, D, L, T0]
+        level_summary = multiscale_level_memory.mean(dim=1)  # [B, L, T0]
+        level_logits = self.level_temporal_scorer(level_summary)  # [B, L, T0]
+        level_weights = torch.softmax(level_logits, dim=1)
+        self.last_level_fusion_weights = level_weights.detach()
+        fused_memory = (multiscale_level_memory * level_weights[:, None, :, :]).sum(
+            dim=2
         )
-        fused_memory = self.multiscale_concat_fusion(concat_memory)
+        fused_memory = self.fused_refine(fused_memory)
 
         predictions = self.detection_head(fused_memory)
         predictions["encoder_features"] = encoder_features

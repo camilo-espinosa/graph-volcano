@@ -9,10 +9,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.detr_event_loss import DETREventLoss
+from utils.event_detection_loss import EventDetectionLoss
 from utils.event_detection_metrics import EventDetectionMetrics
 from utils.event_targets import batch_segmentation_to_events
-from utils.trainer_detection import _resolve_detr_eval_matching, _resolve_detr_loss_weights
+from utils.trainer_detection import (
+    _resolve_event_detection_eval_matching,
+    _resolve_event_detection_loss_weights,
+)
 from utils.train_utils import (
     MultiStation1DDataset,
     UNetPatchDataset,
@@ -238,7 +241,7 @@ def evaluate_unet_checkpoint(
     )
 
 
-def evaluate_detr_checkpoint(
+def evaluate_event_detection_checkpoint(
     model: torch.nn.Module,
     test_npz_path: Path,
     batch_size: int,
@@ -270,9 +273,9 @@ def evaluate_detr_checkpoint(
         ds.label_ids
     )
 
-    loss_weights = _resolve_detr_loss_weights(model_spec=model_spec, config={})
-    eval_matching = _resolve_detr_eval_matching(model_spec=model_spec, config={})
-    loss_fn = DETREventLoss(num_classes=6, loss_weights=loss_weights)
+    loss_weights = _resolve_event_detection_loss_weights(model_spec=model_spec, config={})
+    eval_matching = _resolve_event_detection_eval_matching(model_spec=model_spec, config={})
+    loss_fn = EventDetectionLoss(num_classes=6, loss_weights=loss_weights)
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
     model.eval()
@@ -331,7 +334,7 @@ def evaluate_detr_checkpoint(
     ]
     if len(active_class_ids) == 0:
         raise RuntimeError(
-            "No active event classes found in DETR evaluation target set."
+            "No active event classes found in event-detection evaluation target set."
         )
     mean_f1 = float(
         np.mean(

@@ -40,7 +40,7 @@ from utils.fold_io_utils import (
 )
 from utils.model_registry import MODEL_SPECS
 from utils.active_eval_utils import (
-    evaluate_detr_checkpoint,
+    evaluate_event_detection_checkpoint,
     evaluate_multistation_checkpoint as evaluate_multistation_checkpoint_on_target,
     evaluate_unet_checkpoint as evaluate_unet_checkpoint_on_target,
     load_checkpoint_into_model,
@@ -649,7 +649,7 @@ def main() -> None:
                         )
                         iou_all_classes = [float("nan")] * len(ALL_CLASS_NAMES)
                         mean_iou_all = float("nan")
-                    elif trainer_kind == "detr":
+                    elif trainer_kind == "event_detection":
                         model = model_spec["model_cls"](**model_kwargs).to(device)
                         load_checkpoint_into_model(
                             model=model,
@@ -669,7 +669,7 @@ def main() -> None:
                             n_samples,
                             active_event_ids,
                             _,
-                        ) = evaluate_detr_checkpoint(
+                        ) = evaluate_event_detection_checkpoint(
                             model=model,
                             test_npz_path=test_npz_path,
                             batch_size=batch_size,

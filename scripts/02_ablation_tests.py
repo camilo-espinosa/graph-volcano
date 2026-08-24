@@ -49,7 +49,7 @@ from utils.train_utils import (
 from utils.trainer_segmentation import train_one_segmentation_fold
 from utils.trainer_detection import train_one_event_detection_fold
 from utils.fold_io_utils import is_training_fold_complete
-from utils.model_registry import DETR_EVAL_DEFAULTS, MODEL_SPECS, get_model_spec
+from utils.model_registry import EVENT_DETECTION_EVAL_DEFAULTS, MODEL_SPECS, get_model_spec
 from utils.script_common import resolve_project_path
 
 # Default run set. Override with --models if needed.
@@ -59,7 +59,7 @@ MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
 CONFIG = {
     "volcano": "NVCHVC",
     "batch_size": 16,
-    "epochs": 100,
+    "epochs": 2,
     "early_stop_patience": 15,
     "lr": 5e-4,
     "lr_final": 1e-6,
@@ -73,9 +73,9 @@ CONFIG = {
     "val_plot_forward_batch_size": 2,
     "best_epoch_attention_mode": "station",
     "final_attention_mode": "full",
-    "match_iou_threshold": float(DETR_EVAL_DEFAULTS["match_iou_threshold"]),
-    "matching_strategy": str(DETR_EVAL_DEFAULTS["matching_strategy"]),
-    "overlap_recall_threshold": float(DETR_EVAL_DEFAULTS["overlap_recall_threshold"]),
+    "match_iou_threshold": float(EVENT_DETECTION_EVAL_DEFAULTS["match_iou_threshold"]),
+    "matching_strategy": str(EVENT_DETECTION_EVAL_DEFAULTS["matching_strategy"]),
+    "overlap_recall_threshold": float(EVENT_DETECTION_EVAL_DEFAULTS["overlap_recall_threshold"]),
 }
 FOLDS = range(1, 6)
 
@@ -210,9 +210,9 @@ def select_folds(raw_folds: str | None) -> list[int]:
     return selected
 
 
-def resolve_detr_loss_weights(spec: dict) -> dict[str, float]:
-    """Return explicit model-specific DETR loss weights, if defined."""
-    if spec.get("trainer_kind") != "detr":
+def resolve_event_detection_loss_weights(spec: dict) -> dict[str, float]:
+    """Return explicit model-specific event-detection loss weights, if defined."""
+    if spec.get("trainer_kind") != "event_detection":
         return {}
 
     raw = spec.get("loss_weights") or {}
@@ -252,7 +252,7 @@ def main() -> None:
                 "trainer_kind": spec["trainer_kind"],
                 "batch_size": spec["batch_size"],
                 "model_kwargs": spec["model_kwargs"],
-                "loss_weights": resolve_detr_loss_weights(spec),
+                "loss_weights": resolve_event_detection_loss_weights(spec),
                 "eval_matching": spec.get("eval_matching", {}),
             }
             for name, spec in selected_specs.items()
@@ -312,7 +312,7 @@ def main() -> None:
         )
         model_config["lr"] = float(scaled_lr)
         model_config["lr_final"] = float(scaled_lr_final)
-        explicit_loss_weights = resolve_detr_loss_weights(spec)
+        explicit_loss_weights = resolve_event_detection_loss_weights(spec)
         if explicit_loss_weights:
             model_config["loss_weights"] = explicit_loss_weights
 
@@ -320,7 +320,7 @@ def main() -> None:
             f"[{model_key}] batch_size={model_batch_size} | "
             f"lr={model_config['lr']:.3e} | lr_final={model_config['lr_final']:.3e}"
         )
-        if spec["trainer_kind"] == "detr":
+        if spec["trainer_kind"] == "event_detection":
             if "loss_weights" in model_config:
                 print(f"[{model_key}] loss_weights=" f"{model_config['loss_weights']}")
             else:
@@ -369,7 +369,7 @@ def main() -> None:
                     device=device,
                     config=model_config,
                 )
-            elif trainer_kind == "detr":
+            elif trainer_kind == "event_detection":
                 # Event detection trainer for MuSSED
                 train_one_event_detection_fold(
                     model_key_or_kwargs=model_key,
@@ -382,7 +382,7 @@ def main() -> None:
             else:
                 raise ValueError(
                     f"Unknown trainer_kind '{trainer_kind}' for model {model_key}. "
-                    f"Expected one of: '2d', '1d', 'detr'."
+                    f"Expected one of: '2d', '1d', 'event_detection'."
                 )
         cleanup_gpu_cache()
 

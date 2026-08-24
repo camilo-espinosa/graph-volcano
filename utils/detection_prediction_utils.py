@@ -16,10 +16,9 @@ def normalize_prediction_intervals(
     predictions: dict[str, Any],
 ) -> dict[str, Any]:
     """Materialize center/start/end/duration for either MuSSED output format."""
-    if "center" not in predictions:
-        raise KeyError("Predictions must include 'center'.")
-
-    center = _clip_unit_interval(predictions["center"])
+    center = None
+    if "center" in predictions:
+        center = _clip_unit_interval(predictions["center"])
 
     if "start" in predictions and "end" in predictions:
         start_raw = _clip_unit_interval(predictions["start"])
@@ -36,6 +35,10 @@ def normalize_prediction_intervals(
         duration = _clip_unit_interval(end - start)
         center = _clip_unit_interval(0.5 * (start + end))
     elif "duration" in predictions:
+        if center is None:
+            raise KeyError(
+                "Predictions that include 'duration' must also include 'center'."
+            )
         duration = _clip_unit_interval(predictions["duration"])
         half_duration = 0.5 * duration
         start = _clip_unit_interval(center - half_duration)

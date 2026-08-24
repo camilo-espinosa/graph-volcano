@@ -273,7 +273,7 @@ def aggregate_fold_metrics(
 
     Args:
         fold_summaries: List of fold summary dicts from train_one_*_fold()
-        trainer_kind: "2d", "1d", or "detr"
+        trainer_kind: "2d", "1d", or "event_detection"
 
     Returns:
         Aggregated metrics dict with mean and std for:
@@ -302,7 +302,7 @@ def aggregate_fold_metrics(
         aggregated[f"{metric_name}_min"] = float(np.min(values))
         aggregated[f"{metric_name}_max"] = float(np.max(values))
 
-    if trainer_kind == "detr":
+    if trainer_kind == "event_detection":
         # Add detection-specific aggregation
         test_mAP = [f.get("test_mAP", 0.0) for f in fold_summaries]
         aggregated["test_mAP_mean"] = float(np.mean(test_mAP))
@@ -322,7 +322,7 @@ def format_aggregated_results(
 
     Args:
         aggregated: Aggregated metrics dict from aggregate_fold_metrics()
-        trainer_kind: "2d", "1d", or "detr"
+        trainer_kind: "2d", "1d", or "event_detection"
 
     Returns:
         Formatted string for printing
@@ -337,7 +337,7 @@ def format_aggregated_results(
         f"Test Loss:       {aggregated['test_loss_mean']:.4f} ± {aggregated['test_loss_std']:.4f}",
     ]
 
-    if trainer_kind == "detr":
+    if trainer_kind == "event_detection":
         lines.insert(
             -1,
             f"Test mAP:        {aggregated['test_mAP_mean']:.4f} ± {aggregated['test_mAP_std']:.4f}",

@@ -24,22 +24,27 @@ from utils.train_utils import (
     BalancedBatchSampler,
 )
 from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.model_registry import DETR_EVAL_DEFAULTS, get_model_spec
-from utils.detr_event_loss import DETREventLoss
+from utils.model_registry import EVENT_DETECTION_EVAL_DEFAULTS, get_model_spec
+from utils.event_detection_loss import EventDetectionLoss
 from utils.event_detection_metrics import EventDetectionMetrics, is_interval_match
 from utils.event_targets import batch_segmentation_to_events
 from utils.validation_plots import plot_event_validation
 
-DEFAULT_DETR_LOSS_WEIGHTS = {
+DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS = {
     "class_loss": 4.0,
+    "confidence_loss": 1.0,
     "bbox_loss": 2.0,
     "giou_loss": 2.0,
+    "mask_bce_loss": 2.0,
+    "mask_dice_loss": 2.0,
+    "start_heatmap_loss": 1.0,
+    "end_heatmap_loss": 1.0,
     "unmatched_query": 2.0,
 }
 
 
-def _normalize_detr_loss_weights(raw_weights: dict | None) -> dict[str, float]:
-    """Normalize alias keys to DETREventLoss schema and cast to float."""
+def _normalize_event_detection_loss_weights(raw_weights: dict | None) -> dict[str, float]:
+    """Normalize alias keys to EventDetectionLoss schema and cast to float."""
     if not raw_weights:
         return {}
 
@@ -49,9 +54,18 @@ def _normalize_detr_loss_weights(raw_weights: dict | None) -> dict[str, float]:
         "bbox": "bbox_loss",
         "giou": "giou_loss",
         "confidence": "unmatched_query",
+        "confidence_loss": "confidence_loss",
+        "mask_bce": "mask_bce_loss",
+        "mask_dice": "mask_dice_loss",
+        "start_heatmap": "start_heatmap_loss",
+        "end_heatmap": "end_heatmap_loss",
         "class_loss": "class_loss",
         "bbox_loss": "bbox_loss",
         "giou_loss": "giou_loss",
+        "mask_bce_loss": "mask_bce_loss",
+        "mask_dice_loss": "mask_dice_loss",
+        "start_heatmap_loss": "start_heatmap_loss",
+        "end_heatmap_loss": "end_heatmap_loss",
         "unmatched_query": "unmatched_query",
     }
     for key, value in raw_weights.items():
@@ -62,21 +76,21 @@ def _normalize_detr_loss_weights(raw_weights: dict | None) -> dict[str, float]:
     return normalized
 
 
-def _resolve_detr_loss_weights(model_spec: dict, config: dict) -> dict[str, float]:
-    """Resolve final DETR loss weights with precedence config > model spec > default."""
-    resolved = dict(DEFAULT_DETR_LOSS_WEIGHTS)
+def _resolve_event_detection_loss_weights(model_spec: dict, config: dict) -> dict[str, float]:
+    """Resolve final event-detection loss weights with precedence config > model spec > default."""
+    resolved = dict(DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS)
 
-    spec_weights = _normalize_detr_loss_weights(model_spec.get("loss_weights"))
-    config_weights = _normalize_detr_loss_weights(config.get("loss_weights"))
+    spec_weights = _normalize_event_detection_loss_weights(model_spec.get("loss_weights"))
+    config_weights = _normalize_event_detection_loss_weights(config.get("loss_weights"))
 
     resolved.update(spec_weights)
     resolved.update(config_weights)
     return resolved
 
 
-def _resolve_detr_eval_matching(model_spec: dict, config: dict) -> dict[str, float | str]:
-    """Resolve DETR evaluation matching settings with config > model spec > defaults."""
-    resolved: dict[str, float | str] = dict(DETR_EVAL_DEFAULTS)
+def _resolve_event_detection_eval_matching(model_spec: dict, config: dict) -> dict[str, float | str]:
+    """Resolve event-detection evaluation matching settings with config > model spec > defaults."""
+    resolved: dict[str, float | str] = dict(EVENT_DETECTION_EVAL_DEFAULTS)
 
     spec_eval = model_spec.get("eval_matching")
     if isinstance(spec_eval, dict):
@@ -278,7 +292,7 @@ def build_validation_event_predictions_dataframe(
     overlap_recall_threshold: float = 0.8,
 ) -> pd.DataFrame:
     """
-    Build per-event validation prediction records for DETR evaluation.
+    Build per-event validation prediction records for event-detection evaluation.
 
     The returned dataframe has one row per:
       - matched target event (correct class or class mismatch),
@@ -585,20 +599,20 @@ def train_one_event_detection_fold(
         )
 
     # Initialize loss function and metrics
-    loss_weights = _resolve_detr_loss_weights(spec, config)
-    eval_matching = _resolve_detr_eval_matching(spec, config)
+    loss_weights = _resolve_event_detection_loss_weights(spec, config)
+    eval_matching = _resolve_event_detection_eval_matching(spec, config)
     match_iou_threshold = float(eval_matching["match_iou_threshold"])
     matching_strategy = str(eval_matching["matching_strategy"])
     overlap_recall_threshold = float(eval_matching["overlap_recall_threshold"])
 
-    print(f"Resolved DETR loss weights for {model_key}: {loss_weights}")
+    print(f"Resolved event-detection loss weights for {model_key}: {loss_weights}")
     print(
-        "Resolved DETR eval matching for "
+        "Resolved event-detection eval matching for "
         f"{model_key}: strategy={matching_strategy} "
         f"iou_threshold={match_iou_threshold:.3f} "
         f"overlap_recall_threshold={overlap_recall_threshold:.3f}"
     )
-    loss_fn = DETREventLoss(num_classes=6, loss_weights=loss_weights)
+    loss_fn = EventDetectionLoss(num_classes=6, loss_weights=loss_weights)
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
     # Build param groups with differential learning rates
@@ -1231,7 +1245,7 @@ def train_one_event_detection_fold(
 
     # Prepare fold summary
     fold_summary = {
-        "trainer_kind": "detr",
+        "trainer_kind": "event_detection",
         "fold": int(fold_id),
         "n_train": int(len(train_ds)),
         "n_val": int(len(val_ds)),
@@ -1275,7 +1289,7 @@ def train_one_event_detection_fold(
     fold_elapsed_sec = float(time.time() - fold_start)
 
     fold_summary = {
-        "trainer_kind": "detr",
+        "trainer_kind": "event_detection",
         "fold": int(fold_id),
         "n_train": int(len(train_ds)),
         "n_val": int(len(val_ds)),
