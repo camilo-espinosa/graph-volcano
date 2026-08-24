@@ -32,13 +32,13 @@ from utils.validation_plots import plot_event_validation
 
 DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS = {
     "class_loss": 4.0,
-    "confidence_loss": 1.0,
+    "confidence_loss": 0.1,
     "bbox_loss": 2.0,
     "giou_loss": 2.0,
-    "mask_bce_loss": 2.0,
+    "mask_bce_loss": 1.0,
     "mask_dice_loss": 2.0,
-    "start_heatmap_loss": 1.0,
-    "end_heatmap_loss": 1.0,
+    "start_heatmap_loss": 0.0,
+    "end_heatmap_loss": 0.0,
     "unmatched_query": 2.0,
 }
 

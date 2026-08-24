@@ -43,13 +43,13 @@ class EventDetectionLoss(torch.nn.Module):
         if loss_weights is None:
             loss_weights = {
                 "class_loss": 2.0,
-                "confidence_loss": 1.0,
+                "confidence_loss": 0.1,
                 "bbox_loss": 2.0,
                 "giou_loss": 2.0,
-                "mask_bce_loss": 2.0,
+                "mask_bce_loss": 1.0,
                 "mask_dice_loss": 2.0,
-                "start_heatmap_loss": 1.0,
-                "end_heatmap_loss": 1.0,
+                "start_heatmap_loss": 0.0,
+                "end_heatmap_loss": 0.0,
                 "unmatched_query": 1.0,
             }
         self.loss_weights = {k: float(v) for k, v in loss_weights.items()}
@@ -214,14 +214,21 @@ class EventDetectionLoss(torch.nn.Module):
                 pred_mask_probs = torch.sigmoid(pred_mask_logits)
                 loss_mask_dice_b = self._soft_dice_loss(pred_mask_probs, target_masks_t)
 
-                loss_start_hm_b = self._distribution_nll(
-                    pred_start_hm_logits,
-                    target_start_hm_t,
-                )
-                loss_end_hm_b = self._distribution_nll(
-                    pred_end_hm_logits,
-                    target_end_hm_t,
-                )
+                if self.loss_weights["start_heatmap_loss"] > 0.0:
+                    loss_start_hm_b = self._distribution_nll(
+                        pred_start_hm_logits,
+                        target_start_hm_t,
+                    )
+                else:
+                    loss_start_hm_b = torch.tensor(0.0, device=device)
+
+                if self.loss_weights["end_heatmap_loss"] > 0.0:
+                    loss_end_hm_b = self._distribution_nll(
+                        pred_end_hm_logits,
+                        target_end_hm_t,
+                    )
+                else:
+                    loss_end_hm_b = torch.tensor(0.0, device=device)
             else:
                 loss_bbox_b = torch.tensor(0.0, device=device)
                 loss_giou_b = torch.tensor(0.0, device=device)
