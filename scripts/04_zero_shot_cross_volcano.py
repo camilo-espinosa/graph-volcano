@@ -651,18 +651,11 @@ def main() -> None:
                         mean_iou_all = float("nan")
                     elif trainer_kind == "detr":
                         model = model_spec["model_cls"](**model_kwargs).to(device)
-                        ignore_checkpoint_keys = ()
-                        # Backward compatibility: some MuSSED checkpoints contain
-                        # a persisted event_queries tensor even when runtime model
-                        # config does not define that parameter.
-                        if getattr(model, "event_queries", None) is None:
-                            ignore_checkpoint_keys = ("event_queries",)
                         load_checkpoint_into_model(
                             model=model,
                             checkpoint_path=ckpt_path,
                             device=device,
                             trainer_kind=trainer_kind,
-                            ignore_checkpoint_keys=ignore_checkpoint_keys,
                         )
                         (
                             f1_per_class,

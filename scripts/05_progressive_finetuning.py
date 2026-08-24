@@ -308,16 +308,11 @@ def _load_base_model(
 
     if trainer_kind == "detr":
         model = build_model_from_spec(model_key, n_classes=6).to(device)
-        ignore_checkpoint_keys: tuple[str, ...] = ()
-        if getattr(model, "event_queries", None) is None:
-            # Backward compatibility for checkpoints that persisted event_queries.
-            ignore_checkpoint_keys = ("event_queries",)
         load_checkpoint_into_model(
             model,
             checkpoint_path,
             device,
             trainer_kind=trainer_kind,
-            ignore_checkpoint_keys=ignore_checkpoint_keys,
         )
         return model
 
