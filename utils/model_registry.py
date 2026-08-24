@@ -27,20 +27,42 @@ EVENT_DETECTION_EVAL_DEFAULTS: dict[str, float | str] = {
 }
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
-   "MuSSED_k3": {
+   "MuSSED": {
         "family": "event_detection",
         "trainer_kind": "event_detection",
         "model_cls": MuSSED,
-        "model_kwargs": {},
-        "batch_size": 14,
-    },    
-   "MuSSED_k127": {
+        "model_kwargs": {"num_queries": 1},
+        "batch_size": 16,
+    },
+
+   "MuSSED_final_q1585": {
         "family": "event_detection",
         "trainer_kind": "event_detection",
         "model_cls": MuSSED,
-        "model_kwargs": {"query_head_kernel_size":127},
-        "batch_size": 14,
-    },    
+        "model_kwargs": {
+            "mask_duration_low_quantile": 0.15,
+            "mask_duration_high_quantile": 0.85,
+        },
+        "batch_size": 16,
+    },
+
+   "MuSSED_final_mq4_refine05": {
+        "family": "event_detection",
+        "trainer_kind": "event_detection",
+        "model_cls": MuSSED,
+        "model_kwargs": {
+            "duration_refine_limit": 0.05,
+        },
+        "batch_size": 16,
+    },
+
+   "MuSSED_final_k127": {
+        "family": "event_detection",
+        "trainer_kind": "event_detection",
+        "model_cls": MuSSED,
+       "model_kwargs": {"query_head_kernel_size": 127},
+        "batch_size": 16,
+    },
 #     "MuSSeg": {
 #         "family": "phasenet",
 #         "trainer_kind": "1d",

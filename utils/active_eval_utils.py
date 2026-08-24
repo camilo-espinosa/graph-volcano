@@ -14,6 +14,7 @@ from utils.event_detection_metrics import EventDetectionMetrics
 from utils.event_targets import batch_segmentation_to_events
 from utils.trainer_detection import (
     _resolve_event_detection_eval_matching,
+    _resolve_event_detection_loss_config,
     _resolve_event_detection_loss_weights,
 )
 from utils.train_utils import (
@@ -274,8 +275,13 @@ def evaluate_event_detection_checkpoint(
     )
 
     loss_weights = _resolve_event_detection_loss_weights(model_spec=model_spec, config={})
+    loss_config = _resolve_event_detection_loss_config(model_spec=model_spec, config={})
     eval_matching = _resolve_event_detection_eval_matching(model_spec=model_spec, config={})
-    loss_fn = EventDetectionLoss(num_classes=6, loss_weights=loss_weights)
+    loss_fn = EventDetectionLoss(
+        num_classes=6,
+        loss_weights=loss_weights,
+        boundary_consistency_mode=loss_config["boundary_consistency_mode"],
+    )
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
     model.eval()

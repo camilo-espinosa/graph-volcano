@@ -59,7 +59,7 @@ MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
 CONFIG = {
     "volcano": "NVCHVC",
     "batch_size": 16,
-    "epochs": 2,
+    "epochs": 100,
     "early_stop_patience": 15,
     "lr": 5e-4,
     "lr_final": 1e-6,
@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--folds",
         type=str,
-        default="all",
+        default="1",
         help=(
             "Comma-separated folds to run (e.g. '1,3' or '01,03'). "
             "Use 'all' for all folds. Default: all folds."
@@ -217,10 +217,20 @@ def resolve_event_detection_loss_weights(spec: dict) -> dict[str, float]:
 
     raw = spec.get("loss_weights") or {}
     weights: dict[str, float] = {}
-    for key in ("class", "bbox", "giou", "confidence"):
-        if key in raw:
-            weights[key] = float(raw[key])
+    for key, value in raw.items():
+        weights[str(key)] = float(value)
     return weights
+
+
+def resolve_event_detection_loss_config(spec: dict) -> dict[str, str]:
+    """Return explicit model-specific event-detection loss config, if defined."""
+    if spec.get("trainer_kind") != "event_detection":
+        return {}
+    raw = spec.get("loss_config") or {}
+    resolved: dict[str, str] = {}
+    if "boundary_consistency_mode" in raw:
+        resolved["boundary_consistency_mode"] = str(raw["boundary_consistency_mode"])
+    return resolved
 
 
 def main() -> None:
@@ -253,6 +263,7 @@ def main() -> None:
                 "batch_size": spec["batch_size"],
                 "model_kwargs": spec["model_kwargs"],
                 "loss_weights": resolve_event_detection_loss_weights(spec),
+                "loss_config": resolve_event_detection_loss_config(spec),
                 "eval_matching": spec.get("eval_matching", {}),
             }
             for name, spec in selected_specs.items()
@@ -313,8 +324,11 @@ def main() -> None:
         model_config["lr"] = float(scaled_lr)
         model_config["lr_final"] = float(scaled_lr_final)
         explicit_loss_weights = resolve_event_detection_loss_weights(spec)
+        explicit_loss_config = resolve_event_detection_loss_config(spec)
         if explicit_loss_weights:
             model_config["loss_weights"] = explicit_loss_weights
+        if explicit_loss_config:
+            model_config["loss_config"] = explicit_loss_config
 
         print(
             f"[{model_key}] batch_size={model_batch_size} | "
@@ -325,6 +339,8 @@ def main() -> None:
                 print(f"[{model_key}] loss_weights=" f"{model_config['loss_weights']}")
             else:
                 print(f"[{model_key}] loss_weights=<trainer defaults>")
+            if "loss_config" in model_config:
+                print(f"[{model_key}] loss_config={model_config['loss_config']}")
 
         completed_folds = []
         remaining_folds = []

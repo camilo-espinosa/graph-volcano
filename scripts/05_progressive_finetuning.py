@@ -347,19 +347,36 @@ def _load_base_model(
 
 def _resolve_event_detection_loss_weights(spec: dict, config: dict) -> dict[str, float]:
     defaults = {
-        "class_loss": 2.0,
+        "class_loss": 4.0,
+        "confidence_loss": 0.1,
         "bbox_loss": 2.0,
         "giou_loss": 2.0,
-        "unmatched_query": 2.0,
+        "mask_bce_loss": 1.0,
+        "mask_dice_loss": 2.0,
+        "start_heatmap_loss": 0.0,
+        "end_heatmap_loss": 0.0,
+        "unmatched_query": 0.0,
+        "boundary_consistency_loss": 0.0,
     }
     aliases = {
         "class": "class_loss",
         "bbox": "bbox_loss",
         "giou": "giou_loss",
-        "confidence": "unmatched_query",
+        "confidence": "confidence_loss",
+        "confidence_loss": "confidence_loss",
+        "mask_bce": "mask_bce_loss",
+        "mask_dice": "mask_dice_loss",
+        "start_heatmap": "start_heatmap_loss",
+        "end_heatmap": "end_heatmap_loss",
+        "boundary_consistency": "boundary_consistency_loss",
         "class_loss": "class_loss",
         "bbox_loss": "bbox_loss",
         "giou_loss": "giou_loss",
+        "mask_bce_loss": "mask_bce_loss",
+        "mask_dice_loss": "mask_dice_loss",
+        "start_heatmap_loss": "start_heatmap_loss",
+        "end_heatmap_loss": "end_heatmap_loss",
+        "boundary_consistency_loss": "boundary_consistency_loss",
         "unmatched_query": "unmatched_query",
     }
 
@@ -369,6 +386,23 @@ def _resolve_event_detection_loss_weights(spec: dict, config: dict) -> dict[str,
             mapped = aliases.get(str(key))
             if mapped is not None:
                 resolved[mapped] = float(value)
+    return resolved
+
+
+def _resolve_event_detection_loss_config(spec: dict, config: dict) -> dict[str, str]:
+    resolved = {"boundary_consistency_mode": "none"}
+    for source in (spec.get("loss_config") or {}, config.get("loss_config") or {}):
+        mode = source.get("boundary_consistency_mode")
+        if mode is not None:
+            resolved["boundary_consistency_mode"] = str(mode)
+
+    mode = str(resolved["boundary_consistency_mode"]).strip().lower()
+    if mode not in {"none", "soft", "soft_stopgrad"}:
+        raise ValueError(
+            "boundary_consistency_mode must be one of "
+            "{'none', 'soft', 'soft_stopgrad'}."
+        )
+    resolved["boundary_consistency_mode"] = mode
     return resolved
 
 
@@ -541,8 +575,13 @@ def _train_one_run(
     event_detection_matching_cfg: dict[str, float | str] | None = None
     if str(trainer_kind) == "event_detection":
         event_detection_loss_weights = _resolve_event_detection_loss_weights(spec, config)
+        event_detection_loss_config = _resolve_event_detection_loss_config(spec, config)
         event_detection_matching_cfg = _resolve_event_detection_eval_matching(spec, config)
-        event_detection_loss_fn = EventDetectionLoss(num_classes=6, loss_weights=event_detection_loss_weights)
+        event_detection_loss_fn = EventDetectionLoss(
+            num_classes=6,
+            loss_weights=event_detection_loss_weights,
+            boundary_consistency_mode=event_detection_loss_config["boundary_consistency_mode"],
+        )
         event_detection_metrics_fn = EventDetectionMetrics(num_classes=6)
 
     train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = (
