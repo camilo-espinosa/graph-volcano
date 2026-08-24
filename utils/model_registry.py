@@ -31,18 +31,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "family": "detr",
         "trainer_kind": "detr",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            "class_pool":"max"
-        },
-        "batch_size": 20,
-    },    
-   "MuSSED_nomaxpool": {
-        "family": "detr",
-        "trainer_kind": "detr",
-        "model_cls": MuSSED,
-        "model_kwargs": {
-            "class_pool":"avg"
-        },
+        "model_kwargs": {},
         "batch_size": 20,
     },    
 #     "MuSSeg": {
