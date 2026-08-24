@@ -27,11 +27,18 @@ EVENT_DETECTION_EVAL_DEFAULTS: dict[str, float | str] = {
 }
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
-   "MuSSED": {
+   "MuSSED_k3": {
         "family": "event_detection",
         "trainer_kind": "event_detection",
         "model_cls": MuSSED,
         "model_kwargs": {},
+        "batch_size": 14,
+    },    
+   "MuSSED_k127": {
+        "family": "event_detection",
+        "trainer_kind": "event_detection",
+        "model_cls": MuSSED,
+        "model_kwargs": {"query_head_kernel_size":127},
         "batch_size": 14,
     },    
 #     "MuSSeg": {

@@ -39,7 +39,7 @@ DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS = {
     "mask_dice_loss": 2.0,
     "start_heatmap_loss": 0.0,
     "end_heatmap_loss": 0.0,
-    "unmatched_query": 2.0,
+    "unmatched_query": 0.0,
 }
 
 
@@ -686,8 +686,13 @@ def train_one_event_detection_fold(
         model.train()
         train_loss = 0.0
         train_loss_class = 0.0
+        train_loss_confidence = 0.0
         train_loss_bbox = 0.0
         train_loss_giou = 0.0
+        train_loss_mask_bce = 0.0
+        train_loss_mask_dice = 0.0
+        train_loss_start_heatmap = 0.0
+        train_loss_end_heatmap = 0.0
         train_loss_unmatched_query = 0.0
         num_train_batches = 0
 
@@ -716,8 +721,13 @@ def train_one_event_detection_fold(
             # Accumulate metrics
             train_loss += loss.item()
             train_loss_class += loss_dict["loss_class"].item()
+            train_loss_confidence += loss_dict.get("loss_confidence", 0.0).item()
             train_loss_bbox += loss_dict["loss_bbox"].item()
             train_loss_giou += loss_dict["loss_giou"].item()
+            train_loss_mask_bce += loss_dict.get("loss_mask_bce", 0.0).item()
+            train_loss_mask_dice += loss_dict.get("loss_mask_dice", 0.0).item()
+            train_loss_start_heatmap += loss_dict.get("loss_start_heatmap", 0.0).item()
+            train_loss_end_heatmap += loss_dict.get("loss_end_heatmap", 0.0).item()
             train_loss_unmatched_query += loss_dict["loss_unmatched_query"].item()
             num_train_batches += 1
 
@@ -728,8 +738,13 @@ def train_one_event_detection_fold(
                     f"  Epoch {epoch + 1:3d} batch {batch_idx + 1:4d}/{len(train_loader):4d} | "
                     f"loss={current_loss:.4f} "
                     f"[class={train_loss_class / (batch_idx + 1):.4f} "
+                    f"conf={train_loss_confidence / (batch_idx + 1):.4f} "
                     f"bbox={train_loss_bbox / (batch_idx + 1):.4f} "
                     f"giou={train_loss_giou / (batch_idx + 1):.4f} "
+                    f"mask_bce={train_loss_mask_bce / (batch_idx + 1):.4f} "
+                    f"mask_dice={train_loss_mask_dice / (batch_idx + 1):.4f} "
+                    f"start_hm={train_loss_start_heatmap / (batch_idx + 1):.4f} "
+                    f"end_hm={train_loss_end_heatmap / (batch_idx + 1):.4f} "
                     f"unmatched={train_loss_unmatched_query / (batch_idx + 1):.4f}]"
                 )
 
@@ -739,8 +754,13 @@ def train_one_event_detection_fold(
         model.eval()
         val_loss = 0.0
         val_loss_class = 0.0
+        val_loss_confidence = 0.0
         val_loss_bbox = 0.0
         val_loss_giou = 0.0
+        val_loss_mask_bce = 0.0
+        val_loss_mask_dice = 0.0
+        val_loss_start_heatmap = 0.0
+        val_loss_end_heatmap = 0.0
         val_loss_unmatched_query = 0.0
         all_predictions = {
             "class_logits": [],
@@ -767,8 +787,13 @@ def train_one_event_detection_fold(
                 loss_dict = loss_fn(predictions, targets)
                 val_loss += loss_dict["loss_total"].item()
                 val_loss_class += loss_dict["loss_class"].item()
+                val_loss_confidence += loss_dict.get("loss_confidence", 0.0).item()
                 val_loss_bbox += loss_dict["loss_bbox"].item()
                 val_loss_giou += loss_dict["loss_giou"].item()
+                val_loss_mask_bce += loss_dict.get("loss_mask_bce", 0.0).item()
+                val_loss_mask_dice += loss_dict.get("loss_mask_dice", 0.0).item()
+                val_loss_start_heatmap += loss_dict.get("loss_start_heatmap", 0.0).item()
+                val_loss_end_heatmap += loss_dict.get("loss_end_heatmap", 0.0).item()
                 val_loss_unmatched_query += loss_dict["loss_unmatched_query"].item()
                 num_val_batches += 1
 
@@ -786,11 +811,28 @@ def train_one_event_detection_fold(
         avg_train_loss_class = (
             train_loss_class / num_train_batches if num_train_batches > 0 else 0.0
         )
+        avg_train_loss_confidence = (
+            train_loss_confidence / num_train_batches if num_train_batches > 0 else 0.0
+        )
         avg_train_loss_bbox = (
             train_loss_bbox / num_train_batches if num_train_batches > 0 else 0.0
         )
         avg_train_loss_giou = (
             train_loss_giou / num_train_batches if num_train_batches > 0 else 0.0
+        )
+        avg_train_loss_mask_bce = (
+            train_loss_mask_bce / num_train_batches if num_train_batches > 0 else 0.0
+        )
+        avg_train_loss_mask_dice = (
+            train_loss_mask_dice / num_train_batches if num_train_batches > 0 else 0.0
+        )
+        avg_train_loss_start_heatmap = (
+            train_loss_start_heatmap / num_train_batches
+            if num_train_batches > 0
+            else 0.0
+        )
+        avg_train_loss_end_heatmap = (
+            train_loss_end_heatmap / num_train_batches if num_train_batches > 0 else 0.0
         )
         avg_train_loss_unmatched_query = (
             train_loss_unmatched_query / num_train_batches
@@ -804,11 +846,26 @@ def train_one_event_detection_fold(
         avg_val_loss_class = (
             val_loss_class / num_val_batches if num_val_batches > 0 else 0.0
         )
+        avg_val_loss_confidence = (
+            val_loss_confidence / num_val_batches if num_val_batches > 0 else 0.0
+        )
         avg_val_loss_bbox = (
             val_loss_bbox / num_val_batches if num_val_batches > 0 else 0.0
         )
         avg_val_loss_giou = (
             val_loss_giou / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_loss_mask_bce = (
+            val_loss_mask_bce / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_loss_mask_dice = (
+            val_loss_mask_dice / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_loss_start_heatmap = (
+            val_loss_start_heatmap / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_loss_end_heatmap = (
+            val_loss_end_heatmap / num_val_batches if num_val_batches > 0 else 0.0
         )
         avg_val_loss_unmatched_query = (
             val_loss_unmatched_query / num_val_batches if num_val_batches > 0 else 0.0
@@ -1068,9 +1125,17 @@ def train_one_event_detection_fold(
             f"EPOCH {epoch + 1:3d} SUMMARY\n"
             f"==============================================================================\n"
             f"Train Loss:  {avg_train_loss:.4f}  "
-            f"[class={avg_train_loss_class:.4f} bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f} unmatched={avg_train_loss_unmatched_query:.4f}]\n"
+            f"[class={avg_train_loss_class:.4f} conf={avg_train_loss_confidence:.4f} "
+            f"bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f} "
+            f"mask_bce={avg_train_loss_mask_bce:.4f} mask_dice={avg_train_loss_mask_dice:.4f} "
+            f"start_hm={avg_train_loss_start_heatmap:.4f} end_hm={avg_train_loss_end_heatmap:.4f} "
+            f"unmatched={avg_train_loss_unmatched_query:.4f}]\n"
             f"Val Loss:    {avg_val_loss:.4f}  "
-            f"[class={avg_val_loss_class:.4f} bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f} unmatched={avg_val_loss_unmatched_query:.4f}]\n"
+            f"[class={avg_val_loss_class:.4f} conf={avg_val_loss_confidence:.4f} "
+            f"bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f} "
+            f"mask_bce={avg_val_loss_mask_bce:.4f} mask_dice={avg_val_loss_mask_dice:.4f} "
+            f"start_hm={avg_val_loss_start_heatmap:.4f} end_hm={avg_val_loss_end_heatmap:.4f} "
+            f"unmatched={avg_val_loss_unmatched_query:.4f}]\n"
             f"Metrics:     mean_f1={mean_f1:.4f} mean_precision={mean_precision:.4f} "
             f"mean_recall={mean_recall:.4f} mean_iou={mean_iou:.4f} "
             f"best_epoch_f1={best_epoch + 1} best_epoch_val_loss={best_val_loss_epoch + 1} "

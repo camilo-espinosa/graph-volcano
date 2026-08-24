@@ -621,7 +621,7 @@ class MuSSED(nn.Module):
         query_dim: int = 128,
         num_queries: int = 1,
         query_head_channels: int = 256,
-        query_head_kernel_size: int = 31,
+        query_head_kernel_size: int = 3,
     ):
         super().__init__()
 

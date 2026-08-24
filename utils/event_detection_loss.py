@@ -50,7 +50,7 @@ class EventDetectionLoss(torch.nn.Module):
                 "mask_dice_loss": 2.0,
                 "start_heatmap_loss": 0.0,
                 "end_heatmap_loss": 0.0,
-                "unmatched_query": 1.0,
+                "unmatched_query": 0.0,
             }
         self.loss_weights = {k: float(v) for k, v in loss_weights.items()}
 
