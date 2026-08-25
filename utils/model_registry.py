@@ -14,8 +14,8 @@ from models.UNet_bottleneck_attention import UNetBottleneckAttention
 
 MUSSED_DEFAULT_LOSS_WEIGHTS: dict[str, float] = {
     "class": 4.0,
-    "bbox": 2.0,
-    "giou": 2.0,
+    "bbox": 2.5,
+    "giou": 2.5,
     "confidence": 2.0,
 }
 
@@ -31,31 +31,33 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "family": "event_detection",
         "trainer_kind": "event_detection",
         "model_cls": MuSSED,
-        "model_kwargs": {"num_queries": 1},
+        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False},
         "batch_size": 16,
     },
 
-   "MuSSED_final_q1585": {
+   "MuSSED_xattn": {
         "family": "event_detection",
         "trainer_kind": "event_detection",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            "mask_duration_low_quantile": 0.15,
-            "mask_duration_high_quantile": 0.85,
-        },
-        "batch_size": 16,
+        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": True},
+        "batch_size": 14,
     },
 
-   "MuSSED_final_mq4_refine05": {
+   "MuSSED_k31": {
         "family": "event_detection",
         "trainer_kind": "event_detection",
         "model_cls": MuSSED,
-        "model_kwargs": {
-            "duration_refine_limit": 0.05,
-        },
+       "model_kwargs": {"query_head_kernel_size": 31},
         "batch_size": 16,
     },
-
+   "MuSSED_k31_xattn": {
+        "family": "event_detection",
+        "trainer_kind": "event_detection",
+        "model_cls": MuSSED,
+       "model_kwargs": {"query_head_kernel_size": 31,
+       "use_query_cross_attention": True},
+        "batch_size": 16,
+    },
    "MuSSED_final_k127": {
         "family": "event_detection",
         "trainer_kind": "event_detection",

@@ -13,8 +13,9 @@ from utils.event_detection_loss import EventDetectionLoss
 from utils.event_detection_metrics import EventDetectionMetrics
 from utils.event_targets import batch_segmentation_to_events
 from utils.trainer_detection import (
+    _class_agnostic_detection_iou_from_rows,
+    build_validation_event_predictions_dataframe,
     _resolve_event_detection_eval_matching,
-    _resolve_event_detection_loss_config,
     _resolve_event_detection_loss_weights,
 )
 from utils.train_utils import (
@@ -275,12 +276,10 @@ def evaluate_event_detection_checkpoint(
     )
 
     loss_weights = _resolve_event_detection_loss_weights(model_spec=model_spec, config={})
-    loss_config = _resolve_event_detection_loss_config(model_spec=model_spec, config={})
     eval_matching = _resolve_event_detection_eval_matching(model_spec=model_spec, config={})
     loss_fn = EventDetectionLoss(
         num_classes=6,
         loss_weights=loss_weights,
-        boundary_consistency_mode=loss_config["boundary_consistency_mode"],
     )
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
@@ -288,12 +287,13 @@ def evaluate_event_detection_checkpoint(
     test_loss = 0.0
     all_predictions = {
         "class_logits": [],
-        "center": [],
         "start": [],
         "end": [],
+        "mask_logits": [],
     }
     all_targets = []
     n_batches = 0
+    test_metric_mask_iou = 0.0
 
     with torch.inference_mode():
         for xb, y_onehot, _ in loader:
@@ -304,6 +304,7 @@ def evaluate_event_detection_checkpoint(
 
             loss_dict = loss_fn(predictions, targets)
             test_loss += float(loss_dict["loss_total"].item())
+            test_metric_mask_iou += float(loss_dict.get("metric_mask_iou", 0.0).item())
             n_batches += 1
 
             for key in all_predictions:
@@ -312,9 +313,19 @@ def evaluate_event_detection_checkpoint(
             del xb, y_onehot, predictions, targets, loss_dict
 
     avg_test_loss = float(test_loss / n_batches) if n_batches > 0 else float("inf")
+    avg_test_mask_iou = float(test_metric_mask_iou / n_batches) if n_batches > 0 else 0.0
 
     for key in all_predictions:
         all_predictions[key] = np.concatenate(all_predictions[key], axis=0)
+
+    predictions_df = build_validation_event_predictions_dataframe(
+        all_predictions,
+        all_targets,
+        iou_threshold=float(eval_matching["match_iou_threshold"]),
+        matching_strategy=str(eval_matching["matching_strategy"]),
+        overlap_recall_threshold=float(eval_matching["overlap_recall_threshold"]),
+    )
+    temporal_iou_agnostic, _ = _class_agnostic_detection_iou_from_rows(predictions_df)
 
     detection_summary = metrics_fn.compute_detection_summary(
         all_predictions,
@@ -327,10 +338,7 @@ def evaluate_event_detection_checkpoint(
         float(detection_summary["per_class_f1"].get(class_id, 0.0))
         for class_id in range(1, 6)
     ]
-    iou_per_class = [
-        float(detection_summary["per_class_iou"].get(class_id, 0.0))
-        for class_id in range(1, 6)
-    ]
+    iou_per_class = [float(temporal_iou_agnostic)] * 5
 
     per_class_stats = detection_summary["per_class"]
     active_class_ids = [
@@ -350,14 +358,7 @@ def evaluate_event_detection_checkpoint(
             ]
         )
     )
-    mean_iou = float(
-        np.mean(
-            [
-                float(detection_summary["per_class_iou"].get(class_id, 0.0))
-                for class_id in active_class_ids
-            ]
-        )
-    )
+    mean_iou = float(temporal_iou_agnostic)
 
     test_metrics = metrics_fn.evaluate_batch(all_predictions, all_targets)
     test_map = float(test_metrics.get("mAP", 0.0))

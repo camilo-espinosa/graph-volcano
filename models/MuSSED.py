@@ -491,11 +491,11 @@ class MultiStationTemporalEncoder(nn.Module):
 
 
 class SegmentationQueryHead(nn.Module):
-    """Mask-driven multi-query head with differentiable interval decoding.
+    """Mask-conditioned multi-query head with learned start/end decoding.
 
     Input: fused memory [B, D, T]. Outputs class/confidence, dense query mask
-    logits, mask-derived start/end heatmap logits, and decoded normalized
-    start/end times via center+duration geometry from the mask.
+    logits, and normalized start/end times predicted through a learned
+    boundary decoder. Query cross-attention is optional.
     """
 
     def __init__(
@@ -505,10 +505,8 @@ class SegmentationQueryHead(nn.Module):
         query_head_channels: int,
         num_classes: int = 6,
         query_head_kernel_size: int = 31,
-        mask_duration_low_quantile: float = 0.10,
-        mask_duration_high_quantile: float = 0.90,
-        mask_quantile_temperature: float = 40.0,
-        duration_refine_limit: float = 0.15,
+        use_query_cross_attention: bool = False,
+        boundary_attn_heads: int = 4,
     ):
         super().__init__()
 
@@ -525,27 +523,20 @@ class SegmentationQueryHead(nn.Module):
                 "query_head_kernel_size must be a positive odd integer, got "
                 f"{query_head_kernel_size}."
             )
-        if not (0.0 < mask_duration_low_quantile < mask_duration_high_quantile < 1.0):
-            raise ValueError(
-                "mask duration quantiles must satisfy 0 < low < high < 1, got "
-                f"low={mask_duration_low_quantile}, high={mask_duration_high_quantile}."
-            )
-        if mask_quantile_temperature <= 0:
-            raise ValueError(
-                "mask_quantile_temperature must be > 0, got "
-                f"{mask_quantile_temperature}."
-            )
-        if duration_refine_limit < 0:
-            raise ValueError(
-                f"duration_refine_limit must be >= 0, got {duration_refine_limit}."
-            )
-
+        if use_query_cross_attention:
+            if boundary_attn_heads < 1:
+                raise ValueError(
+                    f"boundary_attn_heads must be >= 1, got {boundary_attn_heads}."
+                )
+            if query_head_channels % boundary_attn_heads != 0:
+                raise ValueError(
+                    "query_head_channels must be divisible by boundary_attn_heads, got "
+                    f"query_head_channels={query_head_channels}, "
+                    f"boundary_attn_heads={boundary_attn_heads}."
+                )
         self.num_queries = int(num_queries)
         self.query_head_channels = int(query_head_channels)
-        self.mask_duration_low_quantile = float(mask_duration_low_quantile)
-        self.mask_duration_high_quantile = float(mask_duration_high_quantile)
-        self.mask_quantile_temperature = float(mask_quantile_temperature)
-        self.duration_refine_limit = float(duration_refine_limit)
+        self.use_query_cross_attention = bool(use_query_cross_attention)
         self.eps = 1e-6
 
         self.query_feature_extractor = nn.Sequential(
@@ -563,47 +554,42 @@ class SegmentationQueryHead(nn.Module):
         self.class_head = nn.Linear(self.query_head_channels, num_classes)
         self.confidence_head = nn.Linear(self.query_head_channels, 1)
         self.mask_logits_head = nn.Conv1d(self.query_head_channels, 1, kernel_size=1)
-        self.duration_refine_head = nn.Sequential(
-            nn.Linear(self.query_head_channels, self.query_head_channels // 2),
-            nn.GELU(),
-            nn.Linear(self.query_head_channels // 2, 1),
+        if self.use_query_cross_attention:
+            self.mask_context_proj = nn.Sequential(
+                nn.Conv1d(self.query_head_channels + 1, self.query_head_channels, kernel_size=1, bias=False),
+                nn.BatchNorm1d(self.query_head_channels, eps=1e-3),
+                nn.ReLU(),
+            )
+            self.query_cross_attn_norm = nn.LayerNorm(self.query_head_channels)
+            self.query_cross_attn = nn.MultiheadAttention(
+                embed_dim=self.query_head_channels,
+                num_heads=int(boundary_attn_heads),
+                dropout=0.0,
+                batch_first=True,
+            )
+            self.query_cross_ff_norm = nn.LayerNorm(self.query_head_channels)
+            self.query_cross_ff = nn.Sequential(
+                nn.Linear(self.query_head_channels, self.query_head_channels * 2),
+                nn.GELU(),
+                nn.Linear(self.query_head_channels * 2, self.query_head_channels),
+            )
+        else:
+            self.mask_context_proj = None
+            self.query_cross_attn_norm = None
+            self.query_cross_attn = None
+            self.query_cross_ff_norm = None
+            self.query_cross_ff = None
+        self.start_end_logits_head = nn.Sequential(
+            nn.Conv1d(
+                self.query_head_channels * 2 + 1,
+                self.query_head_channels,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.BatchNorm1d(self.query_head_channels, eps=1e-3),
+            nn.ReLU(),
+            nn.Conv1d(self.query_head_channels, 2, kernel_size=1),
         )
-
-    def _decode_boundaries_from_mask(
-        self, mask_logits_flat: torch.Tensor, time_grid: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        probs = torch.sigmoid(mask_logits_flat).clamp(min=self.eps, max=1.0 - self.eps)
-
-        weights = probs / probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        center = (weights * time_grid).sum(dim=-1)
-
-        cdf = torch.cumsum(probs, dim=-1)
-        cdf = cdf / cdf[:, -1:].clamp_min(self.eps)
-
-        def _soft_quantile(quantile: float) -> torch.Tensor:
-            distance = torch.abs(cdf - float(quantile))
-            q_weights = torch.softmax(-self.mask_quantile_temperature * distance, dim=-1)
-            return (q_weights * time_grid).sum(dim=-1)
-
-        q_low = _soft_quantile(self.mask_duration_low_quantile)
-        q_high = _soft_quantile(self.mask_duration_high_quantile)
-        duration_base = (q_high - q_low).clamp(min=0.0, max=1.0)
-
-        # Compatibility logits for optional heatmap supervision and diagnostics.
-        log_not_probs = torch.log1p(-probs)
-        prefix_inclusive = torch.cumsum(log_not_probs, dim=-1)
-        prefix_exclusive = F.pad(prefix_inclusive[..., :-1], (1, 0), value=0.0)
-        suffix_inclusive = torch.flip(
-            torch.cumsum(torch.flip(log_not_probs, dims=[-1]), dim=-1),
-            dims=[-1],
-        )
-        suffix_exclusive = F.pad(suffix_inclusive[..., 1:], (0, 1), value=0.0)
-        start_scores = probs * torch.exp(prefix_exclusive)
-        end_scores = probs * torch.exp(suffix_exclusive)
-        start_logits = torch.log(start_scores.clamp_min(self.eps))
-        end_logits = torch.log(end_scores.clamp_min(self.eps))
-
-        return center, duration_base, start_logits, end_logits, weights
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         if x.ndim != 3:
@@ -636,39 +622,57 @@ class SegmentationQueryHead(nn.Module):
         )[None, :]
 
         mask_logits = self.mask_logits_head(flat_q).squeeze(1)
+        mask_probs = torch.sigmoid(mask_logits).clamp(min=self.eps, max=1.0 - self.eps)
+        mask_weights = mask_probs / mask_probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
 
-        (
-            center,
-            duration_base,
-            start_logits,
-            end_logits,
-            mask_weights,
-        ) = self._decode_boundaries_from_mask(mask_logits, time_grid)
-
-        # Mask-conditioned token shared by class/confidence and duration refinement.
+        # Mask-conditioned token can be optionally refined by query-to-time cross attention.
         pooled = (flat_q * mask_weights[:, None, :]).sum(dim=-1)
+        if self.use_query_cross_attention:
+            query_token = pooled[:, None, :]
+            mask_context = self.mask_context_proj(
+                torch.cat([flat_q, mask_probs[:, None, :]], dim=1)
+            ).transpose(1, 2)
+            query_normed = self.query_cross_attn_norm(query_token)
+            attn_out, _ = self.query_cross_attn(
+                query=query_normed,
+                key=mask_context,
+                value=mask_context,
+                need_weights=False,
+            )
+            query_token = query_token + attn_out
+            query_token = query_token + self.query_cross_ff(
+                self.query_cross_ff_norm(query_token)
+            )
+            pooled = query_token[:, 0, :]
+
         class_logits = self.class_head(pooled).view(batch_size, self.num_queries, -1)
         confidence_logits = self.confidence_head(pooled).view(batch_size, self.num_queries, 1)
 
-        duration_refine = self.duration_refine_head(pooled).squeeze(-1)
-        duration_refine = self.duration_refine_limit * torch.tanh(duration_refine)
-        duration = (duration_base + duration_refine).clamp(min=0.0, max=1.0)
-
-        start = (center - 0.5 * duration).clamp(min=0.0, max=1.0).unsqueeze(-1)
-        end = (center + 0.5 * duration).clamp(min=0.0, max=1.0).unsqueeze(-1)
+        boundary_logits = self.start_end_logits_head(
+            torch.cat(
+                [
+                    flat_q,
+                    pooled[:, :, None].expand(-1, -1, t_len),
+                    mask_probs[:, None, :],
+                ],
+                dim=1,
+            )
+        )
+        start_prob = torch.softmax(boundary_logits[:, 0, :], dim=-1)
+        end_prob = torch.softmax(boundary_logits[:, 1, :], dim=-1)
+        start = (start_prob * time_grid).sum(dim=-1).unsqueeze(-1)
+        end = (end_prob * time_grid).sum(dim=-1).unsqueeze(-1)
         start = start.view(batch_size, self.num_queries, 1)
         end = end.view(batch_size, self.num_queries, 1)
+        start_ordered = torch.minimum(start, end)
+        end_ordered = torch.maximum(start, end)
 
         predictions: Dict[str, torch.Tensor] = {
             "class_logits": class_logits,
             "confidence_logits": confidence_logits,
             "mask_logits": mask_logits.view(batch_size, self.num_queries, t_len),
-            "start_heatmap_logits": start_logits.view(batch_size, self.num_queries, t_len),
-            "end_heatmap_logits": end_logits.view(batch_size, self.num_queries, t_len),
-            "center": center.view(batch_size, self.num_queries, 1),
-            "duration": duration.view(batch_size, self.num_queries, 1),
-            "start": torch.minimum(start, end),
-            "end": torch.maximum(start, end),
+            "start": start_ordered,
+            "end": end_ordered,
         }
 
         return predictions
@@ -696,10 +700,8 @@ class MuSSED(nn.Module):
         num_queries: int = 1,
         query_head_channels: int = 256,
         query_head_kernel_size: int = 3,
-        mask_duration_low_quantile: float = 0.10,
-        mask_duration_high_quantile: float = 0.90,
-        mask_quantile_temperature: float = 40.0,
-        duration_refine_limit: float = 0.15,
+        use_query_cross_attention: bool = False,
+        boundary_attn_heads: int = 4,
     ):
         super().__init__()
 
@@ -803,10 +805,8 @@ class MuSSED(nn.Module):
             query_head_channels=int(query_head_channels),
             num_classes=int(num_classes),
             query_head_kernel_size=int(query_head_kernel_size),
-            mask_duration_low_quantile=float(mask_duration_low_quantile),
-            mask_duration_high_quantile=float(mask_duration_high_quantile),
-            mask_quantile_temperature=float(mask_quantile_temperature),
-            duration_refine_limit=float(duration_refine_limit),
+            use_query_cross_attention=bool(use_query_cross_attention),
+            boundary_attn_heads=int(boundary_attn_heads),
         )
 
         self.query_dim = int(query_dim)

@@ -129,7 +129,6 @@ class EventDetectionMetrics:
         Args:
             predictions: Dict with keys:
                 - class_logits: [B, Nq, num_classes] logits
-                - center: [B, Nq, 1]
                 - start: [B, Nq, 1]
                 - end: [B, Nq, 1]
             targets: List of lists of EventInterval per sample
@@ -150,11 +149,6 @@ class EventDetectionMetrics:
             if isinstance(predictions["class_logits"], np.ndarray)
             else predictions["class_logits"].cpu().numpy()
         )
-        center = (
-            predictions["center"]
-            if isinstance(predictions["center"], np.ndarray)
-            else predictions["center"].cpu().numpy()
-        )
         start = (
             predictions["start"]
             if isinstance(predictions["start"], np.ndarray)
@@ -172,7 +166,6 @@ class EventDetectionMetrics:
         for iou_threshold in self.iou_thresholds:
             ap, per_class_ap = self._compute_ap_at_threshold(
                 class_logits,
-                center,
                 start,
                 end,
                 targets,
@@ -194,7 +187,6 @@ class EventDetectionMetrics:
     def _compute_ap_at_threshold(
         self,
         class_logits: np.ndarray,  # [B, Nq, num_classes]
-        center: np.ndarray,  # [B, Nq, 1]
         start: np.ndarray,  # [B, Nq, 1]
         end: np.ndarray,  # [B, Nq, 1]
         targets: list[list[EventInterval]],

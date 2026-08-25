@@ -33,19 +33,14 @@ from utils.validation_plots import plot_event_validation
 DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS = {
     "class_loss": 4.0,
     "confidence_loss": 0.1,
-    "bbox_loss": 2.0,
-    "giou_loss": 2.0,
+    "bbox_loss": 2.5,
+    "giou_loss": 2.5,
     "mask_bce_loss": 1.0,
     "mask_dice_loss": 2.0,
-    "start_heatmap_loss": 0.0,
-    "end_heatmap_loss": 0.0,
     "unmatched_query": 0.0,
-    "boundary_consistency_loss": 0.0,
 }
 
-DEFAULT_EVENT_DETECTION_LOSS_CONFIG = {
-    "boundary_consistency_mode": "none",
-}
+DEFAULT_EVENT_DETECTION_LOSS_CONFIG = {}
 
 
 def _normalize_event_detection_loss_weights(raw_weights: dict | None) -> dict[str, float]:
@@ -62,17 +57,11 @@ def _normalize_event_detection_loss_weights(raw_weights: dict | None) -> dict[st
         "confidence_loss": "confidence_loss",
         "mask_bce": "mask_bce_loss",
         "mask_dice": "mask_dice_loss",
-        "start_heatmap": "start_heatmap_loss",
-        "end_heatmap": "end_heatmap_loss",
-        "boundary_consistency": "boundary_consistency_loss",
-        "boundary_consistency_loss": "boundary_consistency_loss",
         "class_loss": "class_loss",
         "bbox_loss": "bbox_loss",
         "giou_loss": "giou_loss",
         "mask_bce_loss": "mask_bce_loss",
         "mask_dice_loss": "mask_dice_loss",
-        "start_heatmap_loss": "start_heatmap_loss",
-        "end_heatmap_loss": "end_heatmap_loss",
         "unmatched_query": "unmatched_query",
     }
     for key, value in raw_weights.items():
@@ -96,23 +85,10 @@ def _resolve_event_detection_loss_weights(model_spec: dict, config: dict) -> dic
 
 
 def _resolve_event_detection_loss_config(model_spec: dict, config: dict) -> dict[str, str]:
-    """Resolve non-numeric loss configuration with config > model spec > defaults."""
-    resolved: dict[str, str] = dict(DEFAULT_EVENT_DETECTION_LOSS_CONFIG)
-
-    for source in (model_spec.get("loss_config") or {}, config.get("loss_config") or {}):
-        mode = source.get("boundary_consistency_mode")
-        if mode is not None:
-            resolved["boundary_consistency_mode"] = str(mode)
-
-    valid_modes = {"none", "soft", "soft_stopgrad"}
-    mode = str(resolved["boundary_consistency_mode"]).strip().lower()
-    if mode not in valid_modes:
-        raise ValueError(
-            "boundary_consistency_mode must be one of "
-            f"{sorted(valid_modes)}, got {resolved['boundary_consistency_mode']!r}."
-        )
-    resolved["boundary_consistency_mode"] = mode
-    return resolved
+    """Resolve non-numeric loss configuration (currently no active options)."""
+    _ = model_spec
+    _ = config
+    return dict(DEFAULT_EVENT_DETECTION_LOSS_CONFIG)
 
 
 def _resolve_event_detection_eval_matching(model_spec: dict, config: dict) -> dict[str, float | str]:
@@ -179,7 +155,7 @@ def compute_event_confusion_matrix(
     from the (true_class, pred_class) pairs.
 
     Args:
-        all_predictions: Dict with keys "class_logits", "center", "start", "end"
+        all_predictions: Dict with keys "class_logits", "start", "end"
                         Each is [N_pred] or [N_pred, C] array
         all_targets: List of event lists (each sample has list of EventInterval objects)
         iou_threshold: Minimum IoU to match predictions to targets
@@ -333,7 +309,6 @@ def build_validation_event_predictions_dataframe(
     class_logits = np.asarray(normalized_predictions["class_logits"])  # [B, Nq, C]
     pred_starts = np.asarray(normalized_predictions["start"])  # [B, Nq, 1]
     pred_ends = np.asarray(normalized_predictions["end"])  # [B, Nq, 1]
-    pred_centers = np.asarray(normalized_predictions["center"])  # [B, Nq, 1]
     pred_mask_logits = None
     if "mask_logits" in normalized_predictions:
         pred_mask_logits = np.asarray(normalized_predictions["mask_logits"])
@@ -349,10 +324,6 @@ def build_validation_event_predictions_dataframe(
     if pred_ends.shape[:2] != class_logits.shape[:2]:
         raise ValueError(
             f"End shape mismatch: ends {pred_ends.shape} vs class_logits {class_logits.shape}."
-        )
-    if pred_centers.shape[:2] != class_logits.shape[:2]:
-        raise ValueError(
-            f"Center shape mismatch: centers {pred_centers.shape} vs class_logits {class_logits.shape}."
         )
     if pred_mask_logits is not None and pred_mask_logits.shape[:2] != class_logits.shape[:2]:
         raise ValueError(
@@ -445,9 +416,6 @@ def build_validation_event_predictions_dataframe(
             pred_non_bg_conf = float(1.0 - pred_bg_prob)
             pred_start = float(np.clip(pred_starts[sample_idx, query_idx, 0], 0.0, 1.0))
             pred_end = float(np.clip(pred_ends[sample_idx, query_idx, 0], 0.0, 1.0))
-            pred_center = float(
-                np.clip(pred_centers[sample_idx, query_idx, 0], 0.0, 1.0)
-            )
             if pred_start > pred_end:
                 pred_start, pred_end = pred_end, pred_start
 
@@ -457,8 +425,6 @@ def build_validation_event_predictions_dataframe(
                     "class_id": pred_class,
                     "start": pred_start,
                     "end": pred_end,
-                    "center": pred_center,
-                    "duration": float(max(0.0, pred_end - pred_start)),
                     "background_probability": pred_bg_prob,
                     "pred_confidence": pred_non_bg_conf,
                 }
@@ -476,8 +442,6 @@ def build_validation_event_predictions_dataframe(
             true_end = float(np.clip(target.end_norm, 0.0, 1.0))
             if true_start > true_end:
                 true_start, true_end = true_end, true_start
-            true_center = float(0.5 * (true_start + true_end))
-            true_duration = float(max(0.0, true_end - true_start))
 
             best_pred_idx = -1
             best_iou = 0.0
@@ -540,12 +504,8 @@ def build_validation_event_predictions_dataframe(
                         "temporal_iou": float(best_iou),
                         "true_start": true_start,
                         "true_end": true_end,
-                        "true_duration": true_duration,
-                        "true_center": true_center,
                         "pred_start": float(pred["start"]),
                         "pred_end": float(pred["end"]),
-                        "pred_duration": float(pred["duration"]),
-                        "pred_center": float(pred["center"]),
                         "pred_confidence": float(pred["pred_confidence"]),
                         "pred_background_probability": float(
                             pred["background_probability"]
@@ -593,12 +553,8 @@ def build_validation_event_predictions_dataframe(
                         "temporal_iou": 0.0,
                         "true_start": true_start,
                         "true_end": true_end,
-                        "true_duration": true_duration,
-                        "true_center": true_center,
                         "pred_start": np.nan,
                         "pred_end": np.nan,
-                        "pred_duration": np.nan,
-                        "pred_center": np.nan,
                         "pred_confidence": np.nan,
                         "pred_background_probability": np.nan,
                         "mask_iou": np.nan,
@@ -628,12 +584,8 @@ def build_validation_event_predictions_dataframe(
                     "temporal_iou": 0.0,
                     "true_start": np.nan,
                     "true_end": np.nan,
-                    "true_duration": np.nan,
-                    "true_center": np.nan,
                     "pred_start": float(pred["start"]),
                     "pred_end": float(pred["end"]),
-                    "pred_duration": float(pred["duration"]),
-                    "pred_center": float(pred["center"]),
                     "pred_confidence": float(pred["pred_confidence"]),
                     "pred_background_probability": float(pred["background_probability"]),
                     "mask_iou": np.nan,
@@ -658,12 +610,8 @@ def build_validation_event_predictions_dataframe(
         "temporal_iou",
         "true_start",
         "true_end",
-        "true_duration",
-        "true_center",
         "pred_start",
         "pred_end",
-        "pred_duration",
-        "pred_center",
         "pred_confidence",
         "pred_background_probability",
         "mask_iou",
@@ -678,6 +626,28 @@ def build_validation_event_predictions_dataframe(
     if not rows:
         return pd.DataFrame(columns=columns)
     return pd.DataFrame(rows, columns=columns)
+
+
+def _class_agnostic_detection_iou_from_rows(
+    predictions_df: pd.DataFrame,
+) -> tuple[float, float]:
+    """Return (temporal_iou_mean, mask_iou_mean) over matched rows only."""
+    if predictions_df.empty:
+        return 0.0, 0.0
+
+    matched = predictions_df[
+        predictions_df["match_type"].isin(["matched_correct_class", "matched_wrong_class"])
+    ]
+    if matched.empty:
+        return 0.0, 0.0
+
+    temporal_mean = float(matched["temporal_iou"].mean(skipna=True))
+    mask_mean = float(matched["mask_iou"].mean(skipna=True))
+    if not np.isfinite(temporal_mean):
+        temporal_mean = 0.0
+    if not np.isfinite(mask_mean):
+        mask_mean = 0.0
+    return temporal_mean, mask_mean
 
 
 def train_one_event_detection_fold(
@@ -759,7 +729,6 @@ def train_one_event_detection_fold(
     loss_fn = EventDetectionLoss(
         num_classes=6,
         loss_weights=loss_weights,
-        boundary_consistency_mode=loss_config["boundary_consistency_mode"],
     )
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
@@ -803,7 +772,7 @@ def train_one_event_detection_fold(
     optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=max(1, int(config["epochs"] / 4)),
+        T_max=max(1, int(config["epochs"] / 2)),
     )
 
     # Set eta_min for scheduler (will be overridden per param_group)
@@ -814,7 +783,9 @@ def train_one_event_detection_fold(
     best_val_loss = float("inf")
     best_val_mean_f1 = float("-inf")
     best_val_mask_iou = 0.0
+    best_val_interval_iou = 0.0
     last_val_mask_iou = 0.0
+    last_val_interval_iou = 0.0
     last_val_mask_start_err_pred = float("nan")
     last_val_mask_end_err_pred = float("nan")
     last_val_mask_start_err_true = float("nan")
@@ -847,10 +818,9 @@ def train_one_event_detection_fold(
         train_loss_giou = 0.0
         train_loss_mask_bce = 0.0
         train_loss_mask_dice = 0.0
-        train_loss_start_heatmap = 0.0
-        train_loss_end_heatmap = 0.0
         train_loss_unmatched_query = 0.0
         train_metric_mask_iou = 0.0
+        train_metric_interval_iou = 0.0
         num_train_batches = 0
 
         for batch_idx, batch in enumerate(train_loader):
@@ -883,10 +853,9 @@ def train_one_event_detection_fold(
             train_loss_giou += loss_dict["loss_giou"].item()
             train_loss_mask_bce += loss_dict.get("loss_mask_bce", 0.0).item()
             train_loss_mask_dice += loss_dict.get("loss_mask_dice", 0.0).item()
-            train_loss_start_heatmap += loss_dict.get("loss_start_heatmap", 0.0).item()
-            train_loss_end_heatmap += loss_dict.get("loss_end_heatmap", 0.0).item()
             train_loss_unmatched_query += loss_dict["loss_unmatched_query"].item()
             train_metric_mask_iou += loss_dict.get("metric_mask_iou", 0.0).item()
+            train_metric_interval_iou += loss_dict.get("metric_interval_iou", 0.0).item()
             num_train_batches += 1
 
             # Print progress every few batches
@@ -901,8 +870,6 @@ def train_one_event_detection_fold(
                     f"giou={train_loss_giou / (batch_idx + 1):.4f} "
                     f"mask_bce={train_loss_mask_bce / (batch_idx + 1):.4f} "
                     f"mask_dice={train_loss_mask_dice / (batch_idx + 1):.4f} "
-                    f"start_hm={train_loss_start_heatmap / (batch_idx + 1):.4f} "
-                    f"end_hm={train_loss_end_heatmap / (batch_idx + 1):.4f} "
                     f"unmatched={train_loss_unmatched_query / (batch_idx + 1):.4f}]"
                 )
 
@@ -917,13 +884,11 @@ def train_one_event_detection_fold(
         val_loss_giou = 0.0
         val_loss_mask_bce = 0.0
         val_loss_mask_dice = 0.0
-        val_loss_start_heatmap = 0.0
-        val_loss_end_heatmap = 0.0
         val_loss_unmatched_query = 0.0
         val_metric_mask_iou = 0.0
+        val_metric_interval_iou = 0.0
         all_predictions = {
             "class_logits": [],
-            "center": [],
             "start": [],
             "end": [],
             "mask_logits": [],
@@ -952,10 +917,9 @@ def train_one_event_detection_fold(
                 val_loss_giou += loss_dict["loss_giou"].item()
                 val_loss_mask_bce += loss_dict.get("loss_mask_bce", 0.0).item()
                 val_loss_mask_dice += loss_dict.get("loss_mask_dice", 0.0).item()
-                val_loss_start_heatmap += loss_dict.get("loss_start_heatmap", 0.0).item()
-                val_loss_end_heatmap += loss_dict.get("loss_end_heatmap", 0.0).item()
                 val_loss_unmatched_query += loss_dict["loss_unmatched_query"].item()
                 val_metric_mask_iou += loss_dict.get("metric_mask_iou", 0.0).item()
+                val_metric_interval_iou += loss_dict.get("metric_interval_iou", 0.0).item()
                 num_val_batches += 1
 
                 # Collect predictions for metrics computation
@@ -987,14 +951,6 @@ def train_one_event_detection_fold(
         avg_train_loss_mask_dice = (
             train_loss_mask_dice / num_train_batches if num_train_batches > 0 else 0.0
         )
-        avg_train_loss_start_heatmap = (
-            train_loss_start_heatmap / num_train_batches
-            if num_train_batches > 0
-            else 0.0
-        )
-        avg_train_loss_end_heatmap = (
-            train_loss_end_heatmap / num_train_batches if num_train_batches > 0 else 0.0
-        )
         avg_train_loss_unmatched_query = (
             train_loss_unmatched_query / num_train_batches
             if num_train_batches > 0
@@ -1002,6 +958,9 @@ def train_one_event_detection_fold(
         )
         avg_train_mask_iou = (
             train_metric_mask_iou / num_train_batches if num_train_batches > 0 else 0.0
+        )
+        avg_train_interval_iou = (
+            train_metric_interval_iou / num_train_batches if num_train_batches > 0 else 0.0
         )
 
         avg_val_loss = (
@@ -1025,19 +984,17 @@ def train_one_event_detection_fold(
         avg_val_loss_mask_dice = (
             val_loss_mask_dice / num_val_batches if num_val_batches > 0 else 0.0
         )
-        avg_val_loss_start_heatmap = (
-            val_loss_start_heatmap / num_val_batches if num_val_batches > 0 else 0.0
-        )
-        avg_val_loss_end_heatmap = (
-            val_loss_end_heatmap / num_val_batches if num_val_batches > 0 else 0.0
-        )
         avg_val_loss_unmatched_query = (
             val_loss_unmatched_query / num_val_batches if num_val_batches > 0 else 0.0
         )
         avg_val_mask_iou = (
             val_metric_mask_iou / num_val_batches if num_val_batches > 0 else 0.0
         )
+        avg_val_interval_iou = (
+            val_metric_interval_iou / num_val_batches if num_val_batches > 0 else 0.0
+        )
         last_val_mask_iou = float(avg_val_mask_iou)
+        last_val_interval_iou = float(avg_val_interval_iou)
 
         # Concatenate predictions for metrics computation
         for key in all_predictions:
@@ -1070,6 +1027,9 @@ def train_one_event_detection_fold(
             index=False,
             sep=";",
             decimal=",",
+        )
+        val_temporal_iou_agnostic, val_mask_iou_agnostic = (
+            _class_agnostic_detection_iou_from_rows(val_predictions_df)
         )
         matched_val_df = val_predictions_df[
             val_predictions_df["match_type"].isin(
@@ -1114,9 +1074,10 @@ def train_one_event_detection_fold(
         class_f1_scores = [
             per_class_f1_dict.get(class_id, 0.0) for class_id in range(1, 6)
         ]
-        class_iou_scores = [
-            per_class_iou_dict.get(class_id, 0.0) for class_id in range(1, 6)
-        ]
+        # Canonical IoU is class-agnostic temporal IoU from predicted start/end.
+        # Per-class IoU slots are kept for CSV compatibility and mirror this value.
+        mean_iou = float(val_temporal_iou_agnostic)
+        class_iou_scores = [float(mean_iou)] * 5
 
         active_event_class_ids = [
             class_id
@@ -1137,15 +1098,9 @@ def train_one_event_detection_fold(
                 ]
             )
         )
-        # Keep IoU aggregation aligned with active event classes.
-        mean_iou = float(
-            np.mean(
-                [
-                    float(per_class_iou_dict.get(class_id, 0.0))
-                    for class_id in active_event_class_ids
-                ]
-            )
-        )
+        # Keep a single IoU logic path: class-agnostic temporal IoU from the
+        # same validation rows used for reporting.
+        mean_iou = float(val_temporal_iou_agnostic)
         class_precision_scores = [
             float(per_class_stats[class_id]["precision"]) for class_id in range(1, 6)
         ]
@@ -1178,6 +1133,7 @@ def train_one_event_detection_fold(
         if is_best_val_mean_f1_epoch:
             best_val_mean_f1 = mean_f1
             best_val_mask_iou = float(avg_val_mask_iou)
+            best_val_interval_iou = float(avg_val_interval_iou)
             best_epoch = int(epoch)
             should_reset_early_stop = True
 
@@ -1332,18 +1288,17 @@ def train_one_event_detection_fold(
             f"[class={avg_train_loss_class:.4f} conf={avg_train_loss_confidence:.4f} "
             f"bbox={avg_train_loss_bbox:.4f} giou={avg_train_loss_giou:.4f} "
             f"mask_bce={avg_train_loss_mask_bce:.4f} mask_dice={avg_train_loss_mask_dice:.4f} "
-            f"mask_iou={avg_train_mask_iou:.4f} "
-            f"start_hm={avg_train_loss_start_heatmap:.4f} end_hm={avg_train_loss_end_heatmap:.4f} "
+            f"mask_iou={avg_train_mask_iou:.4f} interval_iou={avg_train_interval_iou:.4f} "
             f"unmatched={avg_train_loss_unmatched_query:.4f}]\n"
             f"Val Loss:    {avg_val_loss:.4f}  "
             f"[class={avg_val_loss_class:.4f} conf={avg_val_loss_confidence:.4f} "
             f"bbox={avg_val_loss_bbox:.4f} giou={avg_val_loss_giou:.4f} "
             f"mask_bce={avg_val_loss_mask_bce:.4f} mask_dice={avg_val_loss_mask_dice:.4f} "
-            f"mask_iou={avg_val_mask_iou:.4f} "
-            f"start_hm={avg_val_loss_start_heatmap:.4f} end_hm={avg_val_loss_end_heatmap:.4f} "
+            f"mask_iou={avg_val_mask_iou:.4f} interval_iou={avg_val_interval_iou:.4f} "
             f"unmatched={avg_val_loss_unmatched_query:.4f}]\n"
             f"Metrics:     mean_f1={mean_f1:.4f} mean_precision={mean_precision:.4f} "
             f"mean_recall={mean_recall:.4f} mean_iou={mean_iou:.4f} "
+            f"val_mask_interval_gap={abs(avg_val_mask_iou - avg_val_interval_iou):.4f} "
             f"best_epoch_f1={best_epoch + 1} best_epoch_val_loss={best_val_loss_epoch + 1} "
             f"no_improve={epochs_without_improvement}/{config['early_stop_patience']}\n"
             f"Boundary:    pred_start_mae={last_val_pred_start_err_true:.4f} "
@@ -1433,7 +1388,6 @@ def train_one_event_detection_fold(
     test_loss = 0.0
     all_test_predictions = {
         "class_logits": [],
-        "center": [],
         "start": [],
         "end": [],
         "mask_logits": [],
@@ -1441,6 +1395,7 @@ def train_one_event_detection_fold(
     all_test_targets = []
     num_test_batches = 0
     test_metric_mask_iou = 0.0
+    test_metric_interval_iou = 0.0
 
     with torch.inference_mode():
         for batch in test_loader:
@@ -1454,6 +1409,7 @@ def train_one_event_detection_fold(
             loss_dict = loss_fn(predictions, targets)
             test_loss += loss_dict["loss_total"].item()
             test_metric_mask_iou += loss_dict.get("metric_mask_iou", 0.0).item()
+            test_metric_interval_iou += loss_dict.get("metric_interval_iou", 0.0).item()
             num_test_batches += 1
 
             for key in all_test_predictions:
@@ -1470,11 +1426,24 @@ def train_one_event_detection_fold(
     avg_test_mask_iou = (
         test_metric_mask_iou / num_test_batches if num_test_batches > 0 else 0.0
     )
+    avg_test_interval_iou = (
+        test_metric_interval_iou / num_test_batches if num_test_batches > 0 else 0.0
+    )
 
     for key in all_test_predictions:
         all_test_predictions[key] = np.concatenate(all_test_predictions[key], axis=0)
 
     test_metrics = metrics_fn.evaluate_batch(all_test_predictions, all_test_targets)
+    test_predictions_df = build_validation_event_predictions_dataframe(
+        all_test_predictions,
+        all_test_targets,
+        iou_threshold=match_iou_threshold,
+        matching_strategy=matching_strategy,
+        overlap_recall_threshold=overlap_recall_threshold,
+    )
+    test_temporal_iou_agnostic, test_mask_iou_agnostic = (
+        _class_agnostic_detection_iou_from_rows(test_predictions_df)
+    )
     test_detection_summary = metrics_fn.compute_detection_summary(
         all_test_predictions,
         all_test_targets,
@@ -1486,10 +1455,8 @@ def train_one_event_detection_fold(
         float(test_detection_summary["per_class_f1"].get(class_id, 0.0))
         for class_id in range(1, 6)
     ]
-    test_iou_per_class = [
-        float(test_detection_summary["per_class_iou"].get(class_id, 0.0))
-        for class_id in range(1, 6)
-    ]
+    test_mean_iou = float(test_temporal_iou_agnostic)
+    test_iou_per_class = [float(test_mean_iou)] * 5
     test_per_class_stats = test_detection_summary["per_class"]
     active_test_class_ids = [
         class_id
@@ -1508,14 +1475,7 @@ def train_one_event_detection_fold(
             ]
         )
     )
-    test_mean_iou = float(
-        np.mean(
-            [
-                float(test_detection_summary["per_class_iou"].get(class_id, 0.0))
-                for class_id in active_test_class_ids
-            ]
-        )
-    )
+    test_mean_iou = float(test_temporal_iou_agnostic)
     test_f1 = metrics_fn.compute_f1(
         all_test_predictions,
         all_test_targets,
@@ -1538,7 +1498,14 @@ def train_one_event_detection_fold(
         "best_val_loss": float(best_val_loss),
         "best_val_mean_f1": float(best_val_mean_f1),
         "best_val_mask_iou": float(best_val_mask_iou),
+        "best_val_interval_iou": float(best_val_interval_iou),
         "last_val_mask_iou": float(last_val_mask_iou),
+        "last_val_interval_iou": float(last_val_interval_iou),
+        "last_val_interval_mask_iou_gap": float(
+            abs(last_val_interval_iou - last_val_mask_iou)
+        ),
+        "last_val_temporal_iou_detection_agnostic": float(val_temporal_iou_agnostic),
+        "last_val_mask_iou_detection_agnostic": float(val_mask_iou_agnostic),
         "last_val_mask_start_err_pred": float(last_val_mask_start_err_pred),
         "last_val_mask_end_err_pred": float(last_val_mask_end_err_pred),
         "last_val_mask_start_err_true": float(last_val_mask_start_err_true),
@@ -1550,6 +1517,10 @@ def train_one_event_detection_fold(
         "test_mean_iou": float(test_mean_iou),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
         "test_iou_per_class": [float(x) for x in test_iou_per_class],
+        "test_temporal_iou_detection_agnostic": float(test_temporal_iou_agnostic),
+        "test_mask_iou_detection_agnostic": float(test_mask_iou_agnostic),
+        "test_interval_iou": float(avg_test_interval_iou),
+        "test_interval_mask_iou_gap": float(abs(avg_test_interval_iou - avg_test_mask_iou)),
         "test_mAP": float(test_metrics.get("mAP", 0.0)),
         "test_mask_iou": float(avg_test_mask_iou),
         "matching_strategy": matching_strategy,
@@ -1572,6 +1543,7 @@ def train_one_event_detection_fold(
         f"Test F1(match criterion): {test_f1:.4f} | "
         f"Test mAP: {test_metrics.get('mAP', 0.0):.4f} | "
         f"Test mask_iou: {avg_test_mask_iou:.4f} | "
+        f"Test interval_iou: {avg_test_interval_iou:.4f} | "
         f"Elapsed: {fold_elapsed_sec / 60:.1f} min"
     )
 

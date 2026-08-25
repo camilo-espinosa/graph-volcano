@@ -45,7 +45,7 @@ class HungarianMatcher(nn.Module):
         """
         Args:
             cost_class: Relative weight of classification cost
-            cost_bbox: Relative weight of temporal center+duration regression cost
+            cost_bbox: Relative weight of temporal start/end regression cost
             cost_giou: Relative weight of temporal GIoU cost
         """
         super().__init__()
@@ -68,7 +68,6 @@ class HungarianMatcher(nn.Module):
         Args:
             predictions: Dict with keys:
                 - class_logits: [B, Nq, num_classes]
-                - center: [B, Nq, 1]
                 - start: [B, Nq, 1]
                 - end: [B, Nq, 1]
             targets: List of lists of EventInterval per sample [B][N_gt]
@@ -81,7 +80,6 @@ class HungarianMatcher(nn.Module):
         batch_size = predictions["class_logits"].shape[0]
 
         class_logits = predictions["class_logits"]  # [B, Nq, num_classes]
-        center_pred = predictions["center"]  # [B, Nq, 1]
         start_pred = predictions["start"]  # [B, Nq, 1]
         end_pred = predictions["end"]  # [B, Nq, 1]
 
@@ -108,7 +106,6 @@ class HungarianMatcher(nn.Module):
             # Compute cost matrix [Nq, N_gt]
             cost_matrix = self._compute_cost_matrix(
                 class_probs[b],
-                center_pred[b],
                 start_pred[b],
                 end_pred[b],
                 target_list,
@@ -124,7 +121,6 @@ class HungarianMatcher(nn.Module):
     def _compute_cost_matrix(
         self,
         class_probs: torch.Tensor,  # [Nq, num_classes]
-        center_pred: torch.Tensor,  # [Nq, 1]
         start_pred: torch.Tensor,  # [Nq, 1]
         end_pred: torch.Tensor,  # [Nq, 1]
         target_list: list[EventInterval],
@@ -144,16 +140,12 @@ class HungarianMatcher(nn.Module):
 
         # Detach and move to numpy
         class_probs_np = class_probs.detach().cpu().numpy()  # [Nq, num_classes]
-        center_pred_np = center_pred.detach().cpu().numpy().squeeze(-1)  # [Nq]
         start_pred_np = start_pred.detach().cpu().numpy().squeeze(-1)  # [Nq]
         end_pred_np = end_pred.detach().cpu().numpy().squeeze(-1)  # [Nq]
 
         # Target class IDs
         target_classes = np.array(
             [t.class_id for t in target_list], dtype=np.int64
-        )  # [N_gt]
-        target_centers = np.array(
-            [t.center_norm for t in target_list], dtype=np.float32
         )  # [N_gt]
         target_starts = np.array(
             [t.start_norm for t in target_list], dtype=np.float32
@@ -166,21 +158,15 @@ class HungarianMatcher(nn.Module):
         # [Nq, N_gt]
         cost_class = -class_probs_np[:, target_classes]
 
-        # Cost 2: L1 distance for center and duration.
-        # [Nq] -> [Nq, 1], [N_gt] -> [1, N_gt]
-        # Broadcast to [Nq, N_gt]
-        pred_durations = np.clip(end_pred_np - start_pred_np, 0.0, 1.0)
-        target_durations = np.clip(target_ends - target_starts, 0.0, 1.0)
-        cost_bbox = np.abs(center_pred_np[:, None] - target_centers[None, :]) + np.abs(
-            pred_durations[:, None] - target_durations[None, :]
+        # Cost 2: L1 distance for start and end.
+        cost_bbox = np.abs(start_pred_np[:, None] - target_starts[None, :]) + np.abs(
+            end_pred_np[:, None] - target_ends[None, :]
         )
 
         # Cost 3: Temporal GIoU (1 - GIoU)
         giou_matrix = self._temporal_giou_matrix(
-            center_pred_np,
             start_pred_np,
             end_pred_np,
-            target_centers,
             target_starts,
             target_ends,
         )  # [Nq, N_gt]
@@ -197,10 +183,8 @@ class HungarianMatcher(nn.Module):
 
     @staticmethod
     def _temporal_giou_matrix(
-        center_pred: np.ndarray,  # [Nq]
         start_pred: np.ndarray,  # [Nq]
         end_pred: np.ndarray,  # [Nq]
-        center_target: np.ndarray,  # [N_gt]
         start_target: np.ndarray,  # [N_gt]
         end_target: np.ndarray,  # [N_gt]
     ) -> np.ndarray:

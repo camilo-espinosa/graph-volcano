@@ -62,7 +62,7 @@ CONFIG = {
     "epochs": 100,
     "early_stop_patience": 15,
     "lr": 5e-4,
-    "lr_final": 1e-6,
+    "lr_final": 1e-5,
     "dice_weight": 0.7,
     "ce_weight": 0.3,
     "val_plot_events": 5,
@@ -226,11 +226,7 @@ def resolve_event_detection_loss_config(spec: dict) -> dict[str, str]:
     """Return explicit model-specific event-detection loss config, if defined."""
     if spec.get("trainer_kind") != "event_detection":
         return {}
-    raw = spec.get("loss_config") or {}
-    resolved: dict[str, str] = {}
-    if "boundary_consistency_mode" in raw:
-        resolved["boundary_consistency_mode"] = str(raw["boundary_consistency_mode"])
-    return resolved
+    return {}
 
 
 def main() -> None:

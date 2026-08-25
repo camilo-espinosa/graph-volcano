@@ -7,7 +7,6 @@ Combines:
 - Interval regression (start/end L1)
 - Temporal GIoU loss
 - Segmentation supervision per matched query (BCE + Dice)
-- Start/end heatmap supervision (distributional NLL over time)
 """
 
 from __future__ import annotations
@@ -29,8 +28,6 @@ class EventDetectionLoss(torch.nn.Module):
         loss_weights: Dict[str, float] | None = None,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
-        peak_sigma: float = 0.015,
-        boundary_consistency_mode: str = "none",
         matcher_cost_class: float | None = None,
         matcher_cost_bbox: float | None = None,
         matcher_cost_giou: float | None = None,
@@ -39,10 +36,6 @@ class EventDetectionLoss(torch.nn.Module):
         self.num_classes = int(num_classes)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
-        self.peak_sigma = float(peak_sigma)
-        self.boundary_consistency_mode = self._normalize_boundary_consistency_mode(
-            boundary_consistency_mode
-        )
 
         if loss_weights is None:
             loss_weights = {
@@ -52,13 +45,16 @@ class EventDetectionLoss(torch.nn.Module):
                 "giou_loss": 2.0,
                 "mask_bce_loss": 1.0,
                 "mask_dice_loss": 2.0,
-                "start_heatmap_loss": 0.0,
-                "end_heatmap_loss": 0.0,
                 "unmatched_query": 0.0,
-                "boundary_consistency_loss": 0.0,
             }
         self.loss_weights = {k: float(v) for k, v in loss_weights.items()}
-        self.loss_weights.setdefault("boundary_consistency_loss", 0.0)
+        self.loss_weights.setdefault("class_loss", 2.0)
+        self.loss_weights.setdefault("confidence_loss", 0.1)
+        self.loss_weights.setdefault("bbox_loss", 2.0)
+        self.loss_weights.setdefault("giou_loss", 2.0)
+        self.loss_weights.setdefault("mask_bce_loss", 1.0)
+        self.loss_weights.setdefault("mask_dice_loss", 2.0)
+        self.loss_weights.setdefault("unmatched_query", 0.0)
 
         if matcher_cost_class is None:
             matcher_cost_class = float(self.loss_weights["class_loss"])
@@ -83,11 +79,8 @@ class EventDetectionLoss(torch.nn.Module):
             "class_logits",
             "confidence_logits",
             "mask_logits",
-            "start_heatmap_logits",
-            "end_heatmap_logits",
             "start",
             "end",
-            "center",
         }
         missing = [key for key in required_keys if key not in predictions]
         if missing:
@@ -106,11 +99,9 @@ class EventDetectionLoss(torch.nn.Module):
         giou_losses = []
         mask_bce_losses = []
         mask_dice_losses = []
-        start_hm_losses = []
-        end_hm_losses = []
-        boundary_consistency_losses = []
         unmatched_query_losses = []
         matched_mask_iou_values: list[torch.Tensor] = []
+        matched_interval_iou_values: list[torch.Tensor] = []
 
         for b in range(batch_size):
             match = matches[b]
@@ -121,8 +112,6 @@ class EventDetectionLoss(torch.nn.Module):
             start_b = predictions["start"][b, :, 0]
             end_b = predictions["end"][b, :, 0]
             mask_logits_b = predictions["mask_logits"][b]
-            start_hm_logits_b = predictions["start_heatmap_logits"][b]
-            end_hm_logits_b = predictions["end_heatmap_logits"][b]
 
             target_obj = torch.zeros(num_queries, device=device, dtype=torch.float32)
             if len(match.pred_indices) > 0:
@@ -190,29 +179,29 @@ class EventDetectionLoss(torch.nn.Module):
                     target_ends,
                 )
                 loss_giou_b = (1.0 - giou).mean()
+                matched_interval_iou_values.append(
+                    self._temporal_iou_1d(
+                        pred_starts,
+                        pred_ends,
+                        target_starts,
+                        target_ends,
+                    ).mean()
+                )
 
                 target_masks = []
-                target_start_hm = []
-                target_end_hm = []
                 for target_idx in match.target_indices:
                     event = target_list[target_idx]
-                    mask_vec, start_peak, end_peak = self._build_targets_over_time(
+                    mask_vec = self._build_mask_target_over_time(
                         event.start_norm,
                         event.end_norm,
                         t_len=t_len,
                         device=device,
                     )
                     target_masks.append(mask_vec)
-                    target_start_hm.append(start_peak)
-                    target_end_hm.append(end_peak)
 
                 target_masks_t = torch.stack(target_masks, dim=0)
-                target_start_hm_t = torch.stack(target_start_hm, dim=0)
-                target_end_hm_t = torch.stack(target_end_hm, dim=0)
 
                 pred_mask_logits = mask_logits_b[match.pred_indices]
-                pred_start_hm_logits = start_hm_logits_b[match.pred_indices]
-                pred_end_hm_logits = end_hm_logits_b[match.pred_indices]
 
                 loss_mask_bce_b = F.binary_cross_entropy_with_logits(
                     pred_mask_logits,
@@ -224,45 +213,11 @@ class EventDetectionLoss(torch.nn.Module):
                 matched_mask_iou_values.append(
                     self._binary_mask_iou_mean(pred_mask_probs, target_masks_t)
                 )
-
-                if self.loss_weights["start_heatmap_loss"] > 0.0:
-                    loss_start_hm_b = self._distribution_nll(
-                        pred_start_hm_logits,
-                        target_start_hm_t,
-                    )
-                else:
-                    loss_start_hm_b = torch.tensor(0.0, device=device)
-
-                if self.loss_weights["end_heatmap_loss"] > 0.0:
-                    loss_end_hm_b = self._distribution_nll(
-                        pred_end_hm_logits,
-                        target_end_hm_t,
-                    )
-                else:
-                    loss_end_hm_b = torch.tensor(0.0, device=device)
-
-                if (
-                    self.boundary_consistency_mode != "none"
-                    and self.loss_weights["boundary_consistency_loss"] > 0.0
-                ):
-                    mask_start, mask_end = self._soft_mask_boundaries(pred_mask_logits)
-                    if self.boundary_consistency_mode == "soft_stopgrad":
-                        mask_start = mask_start.detach()
-                        mask_end = mask_end.detach()
-                    loss_boundary_consistency_b = 0.5 * (
-                        F.l1_loss(pred_starts, mask_start, reduction="mean")
-                        + F.l1_loss(pred_ends, mask_end, reduction="mean")
-                    )
-                else:
-                    loss_boundary_consistency_b = torch.tensor(0.0, device=device)
             else:
                 loss_bbox_b = torch.tensor(0.0, device=device)
                 loss_giou_b = torch.tensor(0.0, device=device)
                 loss_mask_bce_b = torch.tensor(0.0, device=device)
                 loss_mask_dice_b = torch.tensor(0.0, device=device)
-                loss_start_hm_b = torch.tensor(0.0, device=device)
-                loss_end_hm_b = torch.tensor(0.0, device=device)
-                loss_boundary_consistency_b = torch.tensor(0.0, device=device)
 
             class_losses.append(loss_class_b)
             confidence_losses.append(loss_conf_b)
@@ -270,9 +225,6 @@ class EventDetectionLoss(torch.nn.Module):
             giou_losses.append(loss_giou_b)
             mask_bce_losses.append(loss_mask_bce_b)
             mask_dice_losses.append(loss_mask_dice_b)
-            start_hm_losses.append(loss_start_hm_b)
-            end_hm_losses.append(loss_end_hm_b)
-            boundary_consistency_losses.append(loss_boundary_consistency_b)
             unmatched_query_losses.append(loss_class_unmatched)
 
         loss_class = torch.stack(class_losses).mean()
@@ -281,14 +233,15 @@ class EventDetectionLoss(torch.nn.Module):
         loss_giou = torch.stack(giou_losses).mean()
         loss_mask_bce = torch.stack(mask_bce_losses).mean()
         loss_mask_dice = torch.stack(mask_dice_losses).mean()
-        loss_start_heatmap = torch.stack(start_hm_losses).mean()
-        loss_end_heatmap = torch.stack(end_hm_losses).mean()
-        loss_boundary_consistency = torch.stack(boundary_consistency_losses).mean()
         loss_unmatched_query = torch.stack(unmatched_query_losses).mean()
         if matched_mask_iou_values:
             metric_mask_iou = torch.stack(matched_mask_iou_values).mean()
         else:
             metric_mask_iou = torch.tensor(0.0, device=device)
+        if matched_interval_iou_values:
+            metric_interval_iou = torch.stack(matched_interval_iou_values).mean()
+        else:
+            metric_interval_iou = torch.tensor(0.0, device=device)
 
         loss_total = (
             self.loss_weights["class_loss"] * loss_class
@@ -297,9 +250,6 @@ class EventDetectionLoss(torch.nn.Module):
             + self.loss_weights["giou_loss"] * loss_giou
             + self.loss_weights["mask_bce_loss"] * loss_mask_bce
             + self.loss_weights["mask_dice_loss"] * loss_mask_dice
-            + self.loss_weights["start_heatmap_loss"] * loss_start_heatmap
-            + self.loss_weights["end_heatmap_loss"] * loss_end_heatmap
-            + self.loss_weights["boundary_consistency_loss"] * loss_boundary_consistency
         )
 
         return {
@@ -310,70 +260,15 @@ class EventDetectionLoss(torch.nn.Module):
             "loss_giou": loss_giou.detach(),
             "loss_mask_bce": loss_mask_bce.detach(),
             "loss_mask_dice": loss_mask_dice.detach(),
-            "loss_start_heatmap": loss_start_heatmap.detach(),
-            "loss_end_heatmap": loss_end_heatmap.detach(),
-            "loss_boundary_consistency": loss_boundary_consistency.detach(),
             "loss_unmatched_query": loss_unmatched_query.detach(),
             "metric_mask_iou": metric_mask_iou.detach(),
+            "metric_interval_iou": metric_interval_iou.detach(),
             "metrics": {
                 "num_matched": sum(len(m.pred_indices) for m in matches),
                 "num_targets": sum(len(t) for t in targets),
                 "num_predictions": batch_size * num_queries,
             },
         }
-
-    @staticmethod
-    def _normalize_boundary_consistency_mode(mode: str) -> str:
-        normalized = str(mode).strip().lower()
-        valid = {"none", "soft", "soft_stopgrad"}
-        if normalized not in valid:
-            raise ValueError(
-                "boundary_consistency_mode must be one of "
-                f"{sorted(valid)}, got {mode!r}."
-            )
-        return normalized
-
-    @staticmethod
-    def _soft_mask_boundaries(mask_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Differentiable first/last boundary estimates from mask logits [N, T]."""
-        eps = 1e-6
-        probs = torch.sigmoid(mask_logits).clamp(min=eps, max=1.0 - eps)
-        log_not_probs = torch.log1p(-probs)
-
-        prefix_inclusive = torch.cumsum(log_not_probs, dim=-1)
-        prefix_exclusive = F.pad(prefix_inclusive[..., :-1], (1, 0), value=0.0)
-
-        suffix_inclusive = torch.flip(
-            torch.cumsum(torch.flip(log_not_probs, dims=[-1]), dim=-1),
-            dims=[-1],
-        )
-        suffix_exclusive = F.pad(suffix_inclusive[..., 1:], (0, 1), value=0.0)
-
-        start_scores = probs * torch.exp(prefix_exclusive)
-        end_scores = probs * torch.exp(suffix_exclusive)
-
-        start_weights = start_scores / start_scores.sum(dim=-1, keepdim=True).clamp_min(eps)
-        end_weights = end_scores / end_scores.sum(dim=-1, keepdim=True).clamp_min(eps)
-
-        t_len = mask_logits.shape[-1]
-        time_grid = torch.linspace(
-            0.0,
-            1.0,
-            steps=t_len,
-            device=mask_logits.device,
-            dtype=mask_logits.dtype,
-        )[None, :]
-        mask_start = (start_weights * time_grid).sum(dim=-1)
-        mask_end = (end_weights * time_grid).sum(dim=-1)
-        return mask_start, mask_end
-
-    def _distribution_nll(
-        self,
-        logits: torch.Tensor,
-        target_distribution: torch.Tensor,
-    ) -> torch.Tensor:
-        log_probs = F.log_softmax(logits, dim=-1)
-        return (-(target_distribution * log_probs).sum(dim=-1)).mean()
 
     @staticmethod
     def _soft_dice_loss(
@@ -400,28 +295,42 @@ class EventDetectionLoss(torch.nn.Module):
         iou = inter / union.clamp_min(float(eps))
         return iou.mean()
 
-    def _build_targets_over_time(
+    def _build_mask_target_over_time(
         self,
         start_norm: float,
         end_norm: float,
         *,
         t_len: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         start = float(max(0.0, min(1.0, start_norm)))
         end = float(max(0.0, min(1.0, end_norm)))
         start, end = (start, end) if start <= end else (end, start)
 
         time = torch.linspace(0.0, 1.0, steps=t_len, device=device)
         mask = ((time >= start) & (time <= end)).to(torch.float32)
+        return mask
 
-        sigma = max(self.peak_sigma, 1e-4)
-        start_peak = torch.exp(-0.5 * ((time - start) / sigma) ** 2)
-        end_peak = torch.exp(-0.5 * ((time - end) / sigma) ** 2)
-        start_peak = start_peak / start_peak.sum().clamp_min(1e-8)
-        end_peak = end_peak / end_peak.sum().clamp_min(1e-8)
+    @staticmethod
+    def _temporal_iou_1d(
+        pred_starts: torch.Tensor,
+        pred_ends: torch.Tensor,
+        target_starts: torch.Tensor,
+        target_ends: torch.Tensor,
+    ) -> torch.Tensor:
+        pred_start_fixed = torch.minimum(pred_starts, pred_ends).clamp(0.0, 1.0)
+        pred_end_fixed = torch.maximum(pred_starts, pred_ends).clamp(0.0, 1.0)
+        target_start_fixed = torch.minimum(target_starts, target_ends).clamp(0.0, 1.0)
+        target_end_fixed = torch.maximum(target_starts, target_ends).clamp(0.0, 1.0)
 
-        return mask, start_peak, end_peak
+        inter_start = torch.maximum(pred_start_fixed, target_start_fixed)
+        inter_end = torch.minimum(pred_end_fixed, target_end_fixed)
+        inter_len = (inter_end - inter_start).clamp(min=0.0)
+
+        pred_len = (pred_end_fixed - pred_start_fixed).clamp(min=0.0)
+        target_len = (target_end_fixed - target_start_fixed).clamp(min=0.0)
+        union_len = pred_len + target_len - inter_len
+        return inter_len / union_len.clamp_min(1e-7)
 
     @staticmethod
     def _temporal_giou_1d(
