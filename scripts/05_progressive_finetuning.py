@@ -30,6 +30,10 @@ from utils.fold_io_utils import append_row_csv
 from utils.finetune_utils import apply_finetune_protocol
 from utils.model_registry import MODEL_SPECS, build_model_from_spec, get_model_spec
 from utils.script_common import parse_csv_selection, resolve_project_path
+from utils.trainer_detection import (
+    _class_agnostic_detection_iou_from_rows,
+    build_validation_event_predictions_dataframe,
+)
 from utils.train_utils import (
     BalancedBatchSampler,
     MultiStation1DDataset,
@@ -37,7 +41,7 @@ from utils.train_utils import (
     cleanup_gpu_cache,
     combined_dice_ce_loss,
     combined_dice_ce_loss_2d,
-    compute_event_f1_iou_multistation,
+    compute_event_f1_iou_graphsage,
     compute_summary,
     evaluate_unet_model,
     save_confusion_matrix_image,
@@ -430,6 +434,7 @@ def _evaluate_event_detection_loader(
         "class_logits": [],
         "start": [],
         "end": [],
+        "mask_logits": [],
     }
     all_targets = []
 
@@ -463,7 +468,6 @@ def _evaluate_event_detection_loader(
     detection_metrics = metrics_fn.evaluate_batch(all_predictions, all_targets)
 
     per_class_f1 = detection_summary["per_class_f1"]
-    per_class_iou = detection_summary["per_class_iou"]
     per_class_stats = detection_summary["per_class"]
 
     active_event_class_ids = [
@@ -477,12 +481,17 @@ def _evaluate_event_detection_loader(
     mean_f1 = float(
         np.mean([float(per_class_f1.get(class_id, 0.0)) for class_id in active_event_class_ids])
     )
-    mean_iou = float(
-        np.mean([float(per_class_iou.get(class_id, 0.0)) for class_id in active_event_class_ids])
+    predictions_df = build_validation_event_predictions_dataframe(
+        all_predictions,
+        all_targets,
+        iou_threshold=float(matching_cfg["match_iou_threshold"]),
+        matching_strategy=str(matching_cfg["matching_strategy"]),
+        overlap_recall_threshold=float(matching_cfg["overlap_recall_threshold"]),
     )
+    mean_iou, _ = _class_agnostic_detection_iou_from_rows(predictions_df)
 
     f1_per_class = [float(per_class_f1.get(class_id, 0.0)) for class_id in range(1, 6)]
-    iou_per_class = [float(per_class_iou.get(class_id, 0.0)) for class_id in range(1, 6)]
+    iou_per_class = [float(mean_iou)] * 5
     avg_loss = float(val_loss / n_batches)
     cm = detection_summary["confusion_matrix"]
     test_map = float(detection_metrics.get("mAP", 0.0))
@@ -702,7 +711,7 @@ def _train_one_run(
                 _val_mean_iou_all,
                 val_loss,
                 val_cm,
-            ) = compute_event_f1_iou_multistation(
+            ) = compute_event_f1_iou_graphsage(
                 model,
                 val_loader,
                 device,
@@ -742,12 +751,12 @@ def _train_one_run(
                 f"Unsupported trainer kind '{trainer_kind}' for model '{model_key}'."
             )
 
-        improved = float(val_mean_f1) > float(best_val_mean_f1)
-        if improved:
+        is_best_val_mean_f1_epoch = float(val_mean_f1) > float(best_val_mean_f1)
+        is_best_val_loss_epoch = float(val_loss) < float(best_val_loss)
+
+        if is_best_val_mean_f1_epoch:
             best_val_mean_f1 = float(val_mean_f1)
-            best_val_loss = float(val_loss)
             best_epoch = int(epoch)
-            no_improve = 0
             best_ckpt_out = checkpoints_dir / "best_f1.pt"
             torch.save(
                 {
@@ -772,8 +781,35 @@ def _train_one_run(
                 out_path=best_cm_out,
                 title=f"Val CM - {model_key} - {target_volcano} - fold {repeat_idx:02d} - {subset_key}",
             )
+
+        if is_best_val_loss_epoch:
+            best_val_loss = float(val_loss)
+            torch.save(
+                {
+                    "epoch": int(epoch),
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": float(val_loss),
+                    "val_mean_f1": float(val_mean_f1),
+                    "model_key": model_key,
+                    "target_volcano": target_volcano,
+                    "repeat_id": int(repeat_idx),
+                    "subset_key": subset_key,
+                    "base_checkpoint": str(base_checkpoint),
+                },
+                checkpoints_dir / "best_val_loss.pt",
+            )
+
+        if str(trainer_kind) == "event_detection":
+            if is_best_val_mean_f1_epoch or is_best_val_loss_epoch:
+                no_improve = 0
+            else:
+                no_improve += 1
         else:
-            no_improve += 1
+            if is_best_val_mean_f1_epoch:
+                no_improve = 0
+            else:
+                no_improve += 1
 
         print(
             f"epoch={epoch + 1:03d}/{int(config['epochs']):03d} "
@@ -795,10 +831,11 @@ def _train_one_run(
         )
 
         if no_improve >= int(config["early_stop_patience"]):
+            criterion_msg = "val_mean_f1 or val_loss" if str(trainer_kind) == "event_detection" else "val_mean_f1"
             print(
                 "[EARLY-STOP] "
                 f"Stopping at epoch={epoch + 1:03d} after "
-                f"{no_improve} epochs without val_mean_f1 improvement."
+                f"{no_improve} epochs without {criterion_msg} improvement."
             )
             break
 
@@ -849,7 +886,7 @@ def _train_one_run(
             _test_mean_iou_all,
             test_loss,
             test_cm,
-        ) = compute_event_f1_iou_multistation(
+        ) = compute_event_f1_iou_graphsage(
             model,
             test_loader,
             device,

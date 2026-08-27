@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--folds",
         type=str,
-        default="1",
+        default="all",
         help=(
             "Comma-separated folds to run (e.g. '1,3' or '01,03'). "
             "Use 'all' for all folds. Default: all folds."

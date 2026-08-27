@@ -34,87 +34,70 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False},
         "batch_size": 16,
     },
-
-   "MuSSED_xattn": {
+   "MuSSED_k127": {
         "family": "event_detection",
         "trainer_kind": "event_detection",
         "model_cls": MuSSED,
-        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": True},
-        "batch_size": 14,
-    },
-
-   "MuSSED_k31": {
-        "family": "event_detection",
-        "trainer_kind": "event_detection",
-        "model_cls": MuSSED,
-       "model_kwargs": {"query_head_kernel_size": 31},
+        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False, "query_head_kernel_size":127},
         "batch_size": 16,
     },
-   "MuSSED_k31_xattn": {
+   "MuSSED_k91": {
         "family": "event_detection",
         "trainer_kind": "event_detection",
         "model_cls": MuSSED,
-       "model_kwargs": {"query_head_kernel_size": 31,
-       "use_query_cross_attention": True},
+        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False, "query_head_kernel_size":91},
         "batch_size": 16,
     },
-   "MuSSED_final_k127": {
-        "family": "event_detection",
-        "trainer_kind": "event_detection",
-        "model_cls": MuSSED,
-       "model_kwargs": {"query_head_kernel_size": 127},
-        "batch_size": 16,
+    "MuSSeg": {
+        "family": "phasenet",
+        "trainer_kind": "1d",
+        "model_cls": MuSSeg,
+        "model_kwargs": {},
+        "batch_size": 32,
     },
-#     "MuSSeg": {
-#         "family": "phasenet",
-#         "trainer_kind": "1d",
-#         "model_cls": MuSSeg,
-#         "model_kwargs": {},
-#         "batch_size": 32,
-#     },
-#    # ---- Tier B: baselines ----
-#     "unet": {
-#         "family": "unet",
-#         "trainer_kind": "2d",
-#         "model_cls": UNet,
-#         "model_kwargs": {
-#             "in_channels": 1,
-#             "out_channels": 6,
-#             "init_features": 16,
-#             "depth": 5,
-#         },
-#         "batch_size": 32,
-#     },
-#     "unet_attention": {
-#         "family": "unet",
-#         "trainer_kind": "2d",
-#         "model_cls": UNetBottleneckAttention,
-#         "model_kwargs": {
-#             "in_channels": 1,
-#             "out_channels": 6,
-#             "init_features": 16,
-#             "depth": 5,
-#             "bottleneck_attn_heads": 4,
-#             "bottleneck_attn_dropout": 0.2,
-#             "bottleneck_attn_ff_mult": 2,
-#             "feature_dropout": 0.2,
-#         },
-#         "batch_size": 32,
-#     },
-#     "phasenet": {
-#         "family": "phasenet",
-#         "trainer_kind": "1d",
-#         "model_cls": PhaseNet,
-#         "model_kwargs": {},
-#         "batch_size": 64,
-#     },
-#     "phasenet_bottleneck_attention": {
-#         "family": "phasenet",
-#         "trainer_kind": "1d",
-#         "model_cls": PhaseNetBottleneckAttention,
-#         "model_kwargs": {},
-#         "batch_size": 64,
-#     },
+   # ---- Tier B: baselines ----
+    "unet": {
+        "family": "unet",
+        "trainer_kind": "2d",
+        "model_cls": UNet,
+        "model_kwargs": {
+            "in_channels": 1,
+            "out_channels": 6,
+            "init_features": 16,
+            "depth": 5,
+        },
+        "batch_size": 32,
+    },
+    "unet_attention": {
+        "family": "unet",
+        "trainer_kind": "2d",
+        "model_cls": UNetBottleneckAttention,
+        "model_kwargs": {
+            "in_channels": 1,
+            "out_channels": 6,
+            "init_features": 16,
+            "depth": 5,
+            "bottleneck_attn_heads": 4,
+            "bottleneck_attn_dropout": 0.2,
+            "bottleneck_attn_ff_mult": 2,
+            "feature_dropout": 0.2,
+        },
+        "batch_size": 32,
+    },
+    "phasenet": {
+        "family": "phasenet",
+        "trainer_kind": "1d",
+        "model_cls": PhaseNet,
+        "model_kwargs": {},
+        "batch_size": 64,
+    },
+    "phasenet_bottleneck_attention": {
+        "family": "phasenet",
+        "trainer_kind": "1d",
+        "model_cls": PhaseNetBottleneckAttention,
+        "model_kwargs": {},
+        "batch_size": 64,
+    },
 }
 
 
