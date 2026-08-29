@@ -365,18 +365,10 @@ def cm_eval(
     model.eval()
     with torch.inference_mode():
         for data in dataloader:
-            xb, target, _ = data
+            xb, target, y_label = data
             xb = xb.to(device)
-
-            target_trace = data_utils.activation_unstacking(
-                target,
-                len_window=len_window,
-                N=im_size,
-                n_classes=n_classes,
-            )
-            # Dominant true class over the full window, including BG=0.
-            true_label_temp = target_trace.sum(axis=2).max(axis=1).indices.numpy()
-            true_label.extend(true_label_temp.tolist())
+            y_label_np = y_label.detach().cpu().numpy().astype(np.int64, copy=False)
+            true_label.extend(y_label_np.tolist())
 
             output = model(xb)
             if output.ndim == 4:
@@ -398,7 +390,7 @@ def cm_eval(
                 )
                 pred_label.append(pred)
 
-            del xb, target, target_trace, output, output_trace
+            del xb, target, y_label, output, output_trace
 
     if was_training:
         model.train()
@@ -651,10 +643,10 @@ def collect_unet_misclassified_event_plots(
             if all(counts.get(int(c), 0) >= max_per_class for c in tracked_classes):
                 break
 
-            x_unet, _y_onehot_2d, _y_idx, x_raw, y_raw, _x_used, _y_used, _aug_meta = (
+            x_unet, _y_onehot_2d, y_label, x_raw, y_raw, _x_used, _y_used, _aug_meta = (
                 ds[i]
             )
-            true_class = int(np.argmax(y_raw.sum(axis=1)))
+            true_class = int(y_label.item())
             if counts.get(true_class, 0) >= max_per_class:
                 continue
 
@@ -1222,21 +1214,21 @@ class UNetPatchDataset(Dataset):
             n_classes=6,
             n_stations=8,
         ).squeeze(0)
-        y_idx = torch.argmax(y_onehot, dim=0).long()
+        y_label = torch.tensor(int(self.label_ids[idx]), dtype=torch.long)
 
         if self.return_debug:
-            return x_unet, y_onehot, y_idx, x_raw, y_raw, x_used, y_used, aug_meta
+            return x_unet, y_onehot, y_label, x_raw, y_raw, x_used, y_used, aug_meta
 
         if self.return_meta:
             return (
                 x_unet,
                 y_onehot,
-                y_idx,
+                y_label,
                 self.labels[idx],
                 Path(self.filepaths[idx]).name,
             )
 
-        return x_unet, y_onehot, y_idx
+        return x_unet, y_onehot, y_label
 
 
 AVAILABLE_TRACE_DESCRIPTORS = (

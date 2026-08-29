@@ -42,3 +42,4 @@ scripts/04_cross-volcano.py
 figures/fig1_main_results.py
 figure_1_model_comparison.pdf
 figure_1_model_comparison.png
+scripts/00_fix_manifest_drive_prefix.py
