@@ -88,7 +88,7 @@ def save_training_history_segmentation(
     Creates CSV with columns:
         lr, epoch, train_loss, val_loss,
         VT_f1, LP_f1, TR_f1, AV_f1, IC_f1, mean_f1,
-        VT_iou, LP_iou, TR_iou, AV_iou, IC_iou, mean_iou
+        mean_iou
 
     Args:
         metrics_rows: List of metric rows (one per epoch)
@@ -111,11 +111,6 @@ def save_training_history_segmentation(
             "AV_f1",
             "IC_f1",
             "mean_f1",
-            "VT_iou",
-            "LP_iou",
-            "TR_iou",
-            "AV_iou",
-            "IC_iou",
             "mean_iou",
         ],
     )
@@ -145,11 +140,11 @@ def save_training_history_detection(
     1. Main CSV (compatible with segmentation format):
         lr, epoch, train_loss, val_loss,
         VT_f1, LP_f1, TR_f1, AV_f1, IC_f1, mean_f1,
-        VT_iou, LP_iou, TR_iou, AV_iou, IC_iou, mean_iou
+        mean_iou
 
     2. Detection-specific CSV:
         epoch, mAP@0.1, mAP@0.3, mAP@0.5, mAP@0.7, mAP@0.9, mAP,
-        F1@0.5, AP_VT@0.5, AP_LP@0.5, AP_TR@0.5, AP_AV@0.5, AP_IC@0.5
+        macro_f1, VT_f1, LP_f1, TR_f1, AV_f1, IC_f1
 
     Args:
         metrics_rows: List of metric rows for main CSV
@@ -175,11 +170,6 @@ def save_training_history_detection(
             "AV_f1",
             "IC_f1",
             "mean_f1",
-            "VT_iou",
-            "LP_iou",
-            "TR_iou",
-            "AV_iou",
-            "IC_iou",
             "mean_iou",
         ],
     )
@@ -205,12 +195,12 @@ def save_training_history_detection(
                 "mAP@0.7",
                 "mAP@0.9",
                 "mAP",
-                "F1_match",
-                "VT_f1_match",
-                "LP_f1_match",
-                "TR_f1_match",
-                "AV_f1_match",
-                "IC_f1_match",
+                "macro_f1",
+                "VT_f1",
+                "LP_f1",
+                "TR_f1",
+                "AV_f1",
+                "IC_f1",
             ],
         )
         detection_df.to_csv(
@@ -234,31 +224,29 @@ def map_detection_metrics_to_compatible_columns(
     Args:
         mAP_dict: Detection metrics dict with keys like:
             - "mAP": overall mAP
-            - "F1_match": F1 score under selected matching criterion
-            - "VT_f1_match": VT-class F1 under selected matching criterion
-            - "LP_f1_match", "TR_f1_match", "AV_f1_match", "IC_f1_match"
+            - "macro_f1": macro F1 across configured classes
+            - "VT_f1", "LP_f1", "TR_f1", "AV_f1", "IC_f1"
 
     Returns:
         Tuple of:
         - per_class_f1: [VT, LP, TR, AV, IC] F1 scores
         - per_class_iou: [VT, LP, TR, AV, IC] IoU proxy scores
-        - mean_f1: Overall F1 under selected matching criterion
+        - mean_f1: Overall macro F1
         - mean_iou: Overall mAP (as proxy for mean IoU)
     """
-    # For detection models: use the criterion-specific class F1 values and keep
-    # mAP as the cross-threshold overlap-quality proxy.
+    # For detection models: keep macro/per-class F1 plus mAP.
 
     per_class_f1 = [
-        mAP_dict.get("VT_f1_match", 0.0),
-        mAP_dict.get("LP_f1_match", 0.0),
-        mAP_dict.get("TR_f1_match", 0.0),
-        mAP_dict.get("AV_f1_match", 0.0),
-        mAP_dict.get("IC_f1_match", 0.0),
+        mAP_dict.get("VT_f1", 0.0),
+        mAP_dict.get("LP_f1", 0.0),
+        mAP_dict.get("TR_f1", 0.0),
+        mAP_dict.get("AV_f1", 0.0),
+        mAP_dict.get("IC_f1", 0.0),
     ]
 
     per_class_iou = per_class_f1.copy()  # Same as F1 for detection
 
-    mean_f1 = mAP_dict.get("F1_match", 0.0)
+    mean_f1 = mAP_dict.get("macro_f1", 0.0)
     mean_iou = mAP_dict.get("mAP", 0.0)
 
     return per_class_f1, per_class_iou, mean_f1, mean_iou

@@ -235,7 +235,7 @@ def plot_event_validation(
     plot_count = 0
     class_counts: dict = {}  # {class_id: n_saved}
     class_event_counts: dict = {}  # {class_id: n_misdetected_events_saved}
-    num_non_bg_classes: int | None = None
+    tracked_class_ids: list[int] | None = None
 
     need_station_attention = attention_mode in {"station", "full"}
     need_temporal_attention = attention_mode == "full"
@@ -372,25 +372,28 @@ def plot_event_validation(
                     misdetected_event_counts.get(true_class, 0) + 1
                 )
 
+        if len(gt_events) == 0 and len(pred_events) > 0:
+            misdetected_event_counts[0] = 1
+
         return misdetected_event_counts, gt_events
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(dataloader):
             y_onehot = batch[1]
-            if num_non_bg_classes is None:
-                num_non_bg_classes = int(y_onehot.shape[1] - 1)
+            if tracked_class_ids is None:
+                tracked_class_ids = list(range(int(y_onehot.shape[1])))
 
             if misdetected_only:
                 remaining_classes = [
                     c
-                    for c in range(1, y_onehot.shape[1])
+                    for c in range(0, y_onehot.shape[1])
                     if class_event_counts.get(c, 0)
                     < int(max_misdetected_events_per_class)
                 ]
             else:
                 remaining_classes = [
                     c
-                    for c in range(1, y_onehot.shape[1])
+                    for c in range(0, y_onehot.shape[1])
                     if class_counts.get(c, 0) < samples_per_class
                 ]
             if not remaining_classes:
@@ -405,7 +408,7 @@ def plot_event_validation(
                 for sample_idx in range(y_onehot_np.shape[0]):
                     sample_classes = {
                         c
-                        for c in range(1, y_onehot_np.shape[1])
+                        for c in range(0, y_onehot_np.shape[1])
                         if y_onehot_np[sample_idx, c].any()
                     }
                     if sample_classes & remaining_set:
@@ -463,7 +466,7 @@ def plot_event_validation(
                 for sample_idx in range(len(xb)):
                     y_sample = y_onehot_chunk[sample_idx].numpy()  # [C, T]
                     sample_classes = [
-                        c for c in range(1, y_sample.shape[0]) if y_sample[c].any()
+                        c for c in range(0, y_sample.shape[0]) if y_sample[c].any()
                     ]
                     if not sample_classes:
                         continue
@@ -537,49 +540,49 @@ def plot_event_validation(
                             quota = int(max_misdetected_events_per_class)
                             class_event_counts[c] = min(quota, current + add_count)
 
-                        if num_non_bg_classes is not None and all(
+                        if tracked_class_ids is not None and all(
                             class_event_counts.get(c, 0)
                             >= int(max_misdetected_events_per_class)
-                            for c in range(1, num_non_bg_classes + 1)
+                            for c in tracked_class_ids
                         ):
                             break
                     else:
                         for c in sample_classes:
                             class_counts[c] = class_counts.get(c, 0) + 1
 
-                        if num_non_bg_classes is not None and all(
+                        if tracked_class_ids is not None and all(
                             class_counts.get(c, 0) >= samples_per_class
-                            for c in range(1, num_non_bg_classes + 1)
+                            for c in tracked_class_ids
                         ):
                             break
 
                 del xb, y_onehot_chunk, outputs, station_attn_batch, temporal_attn_batch
 
                 if misdetected_only:
-                    if num_non_bg_classes is not None and all(
+                    if tracked_class_ids is not None and all(
                         class_event_counts.get(c, 0)
                         >= int(max_misdetected_events_per_class)
-                        for c in range(1, num_non_bg_classes + 1)
+                        for c in tracked_class_ids
                     ):
                         break
                 else:
-                    if num_non_bg_classes is not None and all(
+                    if tracked_class_ids is not None and all(
                         class_counts.get(c, 0) >= samples_per_class
-                        for c in range(1, num_non_bg_classes + 1)
+                        for c in tracked_class_ids
                     ):
                         break
 
             if misdetected_only:
-                if num_non_bg_classes is not None and all(
+                if tracked_class_ids is not None and all(
                     class_event_counts.get(c, 0)
                     >= int(max_misdetected_events_per_class)
-                    for c in range(1, num_non_bg_classes + 1)
+                    for c in tracked_class_ids
                 ):
                     break
             else:
-                if num_non_bg_classes is not None and all(
+                if tracked_class_ids is not None and all(
                     class_counts.get(c, 0) >= samples_per_class
-                    for c in range(1, num_non_bg_classes + 1)
+                    for c in tracked_class_ids
                 ):
                     break
 

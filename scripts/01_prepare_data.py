@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.data_utils import (
+    CLASS_TO_ID,
     build_stratified_kfold_specs,
     collect_volcano_samples,
     expand_training_set_with_augmentation,
@@ -40,6 +41,9 @@ AUGMENT_TIME_SHIFT = 1000
 AUGMENT_AMPLITUDE_LOW = 0.85
 AUGMENT_AMPLITUDE_HIGH = 1.15
 AUGMENT_NOISE_STD_FACTOR = 0.02
+BG_CLASS_NAME = "BG"
+BG_CLASS_ID = 0
+CLASS_TO_ID_WITH_BG = {BG_CLASS_NAME: BG_CLASS_ID, **CLASS_TO_ID}
 
 
 def main() -> None:
@@ -58,7 +62,16 @@ def main() -> None:
     if not volcano_root.exists():
         raise RuntimeError(f"Target volcano folder not found: {volcano_root}")
 
-    all_paths, all_labels, all_label_ids = collect_volcano_samples(volcano_root)
+    all_paths, all_labels, all_label_ids = collect_volcano_samples(
+        volcano_root,
+        class_to_id=CLASS_TO_ID_WITH_BG,
+    )
+    bg_count = int(np.sum(all_labels == BG_CLASS_NAME))
+    if bg_count == 0:
+        raise RuntimeError(
+            f"No {BG_CLASS_NAME} .npy files found under: {volcano_root / BG_CLASS_NAME}"
+        )
+    print(f"Found {BG_CLASS_NAME} windows: {bg_count}")
     split_specs = build_stratified_kfold_specs(
         labels=all_labels,
         n_splits=N_FOLDS,
@@ -110,18 +123,26 @@ def main() -> None:
             label_ids=train_label_ids,
             extra_fields=common_fields,
         )
+
+        val_perm = np.random.default_rng(seed=RANDOM_SEED + 30000 + fold_idx).permutation(
+            len(val_paths)
+        )
         save_manifest(
             split_dir / "val.npz",
-            filepaths=val_paths,
-            labels=val_labels,
-            label_ids=val_label_ids,
+            filepaths=val_paths[val_perm],
+            labels=val_labels[val_perm],
+            label_ids=val_label_ids[val_perm],
             extra_fields=common_fields,
+        )
+
+        test_perm = np.random.default_rng(seed=RANDOM_SEED + 40000 + fold_idx).permutation(
+            len(test_paths)
         )
         save_manifest(
             split_dir / "test.npz",
-            filepaths=test_paths,
-            labels=test_labels,
-            label_ids=test_label_ids,
+            filepaths=test_paths[test_perm],
+            labels=test_labels[test_perm],
+            label_ids=test_label_ids[test_perm],
             extra_fields=common_fields,
         )
 
@@ -141,6 +162,14 @@ def main() -> None:
             )
         )
 
+        # Shuffle once per fold to avoid deterministic ordering blocks.
+        train_mix_rng = np.random.default_rng(seed=RANDOM_SEED + 20000 + fold_idx)
+        perm = train_mix_rng.permutation(len(train_aug_paths))
+        train_aug_paths = train_aug_paths[perm]
+        train_aug_labels = train_aug_labels[perm]
+        train_aug_label_ids = train_aug_label_ids[perm]
+        is_augmented = is_augmented[perm]
+
         save_manifest(
             split_dir / "train_aug.npz",
             filepaths=train_aug_paths,
@@ -153,7 +182,8 @@ def main() -> None:
         )
 
         print(
-            f"Saved fold={spec.split_id}/{N_FOLDS} | train={len(train_paths)} val={len(val_paths)} test={len(test_paths)} train_aug={len(train_aug_paths)}"
+            f"Saved fold={spec.split_id}/{N_FOLDS} | train={len(train_paths)} val={len(val_paths)} "
+            f"test={len(test_paths)} train_aug={len(train_aug_paths)}"
         )
 
     print(f"Done. Prepared data written to: {PREPARED_ROOT}")

@@ -169,7 +169,6 @@ def write_aggregate_reports(out_dir: Path) -> None:
 
     summary_rows = []
     per_class_f1_rows = []
-    per_class_iou_rows = []
 
     def _normalize_model_key(value) -> str:
         if isinstance(value, tuple):
@@ -186,14 +185,6 @@ def write_aggregate_reports(out_dir: Path) -> None:
         model_key = _normalize_model_key(model_key)
         mean_f1_summary = compute_summary(grp["test_mean_f1"].astype(float).tolist())
         mean_iou_summary = compute_summary(grp["test_mean_iou"].astype(float).tolist())
-        iou_all_values = pd.to_numeric(
-            grp["test_mean_iou_all"], errors="coerce"
-        ).dropna()
-        mean_iou_all_summary = (
-            compute_summary(iou_all_values.astype(float).tolist())
-            if len(iou_all_values) > 0
-            else None
-        )
         loss_summary = compute_summary(grp["test_loss"].astype(float).tolist())
 
         display_names = grp["model_display_name"].dropna().unique().tolist()
@@ -211,38 +202,24 @@ def write_aggregate_reports(out_dir: Path) -> None:
             "test_loss_mean": float(loss_summary["mean"]),
             "test_loss_std": float(loss_summary["std"]),
         }
-        if mean_iou_all_summary is not None:
-            summary_row["test_mean_iou_all_mean"] = float(mean_iou_all_summary["mean"])
-            summary_row["test_mean_iou_all_std"] = float(mean_iou_all_summary["std"])
 
         per_class_f1_row = {
-            "model_key": model_key,
-            "model_display_name": display_name,
-        }
-        per_class_iou_row = {
             "model_key": model_key,
             "model_display_name": display_name,
         }
 
         for class_name in CLASS_NAMES:
             f1_col = f"test_f1_{class_name}"
-            iou_col = f"test_iou_{class_name}"
             f1_summary = compute_summary(grp[f1_col].astype(float).tolist())
-            iou_summary = compute_summary(grp[iou_col].astype(float).tolist())
 
             summary_row[f"{f1_col}_mean"] = float(f1_summary["mean"])
             summary_row[f"{f1_col}_std"] = float(f1_summary["std"])
-            summary_row[f"{iou_col}_mean"] = float(iou_summary["mean"])
-            summary_row[f"{iou_col}_std"] = float(iou_summary["std"])
 
             per_class_f1_row[f"{class_name}_mean"] = float(f1_summary["mean"])
             per_class_f1_row[f"{class_name}_std"] = float(f1_summary["std"])
-            per_class_iou_row[f"{class_name}_mean"] = float(iou_summary["mean"])
-            per_class_iou_row[f"{class_name}_std"] = float(iou_summary["std"])
 
         summary_rows.append(summary_row)
         per_class_f1_rows.append(per_class_f1_row)
-        per_class_iou_rows.append(per_class_iou_row)
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
         by=["test_mean_f1_mean"],
@@ -258,14 +235,6 @@ def write_aggregate_reports(out_dir: Path) -> None:
 
     pd.DataFrame(per_class_f1_rows).sort_values(by=["model_key"]).to_csv(
         out_dir / "station_scramble_per_class_f1.csv",
-        index=False,
-        encoding="utf-8-sig",
-        sep=";",
-        decimal=",",
-    )
-
-    pd.DataFrame(per_class_iou_rows).sort_values(by=["model_key"]).to_csv(
-        out_dir / "station_scramble_per_class_iou.csv",
         index=False,
         encoding="utf-8-sig",
         sep=";",
@@ -404,16 +373,12 @@ def main() -> None:
         "test_loss",
         "test_mean_f1",
         "test_mean_iou",
-        "test_mean_iou_all",
         "test_mAP",
         "n_active_classes",
         "active_classes",
     ]
     for class_name in CLASS_NAMES:
         fieldnames.append(f"test_f1_{class_name}")
-        fieldnames.append(f"test_iou_{class_name}")
-    for class_name in ALL_CLASS_NAMES:
-        fieldnames.append(f"test_iou_all_{class_name}")
 
     completed_keys = load_completed_keys(
         out_dir / "station_scramble_fold_metrics.csv",
@@ -500,10 +465,7 @@ def main() -> None:
                 (
                     f1_per_class,
                     mean_f1,
-                    iou_per_class,
                     mean_iou,
-                    iou_all_classes,
-                    mean_iou_all,
                     eval_loss,
                     cm,
                     n_samples,
@@ -539,7 +501,6 @@ def main() -> None:
                 (
                     f1_per_class,
                     mean_f1,
-                    iou_per_class,
                     mean_iou,
                     eval_loss,
                     cm,
@@ -558,8 +519,6 @@ def main() -> None:
                     len_window=LEN_WINDOW,
                     im_size=IM_SIZE,
                 )
-                iou_all_classes = [float("nan")] * len(ALL_CLASS_NAMES)
-                mean_iou_all = float("nan")
                 test_map = float("nan")
             elif trainer_kind == "event_detection":
                 model = model_spec["model_cls"](**model_kwargs).to(device)
@@ -572,10 +531,7 @@ def main() -> None:
                 (
                     f1_per_class,
                     mean_f1,
-                    iou_per_class,
                     mean_iou,
-                    iou_all_classes,
-                    mean_iou_all,
                     eval_loss,
                     cm,
                     n_samples,
@@ -606,7 +562,6 @@ def main() -> None:
                 "test_loss": float(eval_loss),
                 "test_mean_f1": float(mean_f1),
                 "test_mean_iou": float(mean_iou),
-                "test_mean_iou_all": float(mean_iou_all),
                 "test_mAP": float(test_map),
                 "n_active_classes": int(len(active_event_ids)),
                 "active_classes": ",".join(
@@ -615,9 +570,6 @@ def main() -> None:
             }
             for idx, class_name in enumerate(CLASS_NAMES):
                 row[f"test_f1_{class_name}"] = float(f1_per_class[idx])
-                row[f"test_iou_{class_name}"] = float(iou_per_class[idx])
-            for idx, class_name in enumerate(ALL_CLASS_NAMES):
-                row[f"test_iou_all_{class_name}"] = float(iou_all_classes[idx])
 
             append_row_csv(
                 out_dir / "station_scramble_fold_metrics.csv",

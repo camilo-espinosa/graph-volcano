@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.signal import butter, sosfiltfilt
 import torch
 
 import sys
@@ -33,7 +34,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.active_eval_utils import load_checkpoint_into_model
 from utils.data_utils import activation_unstacking, patch_stacking_X
 from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.event_detection_metrics import temporal_iou, temporal_overlap_recall
 from utils.fold_io_utils import checkpoint_path_for_fold
 from utils.model_registry import MODEL_SPECS, build_model_from_spec
 from utils.script_common import parse_csv_selection, resolve_project_path
@@ -64,6 +64,16 @@ DEFAULT_REFERENCE_CSV = (
     / "NVCh_10h_continuous_trace"
     / "NVCh_10h_continuous_trace_reference.csv"
 )
+DEFAULT_SAMPLE_RATE_HZ = 100.0
+DEFAULT_DET_MIN_DURATION_SEC = "VT:5,LP:7,TR:40,AV:7,IC:2"
+DEFAULT_DET_MAX_DURATION_SEC = "VT:45,LP:80,TR:360,AV:110,IC:25"
+DEFAULT_DET_CONFIDENCE_THRESHOLD = 0.5
+DEFAULT_WINDOW_RSAM_THRESHOLD = 5.0
+DEFAULT_EVENT_RSAM_THRESHOLD = 14.10
+
+def log_stage(message: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=None,
+        default=48,
         help=(
             "Batch size override. When omitted, each model uses its registry batch_size."
         ),
@@ -149,18 +159,74 @@ def parse_args() -> argparse.Namespace:
 
     # Event-detection decode / cleaning.
     parser.add_argument(
-        "--det-bg-prob-threshold",
+        "--enable-window-rsam-filter",
+        action="store_true",
+        help=(
+            "Enable RSAM-based window filtering before model inference. Disabled by "
+            "default."
+        ),
+    )
+    parser.add_argument(
+        "--window-rsam-threshold",
         type=float,
-        default=0.5,
-        help="Skip event-detection query if background probability is >= threshold.",
+        default=DEFAULT_WINDOW_RSAM_THRESHOLD,
+        help=(
+            "RSAM threshold for window-level filtering (used only when "
+            "--enable-window-rsam-filter is set)."
+        ),
+    )
+    parser.add_argument(
+        "--event-rsam-threshold",
+        type=float,
+        default=DEFAULT_EVENT_RSAM_THRESHOLD,
+        help=(
+            "RSAM threshold for event-level filtering. Events below this threshold "
+            "are discarded before merge/post-processing."
+        ),
     )
     parser.add_argument(
         "--cross-class-overlap-threshold",
         type=float,
-        default=0.8,
+        default=0.9,
         help=(
             "If two different-class detections overlap with IoU >= threshold and both "
             "have confidence, keep only the highest-confidence one."
+        ),
+    )
+    parser.add_argument(
+        "--cross-class-confidence-margin",
+        type=float,
+        default=0.02,
+        help=(
+            "Minimum confidence gap required to suppress one class when cross-class "
+            "events overlap. Larger values make suppression less aggressive."
+        ),
+    )
+    parser.add_argument(
+        "--cross-class-max-duration-ratio",
+        type=float,
+        default=2.5,
+        help=(
+            "Do not suppress overlapping cross-class events when duration ratio "
+            "(longer/shorter) exceeds this value."
+        ),
+    )
+    parser.add_argument(
+        "--det-class-min-duration-sec",
+        type=str,
+        default=DEFAULT_DET_MIN_DURATION_SEC,
+        help=(
+            "Minimum duration (seconds) per class for event-detection decode. "
+            "Format: VT:5,LP:7,TR:40,AV:7,IC:2"
+        ),
+    )
+    parser.add_argument(
+        "--det-class-max-duration-sec",
+        type=str,
+        default=DEFAULT_DET_MAX_DURATION_SEC,
+        help=(
+            "Maximum duration (seconds) per class for event-detection decode. "
+            "Format: VT:45,LP:80,TR:360,AV:110,IC:25"
         ),
     )
 
@@ -184,6 +250,14 @@ def parse_args() -> argparse.Namespace:
         default=0.9,
         help="Target coverage threshold used by overlap_recall/dual matching.",
     )
+    parser.add_argument(
+        "--debug-plot-windows",
+        action="store_true",
+        help=(
+            "Save one debug plot per window (normalized traces + GT/pred overlays) to inspect model inputs. "
+            "This is intended for temporary debugging and can be very heavy."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -202,6 +276,39 @@ def parse_int_csv(raw_value: str, *, name: str) -> list[int]:
         if parsed_value not in parsed:
             parsed.append(parsed_value)
     return parsed
+
+
+def parse_class_float_map(raw_value: str, *, name: str) -> dict[str, float]:
+    pairs = [x.strip() for x in raw_value.split(",") if x.strip()]
+    if len(pairs) == 0:
+        raise ValueError(f"No class:value pairs parsed for {name}.")
+
+    out: dict[str, float] = {}
+    for pair in pairs:
+        if ":" not in pair:
+            raise ValueError(
+                f"Invalid token in {name}: {pair!r}. Expected CLASS:VALUE format."
+            )
+        key_raw, value_raw = pair.split(":", maxsplit=1)
+        key = key_raw.strip().upper()
+        if key not in CLASS_NAME_TO_ID:
+            raise ValueError(
+                f"Unknown class {key!r} in {name}. Expected one of {EVENT_CLASSES}."
+            )
+        try:
+            value = float(value_raw.strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid float in {name}: {pair!r}") from exc
+        if value <= 0:
+            raise ValueError(f"{name} values must be > 0, got {pair!r}.")
+        out[key] = float(value)
+
+    missing = [c for c in EVENT_CLASSES if c not in out]
+    if missing:
+        raise ValueError(
+            f"Missing classes in {name}: {missing}. Required classes: {EVENT_CLASSES}."
+        )
+    return out
 
 
 def discover_ablation_keys(experiment_root: Path) -> list[str]:
@@ -253,6 +360,185 @@ def build_window_starts(total_len: int, window_size: int, stride: int) -> np.nda
     return np.asarray(starts, dtype=np.int64)
 
 
+def normalize_windows_global_max_abs(batch_x: np.ndarray) -> np.ndarray:
+    """Normalize each window by its max absolute value across all stations/time."""
+    if batch_x.ndim != 3:
+        raise ValueError(f"Expected batch_x with shape [B, S, T], got {batch_x.shape}.")
+    denom = np.max(np.abs(batch_x), axis=(1, 2), keepdims=True)
+    # Keep all-zero windows unchanged while avoiding division by zero.
+    denom = np.where(denom > 0.0, denom, 1.0)
+    return batch_x / denom
+
+
+def bandpass_windows_butterworth(
+    batch_x: np.ndarray,
+    *,
+    low_hz: float = 1.0,
+    high_hz: float = 15.0,
+    sample_rate_hz: float = DEFAULT_SAMPLE_RATE_HZ,
+    order: int = 4,
+) -> np.ndarray:
+    """Apply zero-phase Butterworth bandpass to each station trace in each window."""
+    if batch_x.ndim != 3:
+        raise ValueError(f"Expected batch_x with shape [B, S, T], got {batch_x.shape}.")
+    nyquist = 0.5 * float(sample_rate_hz)
+    if not (0.0 < float(low_hz) < float(high_hz) < nyquist):
+        raise ValueError(
+            "Invalid bandpass limits: "
+            f"low_hz={low_hz}, high_hz={high_hz}, nyquist={nyquist}."
+        )
+
+    sos = butter(
+        int(order),
+        [float(low_hz), float(high_hz)],
+        btype="bandpass",
+        fs=float(sample_rate_hz),
+        output="sos",
+    )
+    filtered = sosfiltfilt(sos, batch_x, axis=-1)
+    return filtered.astype(np.float32, copy=False)
+
+
+def save_window_debug_plot(
+    *,
+    normalized_window: np.ndarray,
+    window_start: int,
+    output_dir: Path,
+    gt_events_local: list[dict[str, float | int | str]] | None = None,
+    pred_events_local: list[dict[str, float | int | str]] | None = None,
+) -> None:
+    """Save a per-window debug plot with one normalized row per station."""
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except Exception as exc:  # pragma: no cover - debug-only path
+        raise RuntimeError(
+            "matplotlib is required for --debug-plot-windows. "
+            "Install it with: pip install matplotlib"
+        ) from exc
+
+    station_count, time_len = normalized_window.shape
+    fig, axes = plt.subplots(station_count, 1, figsize=(14, max(6, 1.8 * station_count)), sharex=True)
+    if station_count == 1:
+        axes = [axes]
+    time_axis = np.arange(time_len, dtype=np.int32)
+
+    for station_idx in range(station_count):
+        axes[station_idx].plot(
+            time_axis,
+            normalized_window[station_idx],
+            linewidth=1.0,
+            alpha=1.0,
+            color="black",
+            zorder=200,
+        )
+        axes[station_idx].set_ylabel(f"S{station_idx + 1}")
+        axes[station_idx].grid(True, alpha=0.25)
+
+    gt_events_local = gt_events_local or []
+    pred_events_local = pred_events_local or []
+
+    # Match validation_plots.py class colors and event-box semantics.
+    class_colors = {
+        0: (0.5, 0.5, 0.5),
+        1: (0.875, 0.553, 0.369),
+        2: (0.173, 0.627, 0.173),
+        3: (0.839, 0.153, 0.157),
+        4: (0.580, 0.404, 0.741),
+        5: (0.549, 0.337, 0.294),
+    }
+
+    y_lim_min, y_lim_max = -1.1, 1.1
+    y_range = y_lim_max - y_lim_min
+    y_center = (y_lim_max + y_lim_min) / 2.0
+    box_height = y_range * 0.25
+    gt_y_top = y_center
+    gt_y_bottom = gt_y_top - box_height
+    pred_y_bottom = y_center
+    pred_y_top = pred_y_bottom + box_height
+
+    for ax in axes:
+        # Ground-truth event track: hollow rectangles with solid border.
+        for event in gt_events_local:
+            cls = str(event.get("class", ""))
+            class_id = int(CLASS_NAME_TO_ID.get(cls, 0))
+            color = class_colors.get(class_id, (0.0, 0.0, 0.0))
+            s = int(event["idx_start"])
+            e = int(event["idx_end"])
+            rect = Rectangle(
+                (s, gt_y_bottom),
+                max(1, e - s + 1),
+                box_height,
+                linewidth=3.0,
+                edgecolor=color,
+                facecolor="none",
+                alpha=0.9,
+                zorder=10,
+            )
+            ax.add_patch(rect)
+
+        # Predicted event track: hollow dashed rectangles + center marker.
+        for event in pred_events_local:
+            cls = str(event.get("class", ""))
+            class_id = int(CLASS_NAME_TO_ID.get(cls, 0))
+            color = class_colors.get(class_id, (0.0, 0.0, 0.0))
+            conf = event.get("confidence", np.nan)
+            conf_val = float(conf) if pd.notna(conf) else 0.5
+            pred_alpha = float(min(1.0, 0.2 + 0.8 * conf_val))
+            s = int(event["idx_start"])
+            e = int(event["idx_end"])
+            rect = Rectangle(
+                (s, pred_y_bottom),
+                max(1, e - s + 1),
+                box_height,
+                linewidth=3.0,
+                edgecolor=color,
+                facecolor="none",
+                linestyle="--",
+                alpha=pred_alpha,
+                zorder=10,
+            )
+            ax.add_patch(rect)
+
+            center_x = 0.5 * (s + e)
+            marker_y = 0.5 * (pred_y_bottom + pred_y_top)
+            ax.plot(
+                center_x,
+                marker_y,
+                marker="o",
+                color=color,
+                markersize=5,
+                alpha=pred_alpha,
+                zorder=15,
+            )
+
+        ax.set_ylim(y_lim_min, y_lim_max)
+
+    norm_max_abs = (
+        float(np.max(np.abs(normalized_window))) if normalized_window.size else 0.0
+    )
+
+    axes[0].set_title(
+        f"Normalized window start={window_start} (global max_abs={norm_max_abs:.6g})"
+    )
+    axes[0].text(
+        0.01,
+        0.98,
+        f"GT={len(gt_events_local)} | Pred={len(pred_events_local)}",
+        transform=axes[0].transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+    )
+    axes[-1].set_xlabel("Sample index in window")
+
+    output_path = output_dir / f"window_{window_start:07d}.png"
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+
+
 def _fill_small_background_holes(
     class_idx: np.ndarray,
     max_bg_hole_samples: int,
@@ -291,15 +577,13 @@ def decode_segmentation_events(
     max_bg_hole_samples: int,
 ) -> list[list[dict[str, float | int | str]]]:
     probs = torch.softmax(logits, dim=1)
-    pred_idx = torch.argmax(probs, dim=1).detach().cpu().numpy()  # [B, T]
+    # Event-only decode for segmentation baselines: pick among VT/LP/TR/AV/IC
+    # and rely on duration + RSAM postprocessing for no-event rejection.
+    pred_idx = (torch.argmax(probs[:, 1:, :], dim=1) + 1).detach().cpu().numpy()  # [B, T]
 
     batch_events: list[list[dict[str, float | int | str]]] = []
     for sample_idx in range(pred_idx.shape[0]):
         class_idx = pred_idx[sample_idx]
-        class_idx = _fill_small_background_holes(
-            class_idx,
-            max_bg_hole_samples=max_bg_hole_samples,
-        )
 
         events: list[dict[str, float | int | str]] = []
         t = 0
@@ -337,11 +621,14 @@ def decode_event_detection_events(
     predictions: dict[str, torch.Tensor],
     *,
     window_size: int,
-    bg_prob_threshold: float,
+    confidence_threshold: float,
+    min_duration_samples_by_class: dict[str, int],
+    max_duration_samples_by_class: dict[str, int],
 ) -> list[list[dict[str, float | int | str]]]:
     pred = normalize_prediction_intervals(predictions)
 
     class_logits = pred["class_logits"]  # [B, Nq, C]
+    confidence_logits = pred.get("confidence_logits")
     starts = pred["start"]  # [B, Nq, 1]
     ends = pred["end"]  # [B, Nq, 1]
 
@@ -352,18 +639,24 @@ def decode_event_detection_events(
     for b in range(batch_size):
         sample_events: list[dict[str, float | int | str]] = []
         for q in range(num_queries):
-            cls = int(torch.argmax(probs[b, q]).item())
-            if cls == 0:
+            if confidence_logits is not None:
+                conf_logit = torch.clamp(confidence_logits[b, q, 0], -60.0, 60.0)
+                conf_prob = float(torch.sigmoid(conf_logit).item())
+            else:
+                conf_prob = float(1.0 - probs[b, q, 0].item())
+
+            # Low confidence => treat query as background/no-event.
+            if conf_prob < float(confidence_threshold):
                 continue
 
-            bg_prob = float(probs[b, q, 0].item())
-            if bg_prob >= float(bg_prob_threshold):
-                continue
+            # Event class is selected among non-background classes only.
+            cls = int(torch.argmax(probs[b, q, 1:]).item()) + 1
 
             if cls not in CLASS_ID_TO_NAME:
                 continue
 
-            conf = float(1.0 - bg_prob)
+            class_name = CLASS_ID_TO_NAME[cls]
+            conf = float(conf_prob * float(probs[b, q, cls].item()))
             start_norm = float(torch.clamp(starts[b, q, 0], 0.0, 1.0).item())
             end_norm = float(torch.clamp(ends[b, q, 0], 0.0, 1.0).item())
             if start_norm > end_norm:
@@ -376,9 +669,15 @@ def decode_event_detection_events(
             if start_idx > end_idx:
                 start_idx, end_idx = end_idx, start_idx
 
+            duration_samples = int(end_idx - start_idx + 1)
+            min_len = int(min_duration_samples_by_class[class_name])
+            max_len = int(max_duration_samples_by_class[class_name])
+            if duration_samples < min_len or duration_samples > max_len:
+                continue
+
             sample_events.append(
                 {
-                    "class": CLASS_ID_TO_NAME[cls],
+                    "class": class_name,
                     "idx_start": int(start_idx),
                     "idx_end": int(end_idx),
                     "confidence": conf,
@@ -443,10 +742,20 @@ def _event_iou(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
     return float(inter / union)
 
 
+def _event_overlap_recall(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
+    inter = max(0, min(a_end, b_end) - max(a_start, b_start) + 1)
+    b_len = b_end - b_start + 1
+    if b_len <= 0:
+        return 0.0
+    return float(inter / b_len)
+
+
 def resolve_cross_class_conflicts(
     df: pd.DataFrame,
     *,
     overlap_threshold: float,
+    confidence_margin: float,
+    max_duration_ratio: float,
 ) -> pd.DataFrame:
     if df.empty:
         return ensure_detection_df_schema(df)
@@ -488,6 +797,15 @@ def resolve_cross_class_conflicts(
             if iou < float(overlap_threshold):
                 continue
 
+            dur_i = max(1, ei - si + 1)
+            dur_j = max(1, ej - sj + 1)
+            duration_ratio = max(dur_i, dur_j) / max(1, min(dur_i, dur_j))
+            if duration_ratio > float(max_duration_ratio):
+                continue
+
+            if abs(float(confi) - float(confj)) < float(confidence_margin):
+                continue
+
             if float(confi) >= float(confj):
                 drop[j] = True
             else:
@@ -502,11 +820,15 @@ def postprocess_detections(
     raw_df: pd.DataFrame,
     *,
     cross_class_overlap_threshold: float,
+    cross_class_confidence_margin: float,
+    cross_class_max_duration_ratio: float,
 ) -> pd.DataFrame:
     merged = merge_same_class_overlaps(raw_df)
     cleaned = resolve_cross_class_conflicts(
         merged,
         overlap_threshold=cross_class_overlap_threshold,
+        confidence_margin=cross_class_confidence_margin,
+        max_duration_ratio=cross_class_max_duration_ratio,
     )
     if cleaned.empty:
         return cleaned
@@ -525,12 +847,10 @@ def _is_match(
     match_iou_threshold: float,
     overlap_recall_threshold: float,
 ) -> tuple[bool, float, float]:
-    p_start = float(pred_start)
-    p_end = float(pred_end)
-    g_start = float(gt_start)
-    g_end = float(gt_end)
-    iou = temporal_iou(p_start, p_end, g_start, g_end)
-    overlap = temporal_overlap_recall(p_start, p_end, g_start, g_end)
+    iou = _event_iou(int(pred_start), int(pred_end), int(gt_start), int(gt_end))
+    overlap = _event_overlap_recall(
+        int(pred_start), int(pred_end), int(gt_start), int(gt_end)
+    )
 
     if strategy == "iou":
         ok = iou >= float(match_iou_threshold)
@@ -785,6 +1105,191 @@ def load_reference_events(reference_csv: Path) -> pd.DataFrame:
     return ensure_detection_df_schema(pd.DataFrame(rows))
 
 
+def build_window_event_table(
+    *,
+    starts: np.ndarray,
+    window_size: int,
+    events_df: pd.DataFrame,
+    source: str,
+) -> pd.DataFrame:
+    """Map absolute events to overlapping windows with local window coordinates."""
+    rows: list[dict[str, float | int | str]] = []
+    events = ensure_detection_df_schema(events_df)
+
+    for window_idx, window_start in enumerate(starts.tolist()):
+        w_start = int(window_start)
+        w_end = int(w_start + window_size - 1)
+
+        if events.empty:
+            continue
+
+        overlaps = events[
+            (events["idx_end"].astype(int) >= w_start)
+            & (events["idx_start"].astype(int) <= w_end)
+        ]
+
+        for _, event in overlaps.iterrows():
+            e_start = int(event["idx_start"])
+            e_end = int(event["idx_end"])
+            clipped_start = max(e_start, w_start)
+            clipped_end = min(e_end, w_end)
+            rows.append(
+                {
+                    "source": source,
+                    "window_idx": int(window_idx),
+                    "window_start": int(w_start),
+                    "window_end": int(w_end),
+                    "event_class": str(event["class"]),
+                    "event_idx_start": int(e_start),
+                    "event_idx_end": int(e_end),
+                    "event_idx_start_in_window": int(clipped_start - w_start),
+                    "event_idx_end_in_window": int(clipped_end - w_start),
+                    "confidence": event["confidence"],
+                }
+            )
+
+    columns = [
+        "source",
+        "window_idx",
+        "window_start",
+        "window_end",
+        "event_class",
+        "event_idx_start",
+        "event_idx_end",
+        "event_idx_start_in_window",
+        "event_idx_end_in_window",
+        "confidence",
+    ]
+    if len(rows) == 0:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_window_count_table(
+    *,
+    starts: np.ndarray,
+    window_size: int,
+    gt_window_df: pd.DataFrame,
+    pred_raw_window_df: pd.DataFrame,
+    pred_clean_window_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Create one row per window with GT/raw/clean event counts."""
+    window_df = pd.DataFrame(
+        {
+            "window_idx": np.arange(len(starts), dtype=np.int64),
+            "window_start": starts.astype(np.int64),
+            "window_end": (starts + int(window_size) - 1).astype(np.int64),
+        }
+    )
+
+    gt_counts = (
+        gt_window_df.groupby("window_idx", as_index=False)
+        .size()
+        .rename(columns={"size": "n_gt_events"})
+        if not gt_window_df.empty
+        else pd.DataFrame(columns=["window_idx", "n_gt_events"])
+    )
+    raw_counts = (
+        pred_raw_window_df.groupby("window_idx", as_index=False)
+        .size()
+        .rename(columns={"size": "n_pred_raw_events"})
+        if not pred_raw_window_df.empty
+        else pd.DataFrame(columns=["window_idx", "n_pred_raw_events"])
+    )
+    clean_counts = (
+        pred_clean_window_df.groupby("window_idx", as_index=False)
+        .size()
+        .rename(columns={"size": "n_pred_clean_events"})
+        if not pred_clean_window_df.empty
+        else pd.DataFrame(columns=["window_idx", "n_pred_clean_events"])
+    )
+
+    out = window_df.merge(gt_counts, on="window_idx", how="left")
+    out = out.merge(raw_counts, on="window_idx", how="left")
+    out = out.merge(clean_counts, on="window_idx", how="left")
+    for col in ["n_gt_events", "n_pred_raw_events", "n_pred_clean_events"]:
+        out[col] = out[col].fillna(0).astype(int)
+    return out
+
+def compute_rsam_mask(batch_x_filtered, threshold):
+    """
+    RSAM amplitude gate. Call on bandpass-filtered, NOT-YET-normalized windows.
+
+    batch_x_filtered : np.ndarray, shape (B, S, W)
+    threshold        : float, tau from compute_rsam_threshold_from_training
+
+    Returns
+    -------
+    keep_mask : np.ndarray of bool, (B,) -- True = keep the window
+    rsam_net  : np.ndarray of float, (B,) -- for logging/diagnostics
+    """
+    zero_channel = ~np.any(batch_x_filtered, axis=-1)  # (B, S), drop no-data stations
+
+    rsam_k = np.mean(np.abs(batch_x_filtered.astype(np.float64)), axis=-1)  # (B, S)
+    rsam_k_masked = np.where(zero_channel, np.nan, rsam_k)
+
+    with np.errstate(all="ignore"):
+        rsam_net = np.nanmedian(rsam_k_masked, axis=-1)  # (B,)
+
+    # if every station was zero-filled, fail open rather than silently dropping
+    keep_mask = np.where(np.isnan(rsam_net), True, rsam_net >= threshold)
+    return keep_mask, rsam_net
+
+
+def filter_events_by_rsam(
+    events_df: pd.DataFrame,
+    *,
+    x_stations_bandpassed: np.ndarray,
+    threshold: float,
+) -> pd.DataFrame:
+    """Discard events whose RSAM is below threshold (fail-open for all-zero spans)."""
+    events_df = ensure_detection_df_schema(events_df)
+    if events_df.empty:
+        return events_df
+
+    if x_stations_bandpassed.ndim != 2:
+        raise ValueError(
+            "x_stations_bandpassed must have shape [S, T], got "
+            f"{x_stations_bandpassed.shape}."
+        )
+    if threshold <= 0:
+        return events_df.copy()
+
+    n_stations, total_len = x_stations_bandpassed.shape
+    abs_x = np.abs(x_stations_bandpassed.astype(np.float64, copy=False))
+    nonzero_x = (x_stations_bandpassed != 0.0).astype(np.int32, copy=False)
+
+    # Prefix sums for fast interval RSAM queries.
+    abs_prefix = np.pad(np.cumsum(abs_x, axis=1), ((0, 0), (1, 0)), mode="constant")
+    nz_prefix = np.pad(
+        np.cumsum(nonzero_x, axis=1),
+        ((0, 0), (1, 0)),
+        mode="constant",
+    )
+
+    keep_flags = np.zeros(len(events_df), dtype=bool)
+    for i, row in events_df.reset_index(drop=True).iterrows():
+        start_raw = int(row["idx_start"])
+        end_raw = int(row["idx_end"])
+        start_idx = max(0, min(start_raw, total_len - 1))
+        end_idx = max(0, min(end_raw, total_len - 1))
+        if start_idx > end_idx:
+            start_idx, end_idx = end_idx, start_idx
+
+        seg_len = max(1, end_idx - start_idx + 1)
+        sum_abs = abs_prefix[:, end_idx + 1] - abs_prefix[:, start_idx]
+        nz_count = nz_prefix[:, end_idx + 1] - nz_prefix[:, start_idx]
+
+        rsam_station = sum_abs / float(seg_len)
+        rsam_station = np.where(nz_count > 0, rsam_station, np.nan)
+        rsam_event = float(np.nanmedian(rsam_station))
+
+        # If all stations are zero/no-data for this span, keep the event (fail-open).
+        keep_flags[i] = bool(np.isnan(rsam_event) or (rsam_event >= float(threshold)))
+
+    filtered = events_df.reset_index(drop=True).loc[keep_flags].copy()
+    return ensure_detection_df_schema(filtered)
+
 def infer_one_model_fold(
     *,
     model_key: str,
@@ -797,8 +1302,17 @@ def infer_one_model_fold(
     device: torch.device,
     seg_min_event_len_samples: int,
     seg_max_bg_hole_samples: int,
-    det_bg_prob_threshold: float,
+    det_confidence_threshold: float,
+    enable_window_rsam_filter: bool,
+    window_rsam_threshold: float,
+    det_min_duration_samples_by_class: dict[str, int],
+    det_max_duration_samples_by_class: dict[str, int],
+    gt_df: pd.DataFrame | None = None,
+    run_label: str | None = None,
+    debug_plot_windows: bool = False,
+    debug_plot_dir: Path | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
+    label = run_label or model_key
     model = build_model_from_spec(model_key=model_key, n_classes=6)
     model = model.to(device)
     model.eval()
@@ -817,21 +1331,59 @@ def infer_one_model_fold(
     )
     num_windows = int(len(starts))
     num_batches = int(np.ceil(num_windows / batch_size))
+    log_every_batches = max(1, num_batches // 10)
 
     detections: list[dict[str, float | int | str]] = []
+    skipped_all_missing_windows = 0
+    skipped_rsam_windows = 0
+    debug_plotted_windows = 0
+
+    if debug_plot_windows:
+        if debug_plot_dir is None:
+            raise ValueError("debug_plot_dir must be provided when debug_plot_windows=True")
+        debug_plot_dir.mkdir(parents=True, exist_ok=True)
+        log_stage(f"{label}: debug window plots enabled -> {debug_plot_dir}")
+
+    log_stage(
+        f"{label}: model ready, starting inference "
+        f"({num_windows} windows, {num_batches} batches, batch_size={batch_size})."
+    )
+    log_stage(
+        f"{label}: applying Butterworth bandpass (1-15 Hz, fs={DEFAULT_SAMPLE_RATE_HZ:.1f} Hz)."
+    )
+    if enable_window_rsam_filter:
+        log_stage(
+            f"{label}: window RSAM filtering enabled "
+            f"(threshold={window_rsam_threshold:.4f})."
+        )
+    else:
+        log_stage(f"{label}: window RSAM filtering disabled.")
 
     t0 = time.perf_counter()
     with torch.inference_mode():
-        for b_start in range(0, num_windows, batch_size):
+        for batch_idx, b_start in enumerate(range(0, num_windows, batch_size), start=1):
             b_end = min(b_start + batch_size, num_windows)
             batch_starts = starts[b_start:b_end]
-            batch_x = np.stack(
+            batch_x_raw = np.stack(
                 [
                     x_stations[:, int(win_start) : int(win_start) + window_size]
                     for win_start in batch_starts
                 ],
                 axis=0,
             ).astype(np.float32, copy=False)
+            batch_x_filtered = bandpass_windows_butterworth(batch_x_raw)
+            if enable_window_rsam_filter:
+                keep_mask, _ = compute_rsam_mask(
+                    batch_x_filtered,
+                    threshold=float(window_rsam_threshold),
+                )
+                skipped_rsam_windows += int((~keep_mask).sum())
+                if not keep_mask.any():
+                    continue
+                batch_x_filtered = batch_x_filtered[keep_mask]
+                batch_starts = batch_starts[keep_mask]
+
+            batch_x = normalize_windows_global_max_abs(batch_x_filtered)
 
             xb = torch.from_numpy(batch_x).to(device)
             trainer_kind = str(model_spec["trainer_kind"])
@@ -860,13 +1412,50 @@ def infer_one_model_fold(
                 )
                 del x2d, logits_2d
             elif trainer_kind == "event_detection":
-                predictions = model(xb)
-                batch_events = decode_event_detection_events(
-                    predictions,
-                    window_size=window_size,
-                    bg_prob_threshold=det_bg_prob_threshold,
+                missing_threshold = float(
+                    getattr(
+                        getattr(model, "encoder", None),
+                        "station_mask_abs_sum_threshold",
+                        10.0,
+                    )
                 )
-                del predictions
+                station_abs_sum = xb.abs().sum(dim=-1)
+                valid_window_mask = (station_abs_sum > missing_threshold).any(dim=1)
+
+                if not bool(valid_window_mask.any().item()):
+                    skipped_all_missing_windows += int(valid_window_mask.numel())
+                    batch_events = [[] for _ in range(len(batch_starts))]
+                elif bool(valid_window_mask.all().item()):
+                    predictions = model(xb)
+                    batch_events = decode_event_detection_events(
+                        predictions,
+                        window_size=window_size,
+                        confidence_threshold=det_confidence_threshold,
+                        min_duration_samples_by_class=det_min_duration_samples_by_class,
+                        max_duration_samples_by_class=det_max_duration_samples_by_class,
+                    )
+                    del predictions
+                else:
+                    valid_window_mask_np = valid_window_mask.detach().cpu().numpy().astype(bool)
+                    skipped_all_missing_windows += int((~valid_window_mask_np).sum())
+                    xb_valid = xb[valid_window_mask]
+
+                    predictions = model(xb_valid)
+                    valid_events = decode_event_detection_events(
+                        predictions,
+                        window_size=window_size,
+                        confidence_threshold=det_confidence_threshold,
+                        min_duration_samples_by_class=det_min_duration_samples_by_class,
+                        max_duration_samples_by_class=det_max_duration_samples_by_class,
+                    )
+                    del predictions
+
+                    batch_events = [[] for _ in range(len(batch_starts))]
+                    valid_indices = np.flatnonzero(valid_window_mask_np)
+                    for out_i, local_i in enumerate(valid_indices.tolist()):
+                        batch_events[int(local_i)] = valid_events[int(out_i)]
+
+                    del xb_valid, valid_events
             else:
                 raise ValueError(
                     f"Unsupported trainer_kind {trainer_kind} for model {model_key}."
@@ -885,7 +1474,52 @@ def infer_one_model_fold(
                         }
                     )
 
-            del xb, batch_x, batch_events
+            if debug_plot_windows:
+                for local_i, win_start in enumerate(batch_starts.tolist()):
+                    pred_events_local = batch_events[local_i]
+                    gt_events_local: list[dict[str, float | int | str]] = []
+                    if gt_df is not None and not gt_df.empty:
+                        w_start = int(win_start)
+                        w_end = int(win_start) + int(window_size) - 1
+                        overlaps = gt_df[
+                            (gt_df["idx_end"].astype(int) >= w_start)
+                            & (gt_df["idx_start"].astype(int) <= w_end)
+                        ]
+                        for _, gt_row in overlaps.iterrows():
+                            clipped_start = max(int(gt_row["idx_start"]), w_start)
+                            clipped_end = min(int(gt_row["idx_end"]), w_end)
+                            gt_events_local.append(
+                                {
+                                    "class": str(gt_row["class"]),
+                                    "idx_start": int(clipped_start - w_start),
+                                    "idx_end": int(clipped_end - w_start),
+                                    "confidence": gt_row["confidence"],
+                                }
+                            )
+
+                    save_window_debug_plot(
+                        normalized_window=batch_x[local_i],
+                        window_start=int(win_start),
+                        output_dir=debug_plot_dir,
+                        gt_events_local=gt_events_local,
+                        pred_events_local=pred_events_local,
+                    )
+                    debug_plotted_windows += 1
+
+            if (
+                batch_idx == 1
+                or batch_idx % log_every_batches == 0
+                or batch_idx == num_batches
+            ):
+                log_stage(
+                    f"{label}: batch {batch_idx}/{num_batches} "
+                    f"({b_end}/{num_windows} windows processed, "
+                    f"rsam_skipped={skipped_rsam_windows}, "
+                    f"skipped={skipped_all_missing_windows}, "
+                    f"detected_events={len(detections)})."
+                )
+
+            del xb, batch_x, batch_x_filtered, batch_x_raw, batch_events
 
     elapsed_s = float(time.perf_counter() - t0)
 
@@ -896,11 +1530,23 @@ def infer_one_model_fold(
     timing = {
         "total_time_10h_s": elapsed_s,
         "total_windows": float(num_windows),
+        "processed_windows": float(
+            num_windows - skipped_all_missing_windows - skipped_rsam_windows
+        ),
+        "skipped_rsam_windows": float(skipped_rsam_windows),
+        "skipped_all_missing_windows": float(skipped_all_missing_windows),
         "total_batches": float(num_batches),
         "mean_time_per_window_ms": float(1000.0 * elapsed_s / max(1, num_windows)),
         "mean_time_per_batch_ms": float(1000.0 * elapsed_s / max(1, num_batches)),
         "windows_per_second": float(num_windows / max(1e-9, elapsed_s)),
     }
+
+    log_stage(
+        f"{label}: inference finished in {elapsed_s:.2f}s "
+        f"(detections={len(raw_df)}, skipped_rsam_windows={skipped_rsam_windows}, "
+        f"skipped_all_missing_windows={skipped_all_missing_windows}, "
+        f"debug_plots={debug_plotted_windows})."
+    )
 
     del model
     cleanup_gpu_cache()
@@ -929,6 +1575,7 @@ def summarize_group(df: pd.DataFrame, group_cols: list[str], metric_cols: list[s
 
 def main() -> None:
     args = parse_args()
+    log_stage("Starting continuous 10-hour tests.")
 
     experiment_root = resolve_project_path(args.experiment_root, PROJECT_ROOT)
     continuous_npy = resolve_project_path(args.continuous_npy, PROJECT_ROOT)
@@ -939,6 +1586,7 @@ def main() -> None:
         else experiment_root / "continuous_tests"
     )
     output_root.mkdir(parents=True, exist_ok=True)
+    log_stage(f"Output directory: {output_root}")
 
     if not continuous_npy.exists():
         raise FileNotFoundError(f"Continuous NPY not found: {continuous_npy}")
@@ -954,9 +1602,43 @@ def main() -> None:
         raise ValueError("--seg-min-event-len-samples must be > 0")
     if args.seg_max_bg_hole_samples < 0:
         raise ValueError("--seg-max-bg-hole-samples must be >= 0")
+    if args.cross_class_confidence_margin < 0:
+        raise ValueError("--cross-class-confidence-margin must be >= 0")
+    if args.cross_class_max_duration_ratio <= 0:
+        raise ValueError("--cross-class-max-duration-ratio must be > 0")
+    if args.window_rsam_threshold <= 0:
+        raise ValueError("--window-rsam-threshold must be > 0")
+    if args.event_rsam_threshold <= 0:
+        raise ValueError("--event-rsam-threshold must be > 0")
+
+    min_duration_sec_by_class = parse_class_float_map(
+        args.det_class_min_duration_sec,
+        name="--det-class-min-duration-sec",
+    )
+    max_duration_sec_by_class = parse_class_float_map(
+        args.det_class_max_duration_sec,
+        name="--det-class-max-duration-sec",
+    )
+    for cls in EVENT_CLASSES:
+        if min_duration_sec_by_class[cls] > max_duration_sec_by_class[cls]:
+            raise ValueError(
+                f"Duration gate invalid for class {cls}: "
+                f"min {min_duration_sec_by_class[cls]} > max {max_duration_sec_by_class[cls]}."
+            )
+
+    det_min_duration_samples_by_class = {
+        cls: max(1, int(round(min_duration_sec_by_class[cls] * DEFAULT_SAMPLE_RATE_HZ)))
+        for cls in EVENT_CLASSES
+    }
+    det_max_duration_samples_by_class = {
+        cls: max(1, int(round(max_duration_sec_by_class[cls] * DEFAULT_SAMPLE_RATE_HZ)))
+        for cls in EVENT_CLASSES
+    }
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log_stage(f"Using device: {device}")
 
+    log_stage(f"Loading continuous trace: {continuous_npy}")
     cont = np.load(continuous_npy, mmap_mode="r")
     if cont.ndim != 2 or cont.shape[0] < 9:
         raise ValueError(
@@ -964,7 +1646,21 @@ def main() -> None:
             "(timestamp + 8 stations)."
         )
     x_stations = np.asarray(cont[1:9, :], dtype=np.float32)
+    log_stage(
+        f"Prepared station matrix with shape={x_stations.shape} "
+        "(rows 1..8 from continuous trace)."
+    )
+    log_stage("Precomputing bandpassed continuous trace for event RSAM filtering.")
+    x_stations_bandpassed = bandpass_windows_butterworth(
+        x_stations[np.newaxis, :, :]
+    )[0]
+    log_stage(
+        "Bandpassed continuous trace ready "
+        f"(shape={x_stations_bandpassed.shape})."
+    )
+    log_stage(f"Loading reference events: {reference_csv}")
     gt_df = load_reference_events(reference_csv)
+    log_stage(f"Loaded {len(gt_df)} reference events.")
 
     run_manifest = {
         "experiment_root": str(experiment_root),
@@ -978,11 +1674,23 @@ def main() -> None:
         "folds": selected_folds,
         "seg_min_event_len_samples": int(args.seg_min_event_len_samples),
         "seg_max_bg_hole_samples": int(args.seg_max_bg_hole_samples),
-        "det_bg_prob_threshold": float(args.det_bg_prob_threshold),
+        "det_confidence_threshold": float(DEFAULT_DET_CONFIDENCE_THRESHOLD),
+        "enable_window_rsam_filter": bool(args.enable_window_rsam_filter),
+        "window_rsam_threshold": float(args.window_rsam_threshold),
+        "event_rsam_threshold": float(args.event_rsam_threshold),
         "cross_class_overlap_threshold": float(args.cross_class_overlap_threshold),
+        "cross_class_confidence_margin": float(args.cross_class_confidence_margin),
+        "cross_class_max_duration_ratio": float(args.cross_class_max_duration_ratio),
+        "det_class_min_duration_sec": {
+            cls: float(min_duration_sec_by_class[cls]) for cls in EVENT_CLASSES
+        },
+        "det_class_max_duration_sec": {
+            cls: float(max_duration_sec_by_class[cls]) for cls in EVENT_CLASSES
+        },
         "matching_strategy": str(args.matching_strategy),
         "match_iou_threshold": float(args.match_iou_threshold),
         "overlap_recall_threshold": float(args.overlap_recall_threshold),
+        "debug_plot_windows": bool(args.debug_plot_windows),
     }
     with (output_root / "run_manifest_continuous.json").open("w", encoding="utf-8") as f:
         json.dump(run_manifest, f, indent=2)
@@ -990,6 +1698,7 @@ def main() -> None:
     fold_summary_rows: list[dict[str, float | int | str]] = []
 
     for stride in strides:
+        log_stage(f"Starting stride={int(stride)}.")
         stride_root = output_root / f"stride_{int(stride)}"
         stride_root.mkdir(parents=True, exist_ok=True)
 
@@ -997,6 +1706,10 @@ def main() -> None:
             model_spec = MODEL_SPECS[model_key]
             model_batch_size = int(args.batch_size or int(model_spec["batch_size"]))
             model_root = stride_root / model_key
+            log_stage(
+                f"Starting model={model_key} (trainer_kind={model_spec['trainer_kind']}, "
+                f"batch_size={model_batch_size})."
+            )
 
             for fold in selected_folds:
                 ckpt = checkpoint_path_for_fold(
@@ -1011,6 +1724,13 @@ def main() -> None:
 
                 fold_root = model_root / f"fold_{int(fold):02d}"
                 fold_root.mkdir(parents=True, exist_ok=True)
+                run_label = f"stride={int(stride)} model={model_key} fold={int(fold):02d}"
+                log_stage(f"{run_label}: loading checkpoint {ckpt.name}.")
+                debug_plot_dir = (
+                    fold_root / "debug_window_plots"
+                    if args.debug_plot_windows
+                    else None
+                )
 
                 raw_df, timing = infer_one_model_fold(
                     model_key=model_key,
@@ -1023,12 +1743,77 @@ def main() -> None:
                     device=device,
                     seg_min_event_len_samples=int(args.seg_min_event_len_samples),
                     seg_max_bg_hole_samples=int(args.seg_max_bg_hole_samples),
-                    det_bg_prob_threshold=float(args.det_bg_prob_threshold),
+                    det_confidence_threshold=float(DEFAULT_DET_CONFIDENCE_THRESHOLD),
+                    enable_window_rsam_filter=bool(args.enable_window_rsam_filter),
+                    window_rsam_threshold=float(args.window_rsam_threshold),
+                    det_min_duration_samples_by_class=det_min_duration_samples_by_class,
+                    det_max_duration_samples_by_class=det_max_duration_samples_by_class,
+                    gt_df=gt_df,
+                    run_label=run_label,
+                    debug_plot_windows=bool(args.debug_plot_windows),
+                    debug_plot_dir=debug_plot_dir,
                 )
+
+                raw_count_before_event_rsam = int(len(raw_df))
+                raw_df = filter_events_by_rsam(
+                    raw_df,
+                    x_stations_bandpassed=x_stations_bandpassed,
+                    threshold=float(args.event_rsam_threshold),
+                )
+                dropped_by_event_rsam = raw_count_before_event_rsam - int(len(raw_df))
+                if dropped_by_event_rsam > 0:
+                    log_stage(
+                        f"{run_label}: event RSAM filter dropped "
+                        f"{dropped_by_event_rsam}/{raw_count_before_event_rsam} "
+                        f"events (threshold={float(args.event_rsam_threshold):.4f})."
+                    )
+                else:
+                    log_stage(
+                        f"{run_label}: event RSAM filter dropped 0 events "
+                        f"(threshold={float(args.event_rsam_threshold):.4f})."
+                    )
 
                 clean_df = postprocess_detections(
                     raw_df,
                     cross_class_overlap_threshold=float(args.cross_class_overlap_threshold),
+                    cross_class_confidence_margin=float(args.cross_class_confidence_margin),
+                    cross_class_max_duration_ratio=float(args.cross_class_max_duration_ratio),
+                )
+
+                window_starts = build_window_starts(
+                    total_len=int(x_stations.shape[1]),
+                    window_size=int(args.window_size),
+                    stride=int(stride),
+                )
+                gt_window_df = build_window_event_table(
+                    starts=window_starts,
+                    window_size=int(args.window_size),
+                    events_df=gt_df,
+                    source="gt",
+                )
+                pred_raw_window_df = build_window_event_table(
+                    starts=window_starts,
+                    window_size=int(args.window_size),
+                    events_df=raw_df,
+                    source="pred_raw",
+                )
+                pred_clean_window_df = build_window_event_table(
+                    starts=window_starts,
+                    window_size=int(args.window_size),
+                    events_df=clean_df,
+                    source="pred_clean",
+                )
+                window_events_df = pd.concat(
+                    [gt_window_df, pred_raw_window_df, pred_clean_window_df],
+                    axis=0,
+                    ignore_index=True,
+                )
+                window_counts_df = build_window_count_table(
+                    starts=window_starts,
+                    window_size=int(args.window_size),
+                    gt_window_df=gt_window_df,
+                    pred_raw_window_df=pred_raw_window_df,
+                    pred_clean_window_df=pred_clean_window_df,
                 )
 
                 raw_metrics, raw_pairs = evaluate_event_detections(
@@ -1074,6 +1859,20 @@ def main() -> None:
                     sep=";",
                     decimal=",",
                 )
+                window_events_df.to_csv(
+                    fold_root / "window_events_detailed.csv",
+                    index=False,
+                    encoding="utf-8-sig",
+                    sep=";",
+                    decimal=",",
+                )
+                window_counts_df.to_csv(
+                    fold_root / "window_events_summary.csv",
+                    index=False,
+                    encoding="utf-8-sig",
+                    sep=";",
+                    decimal=",",
+                )
 
                 metrics_payload = {
                     "raw": raw_metrics,
@@ -1099,6 +1898,14 @@ def main() -> None:
                 for key, value in timing.items():
                     summary_row[key] = float(value)
                 fold_summary_rows.append(summary_row)
+                log_stage(
+                    f"{run_label}: metrics saved "
+                    f"(raw_f1={summary_row.get('raw_f1', np.nan):.4f}, "
+                    f"clean_f1={summary_row.get('clean_f1', np.nan):.4f}, "
+                    f"raw_detected_events={len(raw_df)}, "
+                    f"clean_detected_events={len(clean_df)}, "
+                    f"window_event_rows={len(window_events_df)})."
+                )
 
                 cleanup_gpu_cache()
                 gc.collect()

@@ -34,20 +34,6 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False},
         "batch_size": 16,
     },
-   "MuSSED_k127": {
-        "family": "event_detection",
-        "trainer_kind": "event_detection",
-        "model_cls": MuSSED,
-        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False, "query_head_kernel_size":127},
-        "batch_size": 16,
-    },
-   "MuSSED_k91": {
-        "family": "event_detection",
-        "trainer_kind": "event_detection",
-        "model_cls": MuSSED,
-        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False, "query_head_kernel_size":91},
-        "batch_size": 16,
-    },
     "MuSSeg": {
         "family": "phasenet",
         "trainer_kind": "1d",

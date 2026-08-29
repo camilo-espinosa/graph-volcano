@@ -34,6 +34,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 
 import sys
@@ -73,6 +74,7 @@ CONFIG = {
     "val_plot_forward_batch_size": 2,
     "best_epoch_attention_mode": "station",
     "final_attention_mode": "full",
+    "event_confidence_threshold": 0.5,
     "match_iou_threshold": float(EVENT_DETECTION_EVAL_DEFAULTS["match_iou_threshold"]),
     "matching_strategy": str(EVENT_DETECTION_EVAL_DEFAULTS["matching_strategy"]),
     "overlap_recall_threshold": float(EVENT_DETECTION_EVAL_DEFAULTS["overlap_recall_threshold"]),
@@ -229,6 +231,33 @@ def resolve_event_detection_loss_config(spec: dict) -> dict[str, str]:
     return {}
 
 
+def summarize_manifest_classes(manifest_path: Path) -> dict[str, object]:
+    with np.load(manifest_path) as data:
+        label_ids = np.asarray(data["label_ids"], dtype=np.int64)
+        labels = (
+            np.asarray(data["labels"], dtype=str)
+            if "labels" in data
+            else np.asarray([], dtype=str)
+        )
+    class_ids = sorted(int(x) for x in np.unique(label_ids).tolist())
+    id_counts = {
+        int(class_id): int(np.sum(label_ids == class_id)) for class_id in class_ids
+    }
+    label_counts: dict[str, int] = {}
+    if labels.size == label_ids.size and labels.size > 0:
+        unique_labels = sorted(np.unique(labels).tolist())
+        label_counts = {
+            str(label): int(np.sum(labels == label)) for label in unique_labels
+        }
+    return {
+        "samples": int(label_ids.shape[0]),
+        "class_count": int(len(class_ids)),
+        "class_ids": class_ids,
+        "id_counts": id_counts,
+        "label_counts": label_counts,
+    }
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -242,6 +271,10 @@ def main() -> None:
     experiment_root.mkdir(parents=True, exist_ok=True)
 
     selected_specs = {name: get_model_spec(name) for name in selected}
+    train_manifest_name = "train_aug.npz"
+    val_manifest_name = "val.npz"
+    test_manifest_name = "test.npz"
+
     run_manifest = {
         "experiment_name": experiment_root.name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -249,6 +282,7 @@ def main() -> None:
         "data_root": str(DATA_ROOT),
         "results_root": str(experiment_root),
         "device": str(device),
+        "train_manifest_name": train_manifest_name,
         "config": CONFIG,
         "models_to_run": selected,
         "folds_to_run": [int(f) for f in selected_folds],
@@ -285,6 +319,35 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Models to run ({len(selected)}): {selected}")
     print(f"Folds to run ({len(selected_folds)}): {selected_folds}")
+    first_fold = selected_folds[0]
+    first_fold_dir = DATA_ROOT / f"fold_{first_fold:02d}"
+    print("Data source:")
+    print(f"  dataset_root={DATA_ROOT}")
+    print(f"  volcano={CONFIG['volcano']}")
+    print(
+        "  manifests="
+        f"train:{train_manifest_name}, val:{val_manifest_name}, test:{test_manifest_name}"
+    )
+    print(
+        "  example_paths="
+        f"{first_fold_dir / train_manifest_name}, "
+        f"{first_fold_dir / val_manifest_name}, "
+        f"{first_fold_dir / test_manifest_name}"
+    )
+    for manifest_name in (train_manifest_name, val_manifest_name, test_manifest_name):
+        manifest_path = first_fold_dir / manifest_name
+        if not manifest_path.exists():
+            print(f"  {manifest_name}: MISSING at {manifest_path}")
+            continue
+        summary = summarize_manifest_classes(manifest_path)
+        print(
+            f"  {manifest_name}: samples={summary['samples']} "
+            f"class_count={summary['class_count']} "
+            f"class_ids={summary['class_ids']}"
+        )
+        print(f"    id_counts={summary['id_counts']}")
+        if summary["label_counts"]:
+            print(f"    label_counts={summary['label_counts']}")
     print(
         "LR scaling: "
         f"base_lr={CONFIG['lr']:.3e}, "
@@ -292,6 +355,7 @@ def main() -> None:
         f"ref_batch={float(args.lr_scale_ref_batch):g}, "
         f"alpha={float(args.lr_scale_alpha):g}"
     )
+    print(f"Train manifest selected: {train_manifest_name}")
     if args.rerun_completed_folds:
         print("Completed folds will be rerun.")
     else:
@@ -319,6 +383,7 @@ def main() -> None:
         )
         model_config["lr"] = float(scaled_lr)
         model_config["lr_final"] = float(scaled_lr_final)
+        model_config["train_manifest_name"] = train_manifest_name
         explicit_loss_weights = resolve_event_detection_loss_weights(spec)
         explicit_loss_config = resolve_event_detection_loss_config(spec)
         if explicit_loss_weights:
@@ -366,6 +431,12 @@ def main() -> None:
         for fold_id in remaining_folds:
             fold_data_dir = DATA_ROOT / f"fold_{fold_id:02d}"
             ensure_fold_data_exists(fold_data_dir)
+            selected_train_manifest = fold_data_dir / train_manifest_name
+            if not selected_train_manifest.exists():
+                raise FileNotFoundError(
+                    f"Missing {train_manifest_name} for fold {fold_id:02d}: {selected_train_manifest}. "
+                    "Run scripts/01_prepare_data.py first."
+                )
 
             fold_out_dir = model_root / f"fold_{fold_id:02d}"
             trainer_kind = spec["trainer_kind"]

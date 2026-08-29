@@ -67,9 +67,12 @@ def train_one_segmentation_fold(
     for p in (checkpoints_dir, reports_dir, cm_dir, val_plot_dir):
         p.mkdir(parents=True, exist_ok=True)
 
+    train_manifest_name = str(config.get("train_manifest_name", "train_aug.npz"))
+    train_manifest_path = fold_data_dir / train_manifest_name
+
     # Load datasets and dataloaders based on trainer_kind
     if trainer_kind == "2d":
-        train_ds = UNetPatchDataset(fold_data_dir / "train_aug.npz")
+        train_ds = UNetPatchDataset(train_manifest_path)
         val_ds = UNetPatchDataset(fold_data_dir / "val.npz")
         test_ds = UNetPatchDataset(fold_data_dir / "test.npz")
 
@@ -86,7 +89,7 @@ def train_one_segmentation_fold(
         im_size = int(config.get("im_size", 256))
 
     elif trainer_kind == "1d":
-        train_ds = MultiStation1DDataset(fold_data_dir / "train_aug.npz")
+        train_ds = MultiStation1DDataset(train_manifest_path)
         val_ds = MultiStation1DDataset(fold_data_dir / "val.npz")
         test_ds = MultiStation1DDataset(fold_data_dir / "test.npz")
 
@@ -155,6 +158,7 @@ def train_one_segmentation_fold(
         f"Training {display_name} (segmentation) | fold={fold_id:02d} | "
         f"train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}"
     )
+    print(f"Train manifest: {train_manifest_path}")
     print(f"Output folder: {fold_out_dir}")
     print("=" * 80)
 
@@ -216,7 +220,6 @@ def train_one_segmentation_fold(
             (
                 val_f1_per_class,
                 val_mean_f1,
-                val_iou_per_class,
                 val_mean_iou,
                 val_loss,
                 val_cm,
@@ -234,10 +237,7 @@ def train_one_segmentation_fold(
             (
                 val_f1_per_class,
                 val_mean_f1,
-                val_iou_per_class,
                 val_mean_iou,
-                val_iou_all_classes,
-                val_mean_iou_all,
                 val_loss,
                 event_plot_payloads,
                 val_cm,
@@ -280,7 +280,7 @@ def train_one_segmentation_fold(
 
             save_confusion_matrix_image(
                 cm=val_cm,
-                labels=["VT", "LP", "TR", "AV", "IC"],
+                labels=["BG", "VT", "LP", "TR", "AV", "IC"],
                 out_path=cm_dir / "confusion_matrix_val_best_f1.png",
                 title=f"Validation Confusion Matrix - {display_name} - best_f1",
             )
@@ -329,7 +329,7 @@ def train_one_segmentation_fold(
             )
 
         if config.get("save_confusion_matrix_each_epoch", False):
-            cm_labels = ["VT", "LP", "TR", "AV", "IC"]
+            cm_labels = ["BG", "VT", "LP", "TR", "AV", "IC"]
             cm_path = cm_dir / f"confusion_matrix_epoch_{epoch:03d}.png"
             save_confusion_matrix_image(
                 cm=val_cm,
@@ -351,12 +351,8 @@ def train_one_segmentation_fold(
                 float(val_f1_per_class[2]),
                 float(val_f1_per_class[3]),
                 float(val_f1_per_class[4]),
+                float(val_f1_per_class[5]),
                 float(val_mean_f1),
-                float(val_iou_per_class[0]),
-                float(val_iou_per_class[1]),
-                float(val_iou_per_class[2]),
-                float(val_iou_per_class[3]),
-                float(val_iou_per_class[4]),
                 float(val_mean_iou),
             ]
         )
@@ -368,17 +364,13 @@ def train_one_segmentation_fold(
                 "epoch",
                 "train_loss",
                 "val_loss",
+                "BG_f1",
                 "VT_f1",
                 "LP_f1",
                 "TR_f1",
                 "AV_f1",
                 "IC_f1",
                 "mean_f1",
-                "VT_iou",
-                "LP_iou",
-                "TR_iou",
-                "AV_iou",
-                "IC_iou",
                 "mean_iou",
             ],
         )
@@ -425,7 +417,6 @@ def train_one_segmentation_fold(
         (
             test_f1_per_class,
             test_mean_f1,
-            test_iou_per_class,
             test_mean_iou,
             test_loss,
             test_cm,
@@ -441,10 +432,7 @@ def train_one_segmentation_fold(
         (
             test_f1_per_class,
             test_mean_f1,
-            test_iou_per_class,
             test_mean_iou,
-            test_iou_all_classes,
-            test_mean_iou_all,
             test_loss,
             test_cm,
         ) = compute_event_f1_iou_graphsage(
@@ -462,7 +450,7 @@ def train_one_segmentation_fold(
     test_cm_path = cm_dir / "confusion_matrix_test_best_f1.png"
     save_confusion_matrix_image(
         cm=test_cm,
-        labels=["VT", "LP", "TR", "AV", "IC"],
+        labels=["BG", "VT", "LP", "TR", "AV", "IC"],
         out_path=test_cm_path,
         title=f"Test Confusion Matrix - {display_name} - best_f1",
     )
@@ -483,7 +471,6 @@ def train_one_segmentation_fold(
         "test_mean_f1": float(test_mean_f1),
         "test_mean_iou": float(test_mean_iou),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
-        "test_iou_per_class": [float(x) for x in test_iou_per_class],
         "fold_elapsed_seconds": fold_elapsed_sec,
     }
 

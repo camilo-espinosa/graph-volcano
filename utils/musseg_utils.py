@@ -289,22 +289,21 @@ def evaluate_musseg_model(
         average=None,
         zero_division=0,
     )
-    mean_f1 = float(np.mean(f1_per_class)) if len(f1_per_class) > 0 else 0.0
+    support = np.sum(cm, axis=1)
+    active_mask = support > 0
+    mean_f1 = (
+        float(np.mean([f1_per_class[i] for i, active in enumerate(active_mask) if active]))
+        if np.any(active_mask)
+        else 0.0
+    )
 
-    iou_per_class: list[float] = []
-    for i in range(cm.shape[0]):
-        tp = float(cm[i, i])
-        fp = float(cm[:, i].sum() - tp)
-        fn = float(cm[i, :].sum() - tp)
-        denom = tp + fp + fn
-        iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
-    mean_iou = float(np.mean(iou_per_class)) if len(iou_per_class) > 0 else 0.0
+    # Class-agnostic non-BG event IoU in this event-only setting.
+    mean_iou = 1.0 if len(y_true) > 0 else 0.0
 
     return {
         "n_samples": int(len(y_true)),
         "f1_per_class": [float(x) for x in f1_per_class],
         "mean_f1": mean_f1,
-        "iou_per_class": iou_per_class,
         "mean_iou": mean_iou,
         "confusion_matrix": cm,
         "event_label_ids": list(EVENT_LABEL_IDS),

@@ -289,9 +289,11 @@ def predicted_from_output(
     t_bg=50,
     t_cl=25,
 ):
-    _ = t_bg, t_cl
-    max_indices = np.argmax(out_np, axis=0)
-    processed_out = np.eye(len(out_np))[max_indices].T
+    processed_out = fill_short_sequences(out_np, t_bg=t_bg, t_cl=t_cl)
+    # If no event survives postprocessing, return BG over full window.
+    if float(processed_out[1:, :].sum()) <= 0.0:
+        return 0, "BG", 0, len(processed_out[0]) - 1
+
     bg_diff = np.diff(processed_out[0])
     if np.abs(bg_diff).sum() != 0:
         start_, end_, _ = longest_event(bg_diff)
@@ -372,9 +374,8 @@ def cm_eval(
                 N=im_size,
                 n_classes=n_classes,
             )
-            true_label_temp = (
-                target_trace[:, 1:, :].sum(axis=2).max(axis=1).indices.numpy() + 1
-            )
+            # Dominant true class over the full window, including BG=0.
+            true_label_temp = target_trace.sum(axis=2).max(axis=1).indices.numpy()
             true_label.extend(true_label_temp.tolist())
 
             output = model(xb)
@@ -402,7 +403,7 @@ def cm_eval(
     if was_training:
         model.train()
 
-    cm = confusion_matrix(true_label, pred_label, labels=[1, 2, 3, 4, 5])
+    cm = confusion_matrix(true_label, pred_label, labels=[0, 1, 2, 3, 4, 5])
     return cm
 
 
@@ -630,23 +631,30 @@ def collect_unet_misclassified_event_plots(
     if max_per_class <= 0:
         return []
 
-    class_map = {1.0: "VT", 2.0: "LP", 3.0: "TR", 4.0: "AV", 5.0: "IC"}
+    class_map = {
+        0.0: "BG",
+        1.0: "VT",
+        2.0: "LP",
+        3.0: "TR",
+        4.0: "AV",
+        5.0: "IC",
+    }
     ds = UNetPatchDataset(npz_path, return_debug=True)
     payloads: list[dict] = []
     counts: dict[int, int] = {}
-    event_classes = list(class_map.keys())
+    tracked_classes = list(range(len(class_names)))
 
     was_training = model.training
     model.eval()
     with torch.inference_mode():
         for i in range(len(ds)):
-            if all(counts.get(int(c), 0) >= max_per_class for c in event_classes):
+            if all(counts.get(int(c), 0) >= max_per_class for c in tracked_classes):
                 break
 
             x_unet, _y_onehot_2d, _y_idx, x_raw, y_raw, _x_used, _y_used, _aug_meta = (
                 ds[i]
             )
-            true_class = int(np.argmax(y_raw[1:].sum(axis=1))) + 1
+            true_class = int(np.argmax(y_raw.sum(axis=1)))
             if counts.get(true_class, 0) >= max_per_class:
                 continue
 
@@ -749,8 +757,7 @@ def compute_event_f1_iou(model, loader, device):
     Returns:
         f1_per_class: list[float] len=5
         mean_f1: float
-        iou_per_class: list[float] len=5
-        mean_iou: float
+        mean_iou: class-agnostic event-vs-background IoU over time
     """
     cm = cm_eval(model, loader, device)
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
@@ -762,24 +769,18 @@ def compute_event_f1_iou(model, loader, device):
         else 0.0
     )
 
-    iou_per_class = []
-    for i in range(cm.shape[0]):
-        tp = cm[i, i]
-        fp = np.sum(cm[:, i]) - tp
-        fn = np.sum(cm[i, :]) - tp
-        denom = tp + fp + fn
-        iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
-    mean_iou = (
-        float(
-            np.mean(
-                [iou_per_class[i] for i, active in enumerate(active_mask) if active]
-            )
-        )
-        if np.any(active_mask)
-        else 0.0
-    )
+    cm_bg = np.zeros((2, 2), dtype=np.int64)
+    cm_bg[0, 0] = int(cm[0, 0])
+    cm_bg[0, 1] = int(np.sum(cm[0, 1:]))
+    cm_bg[1, 0] = int(np.sum(cm[1:, 0]))
+    cm_bg[1, 1] = int(np.sum(cm[1:, 1:]))
+    tp_evt = int(cm_bg[1, 1])
+    fp_evt = int(cm_bg[0, 1])
+    fn_evt = int(cm_bg[1, 0])
+    denom_evt = tp_evt + fp_evt + fn_evt
+    mean_iou = float(tp_evt / denom_evt) if denom_evt > 0 else 0.0
 
-    return list(f1_scores), mean_f1, iou_per_class, mean_iou
+    return list(f1_scores), mean_f1, mean_iou
 
 
 def compute_event_f1_iou_multistation(
@@ -803,22 +804,21 @@ def compute_event_f1_iou_multistation(
     - [B, S, C, T] legacy compatibility path; stations are reduced before metrics
 
     Returns:
-        f1_per_class: list[float] len=5
+        f1_per_class: list[float] len=6
         mean_f1: float
-        iou_per_class: list[float] len=5 (from confusion matrix, same as UNet eval)
-        mean_iou: float
+        mean_iou: class-agnostic event-vs-background IoU over time
         if return_val_loss=True, returns mean_val_loss before cm
         if return_event_plot_payloads=True, returns event_plot_payloads before cm
         if return_cm=True, returns cm as last element
     """
-    event_classes = (1, 2, 3, 4, 5)
+    event_classes = (0, 1, 2, 3, 4, 5)
     class_map = {1.0: "VT", 2.0: "LP", 3.0: "TR", 4.0: "AV", 5.0: "IC"}
 
     model.eval()
     pred_label = []
     true_label = []
-    temporal_intersections = np.zeros(6, dtype=np.int64)
-    temporal_unions = np.zeros(6, dtype=np.int64)
+    event_intersection = 0
+    event_union = 0
     val_loss_sum = 0.0
     val_batch_count = 0
     class_names = ["BG", "VT", "LP", "TR", "AV", "IC"]
@@ -1063,30 +1063,25 @@ def compute_event_f1_iou_multistation(
                 pred_evt_list, device=device, dtype=torch.long
             )
 
-            # Ground-truth event class from labels (unchanged).
-            true_evt_batch = torch.argmax(y_onehot[:, 1:, :].sum(dim=2), dim=1) + 1
-
-            assert torch.equal(
-                true_evt_batch, y_label
-            ), "Label mismatch: class from y_onehot does not match dataset label_ids"
+            # Keep metrics over all classes, including BG=0.
+            true_evt_batch = y_label
 
             pred_evt_np = pred_evt_batch.detach().cpu().numpy()
             true_evt_np = true_evt_batch.detach().cpu().numpy()
             pred_label.extend(pred_evt_np.tolist())
             true_label.extend(true_evt_np.tolist())
 
-            # Separate multiclass temporal IoU over [BG, VT, LP, TR, AV, IC].
+            # Class-agnostic event-vs-background IoU over time.
             true_max_idx = torch.argmax(y_onehot, dim=1)  # [B, T]
             pred_max_idx = torch.argmax(probs, dim=1)  # [B, T]
             true_max_idx_np = true_max_idx.detach().cpu().numpy().reshape(-1)
             pred_max_idx_np = pred_max_idx.detach().cpu().numpy().reshape(-1)
-            for c in range(6):
-                pred_mask = pred_max_idx_np == c
-                true_mask = true_max_idx_np == c
-                temporal_intersections[c] += int(
-                    np.logical_and(pred_mask, true_mask).sum()
-                )
-                temporal_unions[c] += int(np.logical_or(pred_mask, true_mask).sum())
+            pred_event_mask = pred_max_idx_np > 0
+            true_event_mask = true_max_idx_np > 0
+            event_intersection += int(
+                np.logical_and(pred_event_mask, true_event_mask).sum()
+            )
+            event_union += int(np.logical_or(pred_event_mask, true_event_mask).sum())
 
             del (
                 xb,
@@ -1116,30 +1111,7 @@ def compute_event_f1_iou_multistation(
         else 0.0
     )
 
-    iou_per_class = []
-    for i in range(cm.shape[0]):
-        tp = cm[i, i]
-        fp = np.sum(cm[:, i]) - tp
-        fn = np.sum(cm[i, :]) - tp
-        denom = tp + fp + fn
-        iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
-    mean_iou = (
-        float(
-            np.mean(
-                [iou_per_class[i] for i, active in enumerate(active_mask) if active]
-            )
-        )
-        if np.any(active_mask)
-        else 0.0
-    )
-
-    # Extra multiclass temporal IoU over all classes [BG, VT, LP, TR, AV, IC].
-    iou_all_classes = []
-    for c in range(6):
-        inter = int(temporal_intersections[c])
-        union = int(temporal_unions[c])
-        iou_all_classes.append(float(inter / union) if union > 0 else 0.0)
-    mean_iou_all = float(np.mean(iou_all_classes))
+    mean_iou = float(event_intersection / event_union) if event_union > 0 else 0.0
     mean_val_loss = (
         float(val_loss_sum / val_batch_count) if val_batch_count > 0 else 0.0
     )
@@ -1147,10 +1119,7 @@ def compute_event_f1_iou_multistation(
     result = (
         list(f1_scores),
         mean_f1,
-        iou_per_class,
         mean_iou,
-        iou_all_classes,
-        mean_iou_all,
     )
     if return_val_loss:
         result = (*result, mean_val_loss)
@@ -1511,34 +1480,6 @@ class CrossVolcanoLOODataset(Dataset):
         return tuple(output) if len(output) > 3 else (x, y_onehot, y_label)
 
 
-def compute_iou_per_class(
-    pred_idx: np.ndarray, true_idx: np.ndarray, n_classes: int = 6
-):
-    ious = []
-    for c in range(n_classes):
-        pred_mask = pred_idx == c
-        true_mask = true_idx == c
-        intersection = np.logical_and(pred_mask, true_mask).sum()
-        union = np.logical_or(pred_mask, true_mask).sum()
-        if union == 0:
-            ious.append(np.nan)
-        else:
-            ious.append(intersection / union)
-    return np.array(ious)
-
-
-def compute_iou_from_cm(cm: np.ndarray) -> tuple[list[float], float]:
-    iou_per_class = []
-    for i in range(cm.shape[0]):
-        tp = cm[i, i]
-        fp = np.sum(cm[:, i]) - tp
-        fn = np.sum(cm[i, :]) - tp
-        denom = tp + fp + fn
-        iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
-    mean_iou = float(np.mean(iou_per_class)) if len(iou_per_class) > 0 else 0.0
-    return iou_per_class, mean_iou
-
-
 def f1_score_from_confusion_matrix(confusion_matrix: np.ndarray):
     f1_scores = []
     recall_scores = []
@@ -1725,10 +1666,7 @@ def train_one_ablation_fold(
         (
             f1_per_class,
             mean_f1,
-            iou_per_class,
             mean_iou,
-            iou_all_classes,
-            mean_iou_all,
             val_loss,
             event_plot_payloads,
             cm,
@@ -1825,19 +1763,7 @@ def train_one_ablation_fold(
                 float(f1_per_class[3]),
                 float(f1_per_class[4]),
                 float(mean_f1),
-                float(iou_per_class[0]),
-                float(iou_per_class[1]),
-                float(iou_per_class[2]),
-                float(iou_per_class[3]),
-                float(iou_per_class[4]),
                 float(mean_iou),
-                float(iou_all_classes[0]),
-                float(iou_all_classes[1]),
-                float(iou_all_classes[2]),
-                float(iou_all_classes[3]),
-                float(iou_all_classes[4]),
-                float(iou_all_classes[5]),
-                float(mean_iou_all),
             ]
         )
 
@@ -1854,19 +1780,7 @@ def train_one_ablation_fold(
                 "AV_f1",
                 "IC_f1",
                 "mean_f1",
-                "VT_iou",
-                "LP_iou",
-                "TR_iou",
-                "AV_iou",
-                "IC_iou",
                 "mean_iou",
-                "BG_iou_all",
-                "VT_iou_all",
-                "LP_iou_all",
-                "TR_iou_all",
-                "AV_iou_all",
-                "IC_iou_all",
-                "mean_iou_all",
             ],
         )
         metrics_df.to_csv(
@@ -1908,10 +1822,7 @@ def train_one_ablation_fold(
     (
         test_f1_per_class,
         test_mean_f1,
-        test_iou_per_class,
         test_mean_iou,
-        test_iou_all_classes,
-        test_mean_iou_all,
         test_loss,
         test_cm,
     ) = compute_event_f1_iou_graphsage(
@@ -1949,10 +1860,7 @@ def train_one_ablation_fold(
         "test_loss": float(test_loss),
         "test_mean_f1": float(test_mean_f1),
         "test_mean_iou": float(test_mean_iou),
-        "test_mean_iou_all": float(test_mean_iou_all),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
-        "test_iou_per_class": [float(x) for x in test_iou_per_class],
-        "test_iou_all_classes": [float(x) for x in test_iou_all_classes],
         "fold_elapsed_seconds": fold_elapsed_sec,
     }
 
@@ -1974,11 +1882,13 @@ def evaluate_unet_model(
     len_window: int,
     im_size: int,
     config: dict,
-) -> tuple[list[float], float, list[float], float, float, np.ndarray]:
+) -> tuple[list[float], float, float, float, np.ndarray]:
     model.eval()
 
     total_loss = 0.0
     n_batches = 0
+    event_intersection = 0
+    event_union = 0
     with torch.no_grad():
         for xb, y_onehot, _y_idx in dataloader:
             xb = xb.to(device)
@@ -1993,6 +1903,17 @@ def evaluate_unet_model(
             )
             total_loss += float(loss.item())
             n_batches += 1
+
+            pred_idx = torch.argmax(out, dim=1)
+            true_idx = torch.argmax(y_onehot, dim=1)
+            pred_event_mask = pred_idx > 0
+            true_event_mask = true_idx > 0
+            event_intersection += int(
+                torch.logical_and(pred_event_mask, true_event_mask).sum().item()
+            )
+            event_union += int(
+                torch.logical_or(pred_event_mask, true_event_mask).sum().item()
+            )
             del xb, y_onehot, out, loss
 
     mean_loss = float(total_loss / n_batches) if n_batches > 0 else 0.0
@@ -2009,34 +1930,16 @@ def evaluate_unet_model(
     )
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
     f1_scores = [float(x) for x in f1_scores]
-    iou_per_class, _mean_iou_all = compute_iou_from_cm(cm)
-
-    dataset = dataloader.dataset
-    if not hasattr(dataset, "label_ids"):
-        raise AttributeError(
-            "evaluate_unet_model requires dataloader.dataset.label_ids to compute active-class means."
-        )
-
-    label_ids = np.asarray(dataset.label_ids, dtype=np.int64)
-    active_event_ids = sorted(
-        int(v) for v in np.unique(label_ids).tolist() if 1 <= int(v) <= 5
+    support = np.sum(cm, axis=1)
+    active_mask = support > 0
+    mean_f1 = (
+        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
+        if np.any(active_mask)
+        else 0.0
     )
-    if len(active_event_ids) == 0:
-        raise RuntimeError(
-            "No active event classes found in dataset.label_ids; cannot compute active-class mean F1/IoU."
-        )
+    mean_iou = float(event_intersection / event_union) if event_union > 0 else 0.0
 
-    active_class_indices = [event_id - 1 for event_id in active_event_ids]
-    if max(active_class_indices) >= len(f1_scores):
-        raise RuntimeError(
-            "Active class index is out of bounds for confusion-matrix scores: "
-            f"active_class_indices={active_class_indices}, n_scores={len(f1_scores)}"
-        )
-
-    mean_f1 = float(np.mean([f1_scores[i] for i in active_class_indices]))
-    mean_iou = float(np.mean([float(iou_per_class[i]) for i in active_class_indices]))
-
-    return f1_scores, mean_f1, iou_per_class, mean_iou, mean_loss, cm
+    return f1_scores, mean_f1, mean_iou, mean_loss, cm
 
 
 def train_one_unet_fold(
@@ -2130,7 +2033,6 @@ def train_one_unet_fold(
         (
             val_f1_per_class,
             val_mean_f1,
-            val_iou_per_class,
             val_mean_iou,
             val_loss,
             val_cm,
@@ -2231,11 +2133,6 @@ def train_one_unet_fold(
                 float(val_f1_per_class[3]),
                 float(val_f1_per_class[4]),
                 float(val_mean_f1),
-                float(val_iou_per_class[0]),
-                float(val_iou_per_class[1]),
-                float(val_iou_per_class[2]),
-                float(val_iou_per_class[3]),
-                float(val_iou_per_class[4]),
                 float(val_mean_iou),
             ]
         )
@@ -2252,11 +2149,6 @@ def train_one_unet_fold(
                 "AV_f1",
                 "IC_f1",
                 "mean_f1",
-                "VT_iou",
-                "LP_iou",
-                "TR_iou",
-                "AV_iou",
-                "IC_iou",
                 "mean_iou",
             ],
         )
@@ -2299,7 +2191,6 @@ def train_one_unet_fold(
     (
         test_f1_per_class,
         test_mean_f1,
-        test_iou_per_class,
         test_mean_iou,
         test_loss,
         test_cm,
@@ -2338,7 +2229,6 @@ def train_one_unet_fold(
         "test_mean_f1": float(test_mean_f1),
         "test_mean_iou": float(test_mean_iou),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
-        "test_iou_per_class": [float(x) for x in test_iou_per_class],
         "fold_elapsed_seconds": fold_elapsed_sec,
     }
 

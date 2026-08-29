@@ -75,6 +75,8 @@ def load_completed_keys(csv_path: Path, id_columns: list[str]) -> set[tuple[Any,
         return set()
 
     keys: set[tuple[Any, ...]] = set()
+    int_id_columns = {"fold", "repeat_id"}
+
     for _, row in df.iterrows():
         values: list[Any] = []
         valid = True
@@ -83,10 +85,10 @@ def load_completed_keys(csv_path: Path, id_columns: list[str]) -> set[tuple[Any,
             if pd.isna(value):
                 valid = False
                 break
-            if col == "fold":
+            if col in int_id_columns:
                 values.append(int(value))
             else:
-                values.append(str(value))
+                values.append(str(value).strip())
         if valid:
             keys.add(tuple(values))
 

@@ -106,6 +106,7 @@ class EventDetectionLoss(torch.nn.Module):
         for b in range(batch_size):
             match = matches[b]
             target_list = targets[b]
+            has_targets = len(target_list) > 0
 
             class_logits_b = predictions["class_logits"][b]
             confidence_logits_b = predictions["confidence_logits"][b, :, 0]
@@ -136,7 +137,9 @@ class EventDetectionLoss(torch.nn.Module):
             else:
                 loss_class_matched = torch.tensor(0.0, device=device)
 
-            if len(match.unmatched_pred) > 0:
+            # For BG-only windows (no targets), keep class-loss neutral and let
+            # confidence/objectness loss carry the background supervision.
+            if len(match.unmatched_pred) > 0 and has_targets:
                 unmatched_target_classes = torch.zeros(
                     len(match.unmatched_pred),
                     dtype=torch.long,

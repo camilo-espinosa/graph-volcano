@@ -57,7 +57,6 @@ from utils.train_utils import (
 )
 
 CLASS_NAMES = ["VT", "LP", "TR", "AV", "IC"]
-ALL_CLASS_NAMES = ["BG", "VT", "LP", "TR", "AV", "IC"]
 FOLDS = range(1, 6)
 LEN_WINDOW = 8192
 IM_SIZE = 256
@@ -219,20 +218,11 @@ def write_aggregate_reports(out_dir: Path) -> None:
 
     summary_rows = []
     per_class_f1_rows = []
-    per_class_iou_rows = []
 
     grouped = fold_df.groupby(["model_key", "target_volcano"], sort=True)
     for (model_key, target), grp in grouped:
         mean_f1_summary = compute_summary(grp["test_mean_f1"].astype(float).tolist())
         mean_iou_summary = compute_summary(grp["test_mean_iou"].astype(float).tolist())
-        iou_all_values = pd.to_numeric(
-            grp["test_mean_iou_all"], errors="coerce"
-        ).dropna()
-        mean_iou_all_summary = (
-            compute_summary(iou_all_values.astype(float).tolist())
-            if len(iou_all_values) > 0
-            else None
-        )
         loss_summary = compute_summary(grp["test_loss"].astype(float).tolist())
 
         display_names = grp["model_display_name"].dropna().unique().tolist()
@@ -251,16 +241,8 @@ def write_aggregate_reports(out_dir: Path) -> None:
             "test_loss_mean": float(loss_summary["mean"]),
             "test_loss_std": float(loss_summary["std"]),
         }
-        if mean_iou_all_summary is not None:
-            summary_row["test_mean_iou_all_mean"] = float(mean_iou_all_summary["mean"])
-            summary_row["test_mean_iou_all_std"] = float(mean_iou_all_summary["std"])
 
         per_class_f1_row = {
-            "model_key": str(model_key),
-            "model_display_name": display_name,
-            "target_volcano": str(target),
-        }
-        per_class_iou_row = {
             "model_key": str(model_key),
             "model_display_name": display_name,
             "target_volcano": str(target),
@@ -268,23 +250,16 @@ def write_aggregate_reports(out_dir: Path) -> None:
 
         for class_name in CLASS_NAMES:
             f1_col = f"test_f1_{class_name}"
-            iou_col = f"test_iou_{class_name}"
             f1_summary = compute_summary(grp[f1_col].astype(float).tolist())
-            iou_summary = compute_summary(grp[iou_col].astype(float).tolist())
 
             summary_row[f"{f1_col}_mean"] = float(f1_summary["mean"])
             summary_row[f"{f1_col}_std"] = float(f1_summary["std"])
-            summary_row[f"{iou_col}_mean"] = float(iou_summary["mean"])
-            summary_row[f"{iou_col}_std"] = float(iou_summary["std"])
 
             per_class_f1_row[f"{class_name}_mean"] = float(f1_summary["mean"])
             per_class_f1_row[f"{class_name}_std"] = float(f1_summary["std"])
-            per_class_iou_row[f"{class_name}_mean"] = float(iou_summary["mean"])
-            per_class_iou_row[f"{class_name}_std"] = float(iou_summary["std"])
 
         summary_rows.append(summary_row)
         per_class_f1_rows.append(per_class_f1_row)
-        per_class_iou_rows.append(per_class_iou_row)
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
         by=["target_volcano", "test_mean_f1_mean"],
@@ -303,17 +278,6 @@ def write_aggregate_reports(out_dir: Path) -> None:
         ascending=[True, True],
     ).to_csv(
         out_dir / "zero_shot_per_class_f1.csv",
-        index=False,
-        encoding="utf-8-sig",
-        sep=";",
-        decimal=",",
-    )
-
-    pd.DataFrame(per_class_iou_rows).sort_values(
-        by=["target_volcano", "model_key"],
-        ascending=[True, True],
-    ).to_csv(
-        out_dir / "zero_shot_per_class_iou.csv",
         index=False,
         encoding="utf-8-sig",
         sep=";",
@@ -470,15 +434,11 @@ def main() -> None:
         "test_loss",
         "test_mean_f1",
         "test_mean_iou",
-        "test_mean_iou_all",
         "n_active_classes",
         "active_classes",
     ]
     for class_name in CLASS_NAMES:
         fieldnames.append(f"test_f1_{class_name}")
-        fieldnames.append(f"test_iou_{class_name}")
-    for class_name in ALL_CLASS_NAMES:
-        fieldnames.append(f"test_iou_all_{class_name}")
 
     completed_keys = load_completed_keys(
         out_dir / "zero_shot_fold_metrics.csv",
@@ -585,10 +545,7 @@ def main() -> None:
                         (
                             f1_per_class,
                             mean_f1,
-                            iou_per_class,
                             mean_iou,
-                            iou_all_classes,
-                            mean_iou_all,
                             eval_loss,
                             cm,
                             n_samples,
@@ -628,7 +585,6 @@ def main() -> None:
                         (
                             f1_per_class,
                             mean_f1,
-                            iou_per_class,
                             mean_iou,
                             eval_loss,
                             cm,
@@ -647,8 +603,6 @@ def main() -> None:
                             len_window=LEN_WINDOW,
                             im_size=IM_SIZE,
                         )
-                        iou_all_classes = [float("nan")] * len(ALL_CLASS_NAMES)
-                        mean_iou_all = float("nan")
                     elif trainer_kind == "event_detection":
                         model = model_spec["model_cls"](**model_kwargs).to(device)
                         load_checkpoint_into_model(
@@ -660,10 +614,7 @@ def main() -> None:
                         (
                             f1_per_class,
                             mean_f1,
-                            iou_per_class,
                             mean_iou,
-                            iou_all_classes,
-                            mean_iou_all,
                             eval_loss,
                             cm,
                             n_samples,
@@ -696,7 +647,6 @@ def main() -> None:
                         "test_loss": float(eval_loss),
                         "test_mean_f1": float(mean_f1),
                         "test_mean_iou": float(mean_iou),
-                        "test_mean_iou_all": float(mean_iou_all),
                         "n_active_classes": int(len(active_event_ids)),
                         "active_classes": ",".join(
                             [CLASS_NAMES[x - 1] for x in active_event_ids]
@@ -705,10 +655,6 @@ def main() -> None:
 
                     for idx, class_name in enumerate(CLASS_NAMES):
                         row[f"test_f1_{class_name}"] = float(f1_per_class[idx])
-                        row[f"test_iou_{class_name}"] = float(iou_per_class[idx])
-
-                    for idx, class_name in enumerate(ALL_CLASS_NAMES):
-                        row[f"test_iou_all_{class_name}"] = float(iou_all_classes[idx])
 
                     append_row_csv(
                         out_dir / "zero_shot_fold_metrics.csv",

@@ -103,7 +103,10 @@ def parse_args() -> argparse.Namespace:
         "--models",
         type=str,
         default=None,
-        help="Comma-separated model keys. Default: all active registry entries.",
+        help=(
+            "Comma-separated model keys. "
+            "Default: all model folders under <experiment_root>/ablations that are registered."
+        ),
     )
     parser.add_argument(
         "--targets",
@@ -191,6 +194,25 @@ def _discover_subset_keys(fold_dir: Path) -> list[str]:
     if not subsets_root.exists():
         return []
     return [p.name for p in sorted(subsets_root.iterdir()) if p.is_dir()]
+
+
+def discover_source_models(experiment_root: Path) -> list[str]:
+    ablations_root = experiment_root / "ablations"
+    if not ablations_root.exists():
+        raise FileNotFoundError(f"Ablations root not found: {ablations_root}")
+
+    model_dirs = [p.name for p in sorted(ablations_root.iterdir()) if p.is_dir()]
+    if len(model_dirs) == 0:
+        raise FileNotFoundError(f"No model folders found under: {ablations_root}")
+
+    unknown = sorted([name for name in model_dirs if name not in MODEL_SPECS])
+    if len(unknown) > 0:
+        raise KeyError(
+            "Found model folders that are not present in utils.model_registry.MODEL_SPECS: "
+            f"{unknown}. Please register them or remove/rename those folders."
+        )
+
+    return model_dirs
 
 
 def _load_json(path: Path) -> dict:
@@ -426,7 +448,7 @@ def _evaluate_event_detection_loader(
     loss_fn: EventDetectionLoss,
     metrics_fn: EventDetectionMetrics,
     matching_cfg: dict[str, float | str],
-) -> tuple[list[float], float, list[float], float, float, np.ndarray, float]:
+) -> tuple[list[float], float, float, float, np.ndarray, float]:
     model.eval()
     val_loss = 0.0
     n_batches = 0
@@ -491,12 +513,11 @@ def _evaluate_event_detection_loader(
     mean_iou, _ = _class_agnostic_detection_iou_from_rows(predictions_df)
 
     f1_per_class = [float(per_class_f1.get(class_id, 0.0)) for class_id in range(1, 6)]
-    iou_per_class = [float(mean_iou)] * 5
     avg_loss = float(val_loss / n_batches)
     cm = detection_summary["confusion_matrix"]
     test_map = float(detection_metrics.get("mAP", 0.0))
 
-    return f1_per_class, mean_f1, iou_per_class, mean_iou, avg_loss, cm, test_map
+    return f1_per_class, mean_f1, mean_iou, avg_loss, cm, test_map
 
 
 def _prepare_dataloaders(
@@ -689,7 +710,6 @@ def _train_one_run(
             (
                 val_f1_per_class,
                 val_mean_f1,
-                val_iou_per_class,
                 val_mean_iou,
                 val_loss,
                 val_cm,
@@ -705,10 +725,7 @@ def _train_one_run(
             (
                 val_f1_per_class,
                 val_mean_f1,
-                val_iou_per_class,
                 val_mean_iou,
-                _val_iou_all,
-                _val_mean_iou_all,
                 val_loss,
                 val_cm,
             ) = compute_event_f1_iou_graphsage(
@@ -733,7 +750,6 @@ def _train_one_run(
             (
                 val_f1_per_class,
                 val_mean_f1,
-                val_iou_per_class,
                 val_mean_iou,
                 val_loss,
                 val_cm,
@@ -863,7 +879,6 @@ def _train_one_run(
         (
             test_f1_per_class,
             test_mean_f1,
-            test_iou_per_class,
             test_mean_iou,
             test_loss,
             test_cm,
@@ -880,10 +895,7 @@ def _train_one_run(
         (
             test_f1_per_class,
             test_mean_f1,
-            test_iou_per_class,
             test_mean_iou,
-            _test_iou_all,
-            _test_mean_iou_all,
             test_loss,
             test_cm,
         ) = compute_event_f1_iou_graphsage(
@@ -909,7 +921,6 @@ def _train_one_run(
         (
             test_f1_per_class,
             test_mean_f1,
-            test_iou_per_class,
             test_mean_iou,
             test_loss,
             test_cm,
@@ -949,9 +960,7 @@ def _train_one_run(
     }
     for idx, cls in enumerate(CLASS_NAMES):
         row[f"val_f1_{cls}"] = float(val_f1_per_class[idx])
-        row[f"val_iou_{cls}"] = float(val_iou_per_class[idx])
         row[f"test_f1_{cls}"] = float(test_f1_per_class[idx])
-        row[f"test_iou_{cls}"] = float(test_iou_per_class[idx])
 
     with (reports_dir / "fold_summary.json").open("w", encoding="utf-8") as f:
         json.dump(row, f, indent=2)
@@ -990,7 +999,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     available_targets = discover_targets(data_root)
-    available_models = [k for k, v in MODEL_SPECS.items()]
+    available_models = discover_source_models(experiment_root)
     selected_models = parse_csv_selection(args.models, available_models, "models")
     selected_targets = parse_csv_selection(args.targets, available_targets, "targets")
     selected_targets = _order_targets_cau_first(selected_targets)
@@ -1091,9 +1100,7 @@ def main() -> None:
     ]
     for cls in CLASS_NAMES:
         fieldnames.append(f"val_f1_{cls}")
-        fieldnames.append(f"val_iou_{cls}")
         fieldnames.append(f"test_f1_{cls}")
-        fieldnames.append(f"test_iou_{cls}")
 
     metrics_csv_path = output_dir / "progressive_finetuning_metrics.csv"
     completed_run_keys: set[tuple[str, str, int, str]] = set()

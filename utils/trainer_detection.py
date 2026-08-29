@@ -37,7 +37,7 @@ DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS = {
     "giou_loss": 2.5,
     "mask_bce_loss": 1.0,
     "mask_dice_loss": 2.0,
-    "unmatched_query": 0.0,
+    "unmatched_query": 0.25,
 }
 
 DEFAULT_EVENT_DETECTION_LOSS_CONFIG = {}
@@ -293,6 +293,7 @@ def build_validation_event_predictions_dataframe(
     iou_threshold: float = 0.3,
     matching_strategy: str = "iou",
     overlap_recall_threshold: float = 0.8,
+    confidence_threshold: float = 0.5,
 ) -> pd.DataFrame:
     """
     Build per-event validation prediction records for event-detection evaluation.
@@ -307,6 +308,11 @@ def build_validation_event_predictions_dataframe(
     """
     normalized_predictions = normalize_prediction_intervals(all_predictions)
     class_logits = np.asarray(normalized_predictions["class_logits"])  # [B, Nq, C]
+    confidence_logits = (
+        np.asarray(normalized_predictions["confidence_logits"])
+        if "confidence_logits" in normalized_predictions
+        else None
+    )
     pred_starts = np.asarray(normalized_predictions["start"])  # [B, Nq, 1]
     pred_ends = np.asarray(normalized_predictions["end"])  # [B, Nq, 1]
     pred_mask_logits = None
@@ -405,15 +411,33 @@ def build_validation_event_predictions_dataframe(
 
     for sample_idx in range(batch_size):
         probs = softmax(class_logits[sample_idx], axis=-1)  # [Nq, C]
+        conf_probs = (
+            1.0
+            / (
+                1.0
+                + np.exp(
+                    -np.clip(
+                        np.asarray(confidence_logits[sample_idx])[:, 0],
+                        -60.0,
+                        60.0,
+                    )
+                )
+            )
+            if confidence_logits is not None
+            else (1.0 - probs[:, 0])
+        )
 
         sample_preds: list[dict] = []
         for query_idx in range(n_queries):
-            pred_class = int(np.argmax(probs[query_idx]))
-            if pred_class == 0:
+            query_conf = float(conf_probs[query_idx])
+            if query_conf < float(confidence_threshold):
                 continue
 
+            # Event-only class decode; BG decision is made by confidence gate.
+            pred_class = int(np.argmax(probs[query_idx, 1:])) + 1
+
             pred_bg_prob = float(probs[query_idx, 0])
-            pred_non_bg_conf = float(1.0 - pred_bg_prob)
+            pred_non_bg_conf = float(query_conf)
             pred_start = float(np.clip(pred_starts[sample_idx, query_idx, 0], 0.0, 1.0))
             pred_end = float(np.clip(pred_ends[sample_idx, query_idx, 0], 0.0, 1.0))
             if pred_start > pred_end:
@@ -686,8 +710,11 @@ def train_one_event_detection_fold(
     for p in (checkpoints_dir, reports_dir, val_predictions_dir, val_plot_dir, cm_dir):
         p.mkdir(parents=True, exist_ok=True)
 
+    train_manifest_name = str(config.get("train_manifest_name", "train_aug.npz"))
+    train_manifest_path = fold_data_dir / train_manifest_name
+
     # Load datasets
-    train_ds = MultiStation1DDataset(fold_data_dir / "train_aug.npz")
+    train_ds = MultiStation1DDataset(train_manifest_path)
     val_ds = MultiStation1DDataset(fold_data_dir / "val.npz")
     test_ds = MultiStation1DDataset(fold_data_dir / "test.npz")
 
@@ -717,6 +744,7 @@ def train_one_event_detection_fold(
     match_iou_threshold = float(eval_matching["match_iou_threshold"])
     matching_strategy = str(eval_matching["matching_strategy"])
     overlap_recall_threshold = float(eval_matching["overlap_recall_threshold"])
+    eval_confidence_threshold = float(config.get("event_confidence_threshold", 0.5))
 
     print(f"Resolved event-detection loss weights for {model_key}: {loss_weights}")
     print(f"Resolved event-detection loss config for {model_key}: {loss_config}")
@@ -805,6 +833,7 @@ def train_one_event_detection_fold(
         f"Training {model_key} (event detection) | fold={fold_id:02d} | "
         f"train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}"
     )
+    print(f"Train manifest: {train_manifest_path}")
     print(f"Output folder: {fold_out_dir}")
     print("=" * 80)
 
@@ -889,6 +918,7 @@ def train_one_event_detection_fold(
         val_metric_interval_iou = 0.0
         all_predictions = {
             "class_logits": [],
+            "confidence_logits": [],
             "start": [],
             "end": [],
             "mask_logits": [],
@@ -1001,7 +1031,11 @@ def train_one_event_detection_fold(
             all_predictions[key] = np.concatenate(all_predictions[key], axis=0)
 
         # Compute event detection metrics (mAP at various IoU thresholds)
-        detection_metrics = metrics_fn.evaluate_batch(all_predictions, all_targets)
+        detection_metrics = metrics_fn.evaluate_batch(
+            all_predictions,
+            all_targets,
+            confidence_threshold=eval_confidence_threshold,
+        )
 
         # Unified event summary from one matching pass: confusion matrix + per-class metrics.
         detection_summary = metrics_fn.compute_detection_summary(
@@ -1010,6 +1044,7 @@ def train_one_event_detection_fold(
             iou_threshold=match_iou_threshold,
             matching_strategy=matching_strategy,
             overlap_recall_threshold=overlap_recall_threshold,
+            confidence_threshold=eval_confidence_threshold,
         )
 
         # Build per-event validation prediction rows once per epoch from already
@@ -1020,6 +1055,7 @@ def train_one_event_detection_fold(
             iou_threshold=match_iou_threshold,
             matching_strategy=matching_strategy,
             overlap_recall_threshold=overlap_recall_threshold,
+            confidence_threshold=eval_confidence_threshold,
         )
         val_predictions_latest_path = val_predictions_dir / "val_predictions_latest.csv"
         val_predictions_df.to_csv(
@@ -1067,34 +1103,29 @@ def train_one_event_detection_fold(
             last_val_pred_start_err_true = float("nan")
             last_val_pred_end_err_true = float("nan")
         per_class_f1_dict = detection_summary["per_class_f1"]
-        per_class_iou_dict = detection_summary["per_class_iou"]
         per_class_stats = detection_summary["per_class"]
 
-        # Extract per-class F1 and IoU scores: class_id 1-5 maps to VT, LP, TR, AV, IC
+        # Extract per-class F1 scores: class_id 1-5 maps to VT, LP, TR, AV, IC
         class_f1_scores = [
             per_class_f1_dict.get(class_id, 0.0) for class_id in range(1, 6)
         ]
-        # Canonical IoU is class-agnostic temporal IoU from predicted start/end.
-        # Per-class IoU slots are kept for CSV compatibility and mirror this value.
-        mean_iou = float(val_temporal_iou_agnostic)
-        class_iou_scores = [float(mean_iou)] * 5
 
-        active_event_class_ids = [
+        active_class_ids = [
             class_id
-            for class_id in range(1, 6)
+            for class_id in range(0, 6)
             if int(per_class_stats[class_id]["target_count"]) > 0
         ]
-        if len(active_event_class_ids) == 0:
+        if len(active_class_ids) == 0:
             raise RuntimeError(
-                "Validation set contains no active event classes (target_count=0 for all VT/LP/TR/AV/IC)."
+                "Validation set contains no active classes (target_count=0 for all BG/VT/LP/TR/AV/IC)."
             )
 
-        # Canonical study metric: macro-F1 over active (present) non-background classes.
+        # Canonical metric: macro-F1 over active classes, including BG when present.
         mean_f1 = float(
             np.mean(
                 [
                     float(per_class_f1_dict.get(class_id, 0.0))
-                    for class_id in active_event_class_ids
+                    for class_id in active_class_ids
                 ]
             )
         )
@@ -1232,12 +1263,9 @@ def train_one_event_detection_fold(
         # Save metrics rows for CSV export
         current_lr = float(optimizer.param_groups[0]["lr"])
 
-        # Main CSV: ordered list format identical to segmentation models for comparison
-        # [lr, epoch, train_loss, val_loss, VT_f1, LP_f1, TR_f1, AV_f1, IC_f1, mean_f1, VT_iou, LP_iou, TR_iou, AV_iou, IC_iou, mean_iou]
-        # For event detection: use per-class F1 and per-class IoU from the
-        # configured matching criterion.
+        # Main CSV: ordered list format for training history comparison.
+        # [lr, epoch, train_loss, val_loss, VT_f1, LP_f1, TR_f1, AV_f1, IC_f1, mean_f1, mean_iou]
         vt_f1, lp_f1, tr_f1, av_f1, ic_f1 = class_f1_scores
-        vt_iou, lp_iou, tr_iou, av_iou, ic_iou = class_iou_scores
 
         metrics_row = [
             current_lr,
@@ -1250,18 +1278,13 @@ def train_one_event_detection_fold(
             av_f1,
             ic_f1,
             float(mean_f1),
-            vt_iou,
-            lp_iou,
-            tr_iou,
-            av_iou,
-            ic_iou,
             float(mean_iou),
         ]
         metrics_rows.append(metrics_row)
 
         # Detection metrics CSV (additional metrics specific to event detection):
         # [epoch, mAP@0.1, mAP@0.3, mAP@0.5, mAP@0.7, mAP@0.9, mAP,
-        #  F1_match, VT_f1_match, LP_f1_match, TR_f1_match, AV_f1_match, IC_f1_match]
+        #  macro_f1, VT_f1, LP_f1, TR_f1, AV_f1, IC_f1]
         detection_row = [
             int(epoch + 1),
             float(detection_metrics.get("mAP@0.1", 0.0)),
@@ -1388,6 +1411,7 @@ def train_one_event_detection_fold(
     test_loss = 0.0
     all_test_predictions = {
         "class_logits": [],
+        "confidence_logits": [],
         "start": [],
         "end": [],
         "mask_logits": [],
@@ -1433,13 +1457,18 @@ def train_one_event_detection_fold(
     for key in all_test_predictions:
         all_test_predictions[key] = np.concatenate(all_test_predictions[key], axis=0)
 
-    test_metrics = metrics_fn.evaluate_batch(all_test_predictions, all_test_targets)
+    test_metrics = metrics_fn.evaluate_batch(
+        all_test_predictions,
+        all_test_targets,
+        confidence_threshold=eval_confidence_threshold,
+    )
     test_predictions_df = build_validation_event_predictions_dataframe(
         all_test_predictions,
         all_test_targets,
         iou_threshold=match_iou_threshold,
         matching_strategy=matching_strategy,
         overlap_recall_threshold=overlap_recall_threshold,
+        confidence_threshold=eval_confidence_threshold,
     )
     test_temporal_iou_agnostic, test_mask_iou_agnostic = (
         _class_agnostic_detection_iou_from_rows(test_predictions_df)
@@ -1450,24 +1479,24 @@ def train_one_event_detection_fold(
         iou_threshold=match_iou_threshold,
         matching_strategy=matching_strategy,
         overlap_recall_threshold=overlap_recall_threshold,
+        confidence_threshold=eval_confidence_threshold,
     )
     test_f1_per_class = [
         float(test_detection_summary["per_class_f1"].get(class_id, 0.0))
-        for class_id in range(1, 6)
+        for class_id in range(0, 6)
     ]
     test_mean_iou = float(test_temporal_iou_agnostic)
-    test_iou_per_class = [float(test_mean_iou)] * 5
     test_per_class_stats = test_detection_summary["per_class"]
     active_test_class_ids = [
         class_id
-        for class_id in range(1, 6)
+        for class_id in range(0, 6)
         if int(test_per_class_stats[class_id]["target_count"]) > 0
     ]
     if len(active_test_class_ids) == 0:
         raise RuntimeError(
-            "Test set contains no active event classes (target_count=0 for all VT/LP/TR/AV/IC)."
+            "Test set contains no active classes (target_count=0 for all BG/VT/LP/TR/AV/IC)."
         )
-    test_macro_f1_active = float(
+    test_macro_f1 = float(
         np.mean(
             [
                 float(test_detection_summary["per_class_f1"].get(class_id, 0.0))
@@ -1476,14 +1505,6 @@ def train_one_event_detection_fold(
         )
     )
     test_mean_iou = float(test_temporal_iou_agnostic)
-    test_f1 = metrics_fn.compute_f1(
-        all_test_predictions,
-        all_test_targets,
-        iou_threshold=match_iou_threshold,
-        matching_strategy=matching_strategy,
-        overlap_recall_threshold=overlap_recall_threshold,
-    )
-
     fold_elapsed_sec = float(time.time() - fold_start)
 
     # Prepare fold summary
@@ -1513,10 +1534,9 @@ def train_one_event_detection_fold(
         "last_val_pred_start_err_true": float(last_val_pred_start_err_true),
         "last_val_pred_end_err_true": float(last_val_pred_end_err_true),
         "test_loss": float(avg_test_loss),
-        "test_mean_f1": float(test_macro_f1_active),
+        "test_mean_f1": float(test_macro_f1),
         "test_mean_iou": float(test_mean_iou),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
-        "test_iou_per_class": [float(x) for x in test_iou_per_class],
         "test_temporal_iou_detection_agnostic": float(test_temporal_iou_agnostic),
         "test_mask_iou_detection_agnostic": float(test_mask_iou_agnostic),
         "test_interval_iou": float(avg_test_interval_iou),
@@ -1529,7 +1549,6 @@ def train_one_event_detection_fold(
         "fold_elapsed_seconds": fold_elapsed_sec,
     }
     fold_summary.update(test_metrics)
-    fold_summary[f"test_F1@{match_iou_threshold:.2f}"] = float(test_f1)
 
     # Save fold summary
     summary_path = reports_dir / "fold_summary.json"
@@ -1539,8 +1558,7 @@ def train_one_event_detection_fold(
     print(f"Fold summary saved to {summary_path}")
     print(
         f"Fold {fold_id} complete | Best Epoch: {best_epoch + 1} | "
-        f"Test Macro-F1(active): {test_macro_f1_active:.4f} | "
-        f"Test F1(match criterion): {test_f1:.4f} | "
+        f"Test Macro-F1: {test_macro_f1:.4f} | "
         f"Test mAP: {test_metrics.get('mAP', 0.0):.4f} | "
         f"Test mask_iou: {avg_test_mask_iou:.4f} | "
         f"Test interval_iou: {avg_test_interval_iou:.4f} | "

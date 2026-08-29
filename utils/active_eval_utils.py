@@ -88,9 +88,6 @@ def evaluate_multistation_checkpoint(
 ) -> tuple[
     list[float],
     float,
-    list[float],
-    float,
-    list[float],
     float,
     float,
     np.ndarray,
@@ -104,19 +101,14 @@ def evaluate_multistation_checkpoint(
     )
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
-    active_event_ids, active_class_indices = active_event_ids_from_label_ids(
-        ds.label_ids
-    )
+    active_event_ids, _ = active_event_ids_from_label_ids(ds.label_ids)
 
     model.eval()
     with torch.inference_mode():
         (
             f1_per_class,
             mean_f1,
-            iou_per_class,
             mean_iou,
-            iou_all_classes,
-            mean_iou_all,
             eval_loss,
             cm,
         ) = compute_event_f1_iou_multistation(
@@ -131,10 +123,6 @@ def evaluate_multistation_checkpoint(
             epoch=None,
         )
 
-    if len(active_class_indices) > 0:
-        mean_f1 = float(np.mean([f1_per_class[i] for i in active_class_indices]))
-        mean_iou = float(np.mean([iou_per_class[i] for i in active_class_indices]))
-
     n_samples = int(len(ds))
     del ds, loader
     cleanup_gpu_cache()
@@ -142,10 +130,7 @@ def evaluate_multistation_checkpoint(
     return (
         [float(x) for x in f1_per_class],
         float(mean_f1),
-        [float(x) for x in iou_per_class],
         float(mean_iou),
-        [float(x) for x in iou_all_classes],
-        float(mean_iou_all),
         float(eval_loss),
         cm,
         n_samples,
@@ -167,7 +152,7 @@ def evaluate_unet_checkpoint(
     len_window: int,
     im_size: int,
     event_class_map: dict[float, str] | None = None,
-) -> tuple[list[float], float, list[float], float, float, np.ndarray, int, list[int]]:
+) -> tuple[list[float], float, float, float, np.ndarray, int, list[int]]:
     ds = UNetPatchDataset(
         test_npz_path,
         scramble_stations=scramble_stations,
@@ -175,9 +160,7 @@ def evaluate_unet_checkpoint(
     )
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
-    active_event_ids, active_class_indices = active_event_ids_from_label_ids(
-        ds.label_ids
-    )
+    active_event_ids, _ = active_event_ids_from_label_ids(ds.label_ids)
 
     model.eval()
     total_loss = 0.0
@@ -212,20 +195,31 @@ def evaluate_unet_checkpoint(
     )
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
     f1_scores = [float(x) for x in f1_scores]
-    mean_f1 = float(np.mean(f1_scores)) if len(f1_scores) > 0 else 0.0
+    support = np.sum(cm, axis=1)
+    active_mask = support > 0
+    mean_f1 = (
+        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
+        if np.any(active_mask)
+        else 0.0
+    )
 
-    iou_per_class = []
-    for class_idx in range(len(class_names)):
-        tp = float(cm[class_idx, class_idx])
-        fp = float(cm[:, class_idx].sum() - tp)
-        fn = float(cm[class_idx, :].sum() - tp)
-        denom = tp + fp + fn
-        iou_per_class.append(float(tp / denom) if denom > 0 else 0.0)
-    mean_iou = float(np.mean(iou_per_class)) if len(iou_per_class) > 0 else 0.0
+    # Class-agnostic event-vs-background IoU over temporal masks.
+    event_inter = 0
+    event_union = 0
+    with torch.inference_mode():
+        for xb, y_onehot, _ in loader:
+            xb = xb.to(device)
+            y_onehot = y_onehot.to(device)
+            out = model(xb)
+            pred_idx = torch.argmax(out, dim=1)
+            true_idx = torch.argmax(y_onehot, dim=1)
+            pred_event = pred_idx > 0
+            true_event = true_idx > 0
+            event_inter += int(torch.logical_and(pred_event, true_event).sum().item())
+            event_union += int(torch.logical_or(pred_event, true_event).sum().item())
+            del xb, y_onehot, out
 
-    if len(active_class_indices) > 0:
-        mean_f1 = float(np.mean([f1_scores[i] for i in active_class_indices]))
-        mean_iou = float(np.mean([iou_per_class[i] for i in active_class_indices]))
+    mean_iou = float(event_inter / event_union) if event_union > 0 else 0.0
 
     n_samples = int(len(ds))
     del ds, loader
@@ -234,7 +228,6 @@ def evaluate_unet_checkpoint(
     return (
         [float(x) for x in f1_scores],
         float(mean_f1),
-        [float(x) for x in iou_per_class],
         float(mean_iou),
         float(mean_loss),
         cm,
@@ -254,9 +247,6 @@ def evaluate_event_detection_checkpoint(
 ) -> tuple[
     list[float],
     float,
-    list[float],
-    float,
-    list[float],
     float,
     float,
     np.ndarray,
@@ -271,9 +261,7 @@ def evaluate_event_detection_checkpoint(
     )
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
-    active_event_ids, active_class_indices = active_event_ids_from_label_ids(
-        ds.label_ids
-    )
+    active_event_ids, _ = active_event_ids_from_label_ids(ds.label_ids)
 
     loss_weights = _resolve_event_detection_loss_weights(model_spec=model_spec, config={})
     eval_matching = _resolve_event_detection_eval_matching(model_spec=model_spec, config={})
@@ -293,7 +281,6 @@ def evaluate_event_detection_checkpoint(
     }
     all_targets = []
     n_batches = 0
-    test_metric_mask_iou = 0.0
 
     with torch.inference_mode():
         for xb, y_onehot, _ in loader:
@@ -304,7 +291,6 @@ def evaluate_event_detection_checkpoint(
 
             loss_dict = loss_fn(predictions, targets)
             test_loss += float(loss_dict["loss_total"].item())
-            test_metric_mask_iou += float(loss_dict.get("metric_mask_iou", 0.0).item())
             n_batches += 1
 
             for key in all_predictions:
@@ -313,7 +299,6 @@ def evaluate_event_detection_checkpoint(
             del xb, y_onehot, predictions, targets, loss_dict
 
     avg_test_loss = float(test_loss / n_batches) if n_batches > 0 else float("inf")
-    avg_test_mask_iou = float(test_metric_mask_iou / n_batches) if n_batches > 0 else 0.0
 
     for key in all_predictions:
         all_predictions[key] = np.concatenate(all_predictions[key], axis=0)
@@ -338,15 +323,14 @@ def evaluate_event_detection_checkpoint(
         float(detection_summary["per_class_f1"].get(class_id, 0.0))
         for class_id in range(1, 6)
     ]
-    iou_per_class = [float(temporal_iou_agnostic)] * 5
 
     per_class_stats = detection_summary["per_class"]
-    active_class_ids = [
+    active_event_class_ids = [
         class_id
         for class_id in range(1, 6)
         if int(per_class_stats[class_id]["target_count"]) > 0
     ]
-    if len(active_class_ids) == 0:
+    if len(active_event_class_ids) == 0:
         raise RuntimeError(
             "No active event classes found in event-detection evaluation target set."
         )
@@ -354,7 +338,7 @@ def evaluate_event_detection_checkpoint(
         np.mean(
             [
                 float(detection_summary["per_class_f1"].get(class_id, 0.0))
-                for class_id in active_class_ids
+                for class_id in active_event_class_ids
             ]
         )
     )
@@ -371,10 +355,7 @@ def evaluate_event_detection_checkpoint(
     return (
         [float(x) for x in f1_per_class],
         float(mean_f1),
-        [float(x) for x in iou_per_class],
         float(mean_iou),
-        [float("nan")] * 6,
-        float("nan"),
         float(avg_test_loss),
         cm,
         n_samples,

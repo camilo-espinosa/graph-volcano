@@ -32,7 +32,7 @@ from utils.fold_io_utils import load_fold_summary
 from utils.metrics_report_utils import compute_per_class_summary
 
 FOLDS = range(1, 6)
-CLASS_NAMES = ["VT", "LP", "TR", "AV", "IC"]
+CLASS_NAMES = ["BG", "VT", "LP", "TR", "AV", "IC"]
 RESULTS_ROOT = PROJECT_ROOT / "results"
 EXPERIMENTS_ROOT = RESULTS_ROOT / "experiments"
 DEFAULT_EXPERIMENT_ROOT = EXPERIMENTS_ROOT / "complete_experiment"
@@ -76,17 +76,9 @@ def write_ablation_aggregate(
     val_f1_values = [float(x["best_val_mean_f1"]) for x in fold_summaries]
     test_f1_values = [float(x["test_mean_f1"]) for x in fold_summaries]
     test_iou_values = [float(x["test_mean_iou"]) for x in fold_summaries]
-    test_iou_all_values = [
-        float(x["test_mean_iou_all"])
-        for x in fold_summaries
-        if "test_mean_iou_all" in x and x["test_mean_iou_all"] is not None
-    ]
     best_epoch_values = [int(x["best_epoch"]) for x in fold_summaries]
     test_f1_per_class_values = [
         [float(v) for v in x["test_f1_per_class"]] for x in fold_summaries
-    ]
-    test_iou_per_class_values = [
-        [float(v) for v in x["test_iou_per_class"]] for x in fold_summaries
     ]
 
     for row in test_f1_per_class_values:
@@ -94,18 +86,8 @@ def write_ablation_aggregate(
             raise ValueError(
                 f"Invalid test_f1_per_class length for '{ablation_name}': expected {len(CLASS_NAMES)}, got {len(row)}"
             )
-    for row in test_iou_per_class_values:
-        if len(row) != len(CLASS_NAMES):
-            raise ValueError(
-                f"Invalid test_iou_per_class length for '{ablation_name}': expected {len(CLASS_NAMES)}, got {len(row)}"
-            )
-
     test_f1_per_class_summary = compute_per_class_summary(
         test_f1_per_class_values,
-        CLASS_NAMES,
-    )
-    test_iou_per_class_summary = compute_per_class_summary(
-        test_iou_per_class_values,
         CLASS_NAMES,
     )
 
@@ -117,10 +99,7 @@ def write_ablation_aggregate(
         "test_mean_f1": compute_summary(test_f1_values),
         "test_mean_iou": compute_summary(test_iou_values),
         "test_f1_per_class": test_f1_per_class_summary,
-        "test_iou_per_class": test_iou_per_class_summary,
     }
-    if len(test_iou_all_values) > 0:
-        ablation_summary["test_mean_iou_all"] = compute_summary(test_iou_all_values)
 
     with (aggregate_dir / "cv5fold_summary.json").open("w", encoding="utf-8") as f:
         json.dump(ablation_summary, f, indent=2)
@@ -166,19 +145,12 @@ def write_ablation_aggregate(
     )
 
     per_class_f1_row = {"ablation": ablation_name}
-    per_class_iou_row = {"ablation": ablation_name}
     for class_name in CLASS_NAMES:
         per_class_f1_row[f"{class_name}_mean"] = float(
             test_f1_per_class_summary[class_name]["mean"]
         )
         per_class_f1_row[f"{class_name}_std"] = float(
             test_f1_per_class_summary[class_name]["std"]
-        )
-        per_class_iou_row[f"{class_name}_mean"] = float(
-            test_iou_per_class_summary[class_name]["mean"]
-        )
-        per_class_iou_row[f"{class_name}_std"] = float(
-            test_iou_per_class_summary[class_name]["std"]
         )
 
     pd.DataFrame([per_class_f1_row]).to_csv(
@@ -188,14 +160,6 @@ def write_ablation_aggregate(
         sep=";",
         decimal=",",
     )
-    pd.DataFrame([per_class_iou_row]).to_csv(
-        aggregate_dir / "cv5fold_summary_per_class_iou.csv",
-        index=False,
-        encoding="utf-8-sig",
-        sep=";",
-        decimal=",",
-    )
-
     leaderboard_row = {
         "ablation": ablation_name,
         "best_epoch_mean": float(ablation_summary["best_epoch"]["mean"]),
@@ -209,13 +173,6 @@ def write_ablation_aggregate(
         "test_mean_iou_mean": float(ablation_summary["test_mean_iou"]["mean"]),
         "test_mean_iou_std": float(ablation_summary["test_mean_iou"]["std"]),
     }
-    if "test_mean_iou_all" in ablation_summary:
-        leaderboard_row["test_mean_iou_all_mean"] = float(
-            ablation_summary["test_mean_iou_all"]["mean"]
-        )
-        leaderboard_row["test_mean_iou_all_std"] = float(
-            ablation_summary["test_mean_iou_all"]["std"]
-        )
 
     for class_name in CLASS_NAMES:
         leaderboard_row[f"test_f1_{class_name}_mean"] = float(
@@ -223,12 +180,6 @@ def write_ablation_aggregate(
         )
         leaderboard_row[f"test_f1_{class_name}_std"] = float(
             test_f1_per_class_summary[class_name]["std"]
-        )
-        leaderboard_row[f"test_iou_{class_name}_mean"] = float(
-            test_iou_per_class_summary[class_name]["mean"]
-        )
-        leaderboard_row[f"test_iou_{class_name}_std"] = float(
-            test_iou_per_class_summary[class_name]["std"]
         )
 
     return leaderboard_row
@@ -281,23 +232,6 @@ def write_global_comparisons(
     )[per_class_f1_cols].copy()
     per_class_f1_df.to_csv(
         comparisons_dir / "ablation_mean_f1_per_class.csv",
-        index=False,
-        encoding="utf-8-sig",
-        sep=";",
-        decimal=",",
-    )
-
-    per_class_iou_cols = ["ablation"]
-    for class_name in CLASS_NAMES:
-        per_class_iou_cols.extend(
-            [f"test_iou_{class_name}_mean", f"test_iou_{class_name}_std"]
-        )
-    per_class_iou_df = leaderboard_df.sort_values(
-        by="test_mean_iou_mean",
-        ascending=False,
-    )[per_class_iou_cols].copy()
-    per_class_iou_df.to_csv(
-        comparisons_dir / "ablation_mean_iou_per_class.csv",
         index=False,
         encoding="utf-8-sig",
         sep=";",
