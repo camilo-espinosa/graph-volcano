@@ -26,10 +26,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.train_utils import compute_summary
-from utils.script_common import resolve_project_path
-from utils.fold_io_utils import load_fold_summary
-from utils.metrics_report_utils import compute_per_class_summary
+from utils.evaluation.metrics_core import summarize_scalar_values
+from utils.core.paths import resolve_project_path
+from utils.core.io import load_fold_summary
+from utils.reports.aggregate import compute_per_class_summary
 
 FOLDS = range(1, 6)
 CLASS_NAMES = ["BG", "VT", "LP", "TR", "AV", "IC"]
@@ -73,9 +73,48 @@ def write_ablation_aggregate(
         decimal=",",
     )
 
+    def _metric_value(row: dict, canonical: str, legacy: str) -> float:
+        if canonical in row:
+            return float(row[canonical])
+        if legacy in row:
+            return float(row[legacy])
+        raise KeyError(
+            f"Missing metric keys '{canonical}' and '{legacy}' in fold summary."
+        )
+
+    def _require_keys(row: dict, keys: tuple[str, ...], fold_id: int) -> None:
+        missing = [key for key in keys if key not in row]
+        if missing:
+            raise KeyError(
+                f"Fold summary for ablation='{ablation_name}' fold={fold_id:02d} "
+                f"is missing required keys: {missing}."
+            )
+
+    for row in fold_summaries:
+        fold_id = int(row.get("fold", -1))
+        _require_keys(
+            row,
+            (
+                "fold",
+                "best_epoch",
+                "best_val_mean_f1",
+                "test_f1_per_class",
+            ),
+            fold_id,
+        )
+
     val_f1_values = [float(x["best_val_mean_f1"]) for x in fold_summaries]
-    test_f1_values = [float(x["test_mean_f1"]) for x in fold_summaries]
-    test_iou_values = [float(x["test_mean_iou"]) for x in fold_summaries]
+    macro_f1_values = [
+        _metric_value(x, "macro_f1_6c", "test_mean_f1") for x in fold_summaries
+    ]
+    event_f1_agnostic_values = [
+        _metric_value(x, "event_f1_agnostic", "test_event_f1_agnostic")
+        for x in fold_summaries
+    ]
+    event_iou_values = [
+        _metric_value(x, "event_iou_active_only", "test_mean_iou")
+        for x in fold_summaries
+    ]
     best_epoch_values = [int(x["best_epoch"]) for x in fold_summaries]
     test_f1_per_class_values = [
         [float(v) for v in x["test_f1_per_class"]] for x in fold_summaries
@@ -94,10 +133,11 @@ def write_ablation_aggregate(
     ablation_summary = {
         "ablation": ablation_name,
         "n_folds": len(fold_summaries),
-        "best_epoch": compute_summary(best_epoch_values),
-        "val_mean_f1": compute_summary(val_f1_values),
-        "test_mean_f1": compute_summary(test_f1_values),
-        "test_mean_iou": compute_summary(test_iou_values),
+        "best_epoch": summarize_scalar_values(best_epoch_values),
+        "val_mean_f1": summarize_scalar_values(val_f1_values),
+        "macro_f1_6c": summarize_scalar_values(macro_f1_values),
+        "event_f1_agnostic": summarize_scalar_values(event_f1_agnostic_values),
+        "event_iou_active_only": summarize_scalar_values(event_iou_values),
         "test_f1_per_class": test_f1_per_class_summary,
     }
 
@@ -168,10 +208,16 @@ def write_ablation_aggregate(
         "best_epoch_max": float(ablation_summary["best_epoch"]["max"]),
         "val_mean_f1_mean": float(ablation_summary["val_mean_f1"]["mean"]),
         "val_mean_f1_std": float(ablation_summary["val_mean_f1"]["std"]),
-        "test_mean_f1_mean": float(ablation_summary["test_mean_f1"]["mean"]),
-        "test_mean_f1_std": float(ablation_summary["test_mean_f1"]["std"]),
-        "test_mean_iou_mean": float(ablation_summary["test_mean_iou"]["mean"]),
-        "test_mean_iou_std": float(ablation_summary["test_mean_iou"]["std"]),
+        "macro_f1_6c_mean": float(ablation_summary["macro_f1_6c"]["mean"]),
+        "macro_f1_6c_std": float(ablation_summary["macro_f1_6c"]["std"]),
+        "event_f1_agnostic_mean": float(ablation_summary["event_f1_agnostic"]["mean"]),
+        "event_f1_agnostic_std": float(ablation_summary["event_f1_agnostic"]["std"]),
+        "event_iou_active_only_mean": float(
+            ablation_summary["event_iou_active_only"]["mean"]
+        ),
+        "event_iou_active_only_std": float(
+            ablation_summary["event_iou_active_only"]["std"]
+        ),
     }
 
     for class_name in CLASS_NAMES:
@@ -192,7 +238,7 @@ def write_global_comparisons(
     comparisons_dir.mkdir(parents=True, exist_ok=True)
 
     leaderboard_df = pd.DataFrame(leaderboard_rows)
-    leaderboard_df = leaderboard_df.sort_values(by="test_mean_f1_mean", ascending=False)
+    leaderboard_df = leaderboard_df.sort_values(by="macro_f1_6c_mean", ascending=False)
     leaderboard_df.to_csv(
         comparisons_dir / "ablation_leaderboard.csv",
         index=False,
@@ -201,9 +247,9 @@ def write_global_comparisons(
         decimal=",",
     )
 
-    rank_f1_df = leaderboard_df[["ablation", "test_mean_f1_mean", "test_mean_f1_std"]]
+    rank_f1_df = leaderboard_df[["ablation", "macro_f1_6c_mean", "macro_f1_6c_std"]]
     rank_f1_df.to_csv(
-        comparisons_dir / "ablation_rank_by_mean_f1.csv",
+        comparisons_dir / "ablation_rank_by_macro_f1_6c.csv",
         index=False,
         encoding="utf-8-sig",
         sep=";",
@@ -211,10 +257,21 @@ def write_global_comparisons(
     )
 
     rank_iou_df = leaderboard_df[
-        ["ablation", "test_mean_iou_mean", "test_mean_iou_std"]
-    ].sort_values(by="test_mean_iou_mean", ascending=False)
+        ["ablation", "event_iou_active_only_mean", "event_iou_active_only_std"]
+    ].sort_values(by="event_iou_active_only_mean", ascending=False)
     rank_iou_df.to_csv(
-        comparisons_dir / "ablation_rank_by_mean_iou.csv",
+        comparisons_dir / "ablation_rank_by_event_iou_active_only.csv",
+        index=False,
+        encoding="utf-8-sig",
+        sep=";",
+        decimal=",",
+    )
+
+    rank_event_f1_df = leaderboard_df[
+        ["ablation", "event_f1_agnostic_mean", "event_f1_agnostic_std"]
+    ].sort_values(by="event_f1_agnostic_mean", ascending=False)
+    rank_event_f1_df.to_csv(
+        comparisons_dir / "ablation_rank_by_event_f1_agnostic.csv",
         index=False,
         encoding="utf-8-sig",
         sep=";",
@@ -227,7 +284,7 @@ def write_global_comparisons(
             [f"test_f1_{class_name}_mean", f"test_f1_{class_name}_std"]
         )
     per_class_f1_df = leaderboard_df.sort_values(
-        by="test_mean_f1_mean",
+        by="macro_f1_6c_mean",
         ascending=False,
     )[per_class_f1_cols].copy()
     per_class_f1_df.to_csv(

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Hungarian matcher for matching predicted queries to ground-truth events.
 
 Uses linear_sum_assignment (Hungarian algorithm) to find optimal matching
@@ -14,8 +14,8 @@ import torch
 import torch.nn as nn
 from scipy.optimize import linear_sum_assignment
 
-from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.event_targets import EventInterval
+from utils.evaluation.detection_prediction_utils import normalize_prediction_intervals
+from utils.evaluation.event_targets import EventInterval
 
 
 class MatchResult(NamedTuple):
@@ -286,3 +286,4 @@ class HungarianMatcher(nn.Module):
             unmatched_target=unmatched_target,
             total_cost=total_cost,
         )
+

@@ -1,4 +1,4 @@
-"""Progressive finetuning workflow for the target volcano splits."""
+﻿"""Progressive finetuning workflow for the target volcano splits."""
 
 from __future__ import annotations
 
@@ -21,27 +21,31 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.active_eval_utils import load_checkpoint_into_model
-from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.event_detection_loss import EventDetectionLoss
-from utils.event_detection_metrics import EventDetectionMetrics
-from utils.event_targets import batch_segmentation_to_events
-from utils.fold_io_utils import append_row_csv
-from utils.finetune_utils import apply_finetune_protocol
-from utils.model_registry import MODEL_SPECS, build_model_from_spec, get_model_spec
-from utils.script_common import parse_csv_selection, resolve_project_path
-from utils.trainer_detection import (
-    _class_agnostic_detection_iou_from_rows,
+from utils.evaluation.eval_runtime import load_checkpoint_into_model
+from utils.evaluation.detection_prediction_utils import normalize_prediction_intervals
+from utils.evaluation.metrics_core import (
+    detection_temporal_iou_active_only_from_rows,
+    event_f1_agnostic_from_confusion_matrix,
+    macro_f1_6c_from_confusion_matrix,
+)
+from utils.training.losses_detection import EventDetectionLoss
+from utils.evaluation.event_detection_metrics import EventDetectionMetrics
+from utils.evaluation.event_targets import batch_segmentation_to_events
+from utils.core.io import append_row_csv
+from utils.finetuning.protocols import apply_finetune_protocol
+from utils.core.registry import MODEL_SPECS, build_model_from_spec, get_model_spec
+from utils.core.paths import parse_csv_selection, resolve_project_path
+from utils.training.trainer_detection import (
     build_validation_event_predictions_dataframe,
 )
-from utils.train_utils import (
+from utils.training.train_utils import (
     BalancedBatchSampler,
     MultiStation1DDataset,
     UNetPatchDataset,
     cleanup_gpu_cache,
     combined_dice_ce_loss,
     combined_dice_ce_loss_2d,
-    compute_event_f1_iou_graphsage,
+    compute_event_f1_iou_multistation,
     compute_summary,
     evaluate_unet_model,
     save_confusion_matrix_image,
@@ -130,7 +134,7 @@ def parse_args() -> argparse.Namespace:
         "--protocol",
         type=str,
         default=DEFAULT_PROTOCOL,
-        help="Finetuning protocol key from utils.finetune_utils.",
+        help="Finetuning protocol key from utils.finetuning.protocols.",
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--early-stop-patience", type=int, default=15)
@@ -208,7 +212,7 @@ def discover_source_models(experiment_root: Path) -> list[str]:
     unknown = sorted([name for name in model_dirs if name not in MODEL_SPECS])
     if len(unknown) > 0:
         raise KeyError(
-            "Found model folders that are not present in utils.model_registry.MODEL_SPECS: "
+            "Found model folders that are not present in utils.core.registry.MODEL_SPECS: "
             f"{unknown}. Please register them or remove/rename those folders."
         )
 
@@ -244,6 +248,43 @@ def _order_targets_cau_first(targets: list[str]) -> list[str]:
     if "CAU" in ordered:
         ordered = ["CAU"] + [t for t in ordered if t != "CAU"]
     return ordered
+
+
+def _resolve_run_batch_size(
+    args_batch_size: int | None,
+    source_info: dict,
+    model_key: str,
+) -> int:
+    if args_batch_size is not None:
+        return int(args_batch_size)
+    if "batch_size" in source_info:
+        return int(source_info["batch_size"])
+    return int(MODEL_SPECS[model_key]["batch_size"])
+
+
+def _build_run_config(
+    *,
+    args: argparse.Namespace,
+    source_info: dict,
+    model_key: str,
+    subset_key: str,
+) -> dict[str, float | int | str]:
+    fixed_subset_lr = _fixed_lr_for_subset(subset_key)
+    return {
+        "protocol": str(args.protocol),
+        "epochs": int(args.epochs),
+        "early_stop_patience": int(args.early_stop_patience),
+        "lr": float(fixed_subset_lr),
+        "lr_final": float(args.lr_final),
+        "batch_size": int(
+            _resolve_run_batch_size(args.batch_size, source_info, model_key)
+        ),
+        "dice_weight": float(args.dice_weight),
+        "ce_weight": float(args.ce_weight),
+        "len_window": int(args.len_window),
+        "im_size": int(args.im_size),
+        "log_batches": int(max(0, args.log_batches)),
+    }
 
 
 def _load_completed_run_keys(csv_path: Path) -> set[tuple[str, str, int, str]]:
@@ -412,7 +453,9 @@ def _resolve_event_detection_loss_config(spec: dict, config: dict) -> dict[str, 
     return {}
 
 
-def _resolve_event_detection_eval_matching(spec: dict, config: dict) -> dict[str, float | str]:
+def _resolve_event_detection_eval_matching(
+    spec: dict, config: dict
+) -> dict[str, float | str]:
     resolved: dict[str, float | str] = {
         "match_iou_threshold": 0.3,
         "matching_strategy": "iou",
@@ -498,10 +541,12 @@ def _evaluate_event_detection_loader(
         if int(per_class_stats[class_id]["target_count"]) > 0
     ]
     if len(active_event_class_ids) == 0:
-        raise RuntimeError("No active event classes found in event-detection evaluation split.")
+        raise RuntimeError(
+            "No active event classes found in event-detection evaluation split."
+        )
 
     mean_f1 = float(
-        np.mean([float(per_class_f1.get(class_id, 0.0)) for class_id in active_event_class_ids])
+        macro_f1_6c_from_confusion_matrix(detection_summary["confusion_matrix"])
     )
     predictions_df = build_validation_event_predictions_dataframe(
         all_predictions,
@@ -510,7 +555,7 @@ def _evaluate_event_detection_loader(
         matching_strategy=str(matching_cfg["matching_strategy"]),
         overlap_recall_threshold=float(matching_cfg["overlap_recall_threshold"]),
     )
-    mean_iou, _ = _class_agnostic_detection_iou_from_rows(predictions_df)
+    mean_iou, _ = detection_temporal_iou_active_only_from_rows(predictions_df)
 
     f1_per_class = [float(per_class_f1.get(class_id, 0.0)) for class_id in range(1, 6)]
     avg_loss = float(val_loss / n_batches)
@@ -583,8 +628,12 @@ def _train_one_run(
     event_detection_metrics_fn: EventDetectionMetrics | None = None
     event_detection_matching_cfg: dict[str, float | str] | None = None
     if str(trainer_kind) == "event_detection":
-        event_detection_loss_weights = _resolve_event_detection_loss_weights(spec, config)
-        event_detection_matching_cfg = _resolve_event_detection_eval_matching(spec, config)
+        event_detection_loss_weights = _resolve_event_detection_loss_weights(
+            spec, config
+        )
+        event_detection_matching_cfg = _resolve_event_detection_eval_matching(
+            spec, config
+        )
         event_detection_loss_fn = EventDetectionLoss(
             num_classes=6,
             loss_weights=event_detection_loss_weights,
@@ -666,7 +715,9 @@ def _train_one_run(
             optimizer.zero_grad(set_to_none=True)
             if str(trainer_kind) == "event_detection":
                 if event_detection_loss_fn is None:
-                    raise RuntimeError("Event-detection loss function was not initialized.")
+                    raise RuntimeError(
+                        "Event-detection loss function was not initialized."
+                    )
                 out = model(xb)
                 targets = batch_segmentation_to_events(y_onehot, normalize=True)
                 loss_dict = event_detection_loss_fn(out, targets)
@@ -728,7 +779,7 @@ def _train_one_run(
                 val_mean_iou,
                 val_loss,
                 val_cm,
-            ) = compute_event_f1_iou_graphsage(
+            ) = compute_event_f1_iou_multistation(
                 model,
                 val_loader,
                 device,
@@ -790,7 +841,11 @@ def _train_one_run(
                 best_ckpt_out,
             )
             best_cm_out = cm_dir / f"val_cm_best_f1_epoch_{epoch:03d}.png"
-            cm_labels = EVENT_DETECTION_CM_CLASS_NAMES if str(trainer_kind) == "event_detection" else CLASS_NAMES
+            cm_labels = (
+                EVENT_DETECTION_CM_CLASS_NAMES
+                if str(trainer_kind) == "event_detection"
+                else CLASS_NAMES
+            )
             save_confusion_matrix_image(
                 cm=val_cm,
                 labels=cm_labels,
@@ -847,7 +902,11 @@ def _train_one_run(
         )
 
         if no_improve >= int(config["early_stop_patience"]):
-            criterion_msg = "val_mean_f1 or val_loss" if str(trainer_kind) == "event_detection" else "val_mean_f1"
+            criterion_msg = (
+                "val_mean_f1 or val_loss"
+                if str(trainer_kind) == "event_detection"
+                else "val_mean_f1"
+            )
             print(
                 "[EARLY-STOP] "
                 f"Stopping at epoch={epoch + 1:03d} after "
@@ -898,7 +957,7 @@ def _train_one_run(
             test_mean_iou,
             test_loss,
             test_cm,
-        ) = compute_event_f1_iou_graphsage(
+        ) = compute_event_f1_iou_multistation(
             model,
             test_loader,
             device,
@@ -939,6 +998,13 @@ def _train_one_run(
         )
 
     elapsed = float(time.time() - run_start)
+    if int(test_cm.shape[0]) == 6:
+        macro_f1_6c = float(macro_f1_6c_from_confusion_matrix(test_cm))
+        event_f1_agnostic = float(event_f1_agnostic_from_confusion_matrix(test_cm))
+    else:
+        macro_f1_6c = float(test_mean_f1)
+        event_f1_agnostic = float(test_mean_f1)
+
     row = {
         "model_key": model_key,
         "target_volcano": target_volcano,
@@ -954,6 +1020,9 @@ def _train_one_run(
         "best_val_mean_f1": float(best_val_mean_f1),
         "test_loss": float(test_loss),
         "test_mean_f1": float(test_mean_f1),
+        "macro_f1_6c": float(macro_f1_6c),
+        "event_f1_agnostic": float(event_f1_agnostic),
+        "event_iou_active_only": float(test_mean_iou),
         "test_mean_iou": float(test_mean_iou),
         "test_map": float(test_map),
         "elapsed_seconds": elapsed,
@@ -967,7 +1036,11 @@ def _train_one_run(
     print(f"[SAVE] fold summary={reports_dir / 'fold_summary.json'}")
 
     test_cm_out = cm_dir / "test_cm_best_f1.png"
-    cm_labels = EVENT_DETECTION_CM_CLASS_NAMES if str(trainer_kind) == "event_detection" else CLASS_NAMES
+    cm_labels = (
+        EVENT_DETECTION_CM_CLASS_NAMES
+        if str(trainer_kind) == "event_detection"
+        else CLASS_NAMES
+    )
     save_confusion_matrix_image(
         cm=test_cm,
         labels=cm_labels,
@@ -979,7 +1052,9 @@ def _train_one_run(
         "[DONE] "
         f"model={model_key} target={target_volcano} fold={repeat_idx:02d} subset={subset_key} "
         f"best_epoch={int(best_epoch) + 1} best_val_mean_f1={float(best_val_mean_f1):.4f} "
-        f"test_mean_f1={float(test_mean_f1):.4f} test_mean_iou={float(test_mean_iou):.4f} "
+        f"macro_f1_6c={float(row['macro_f1_6c']):.4f} "
+        f"event_f1_agnostic={float(row['event_f1_agnostic']):.4f} "
+        f"event_iou_active_only={float(row['event_iou_active_only']):.4f} "
         f"test_loss={float(test_loss):.4f} elapsed={elapsed:.1f}s"
     )
 
@@ -1093,6 +1168,9 @@ def main() -> None:
         "best_val_loss",
         "best_val_mean_f1",
         "test_loss",
+        "macro_f1_6c",
+        "event_f1_agnostic",
+        "event_iou_active_only",
         "test_mean_f1",
         "test_mean_iou",
         "test_map",
@@ -1194,27 +1272,12 @@ def main() -> None:
                             continue
 
                     subset_dir = fold_dir / "subsets" / subset_key
-                    fixed_subset_lr = _fixed_lr_for_subset(subset_key)
-                    run_config = {
-                        "protocol": str(args.protocol),
-                        "epochs": int(args.epochs),
-                        "early_stop_patience": int(args.early_stop_patience),
-                        "lr": float(fixed_subset_lr),
-                        "lr_final": float(args.lr_final),
-                        "batch_size": int(
-                            args.batch_size
-                            or int(
-                                source_info.get(
-                                    "batch_size", MODEL_SPECS[model_key]["batch_size"]
-                                )
-                            )
-                        ),
-                        "dice_weight": float(args.dice_weight),
-                        "ce_weight": float(args.ce_weight),
-                        "len_window": int(args.len_window),
-                        "im_size": int(args.im_size),
-                        "log_batches": int(max(0, args.log_batches)),
-                    }
+                    run_config = _build_run_config(
+                        args=args,
+                        source_info=source_info,
+                        model_key=model_key,
+                        subset_key=subset_key,
+                    )
 
                     try:
                         row = _train_one_run(
@@ -1273,14 +1336,20 @@ def main() -> None:
             "subset_key": str(subset_key),
             "n_runs": int(len(grp)),
         }
-        for col in ["test_mean_f1", "test_mean_iou", "test_loss", "best_val_mean_f1"]:
+        for col in [
+            "macro_f1_6c",
+            "event_f1_agnostic",
+            "event_iou_active_only",
+            "test_loss",
+            "best_val_mean_f1",
+        ]:
             stats = compute_summary(grp[col].astype(float).tolist())
             row[f"{col}_mean"] = float(stats["mean"])
             row[f"{col}_std"] = float(stats["std"])
         summary_rows.append(row)
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
-        by=["target_volcano", "subset_key", "test_mean_f1_mean"],
+        by=["target_volcano", "subset_key", "macro_f1_6c_mean"],
         ascending=[True, True, False],
     )
     summary_df.to_csv(
@@ -1300,3 +1369,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

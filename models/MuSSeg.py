@@ -1,10 +1,10 @@
-import numpy as np
+﻿import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections.abc import Sequence
 
-from utils.station_info import get_crater_coords, get_station_coords
+from utils.data.station_metadata import get_crater_coords, get_station_coords
 
 
 class StationPairMessageBlock(nn.Module):
@@ -954,3 +954,4 @@ class MuSSeg(nn.Module):
         if logits:
             return x
         return self.softmax(x)
+

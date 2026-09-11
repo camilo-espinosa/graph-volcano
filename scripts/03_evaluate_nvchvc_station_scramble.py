@@ -1,4 +1,4 @@
-"""
+﻿"""
 Evaluate trained ablation checkpoints on the NVCHVC fold test sets with scrambled station ordering.
 
 This script mirrors the test-time evaluation used after script 02 training, but it
@@ -34,24 +34,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.fold_io_utils import (
+from utils.core.io import (
     append_row_csv,
     checkpoint_path_for_fold,
     load_completed_keys,
     load_training_fold_summary,
 )
-from utils.model_registry import MODEL_SPECS
-from utils.script_common import parse_csv_selection, resolve_project_path
-from utils.active_eval_utils import (
+from utils.core.registry import MODEL_SPECS
+from utils.core.paths import parse_csv_selection, resolve_project_path
+from utils.evaluation.eval_runtime import (
     evaluate_event_detection_checkpoint as evaluate_event_detection_checkpoint_on_test_fold,
     evaluate_multistation_checkpoint as evaluate_multistation_checkpoint_on_test_fold,
     evaluate_unet_checkpoint as evaluate_unet_checkpoint_on_test_fold,
     load_checkpoint_into_model,
     load_unet_shape_and_loss,
 )
-from utils.train_utils import (
+from utils.evaluation.metrics_core import (
+    event_f1_agnostic_from_confusion_matrix,
+    macro_f1_6c_from_confusion_matrix,
+    summarize_scalar_values,
+)
+from utils.training.train_utils import (
     cleanup_gpu_cache,
-    compute_summary,
     save_confusion_matrix_image,
 )
 
@@ -60,7 +64,6 @@ ALL_CLASS_NAMES = ["BG", "VT", "LP", "TR", "AV", "IC"]
 FOLDS = range(1, 6)
 LEN_WINDOW = 8192
 IM_SIZE = 256
-DEFAULT_SCRAMBLE_STATIONS = True
 
 RESULTS_ROOT = PROJECT_ROOT / "results"
 EXPERIMENTS_ROOT = RESULTS_ROOT / "experiments"
@@ -99,22 +102,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Evaluation batch size override. Default: model registry batch_size.",
-    )
-    parser.add_argument(
         "--models",
         type=str,
         default=None,
         help="Comma-separated model keys to evaluate. Default: discovered model folders.",
-    )
-    parser.add_argument(
-        "--ablations",
-        type=str,
-        default=None,
-        help="Backward-compatible alias for --models.",
     )
     parser.add_argument(
         "--allow-missing-models",
@@ -127,29 +118,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip missing fold checkpoints instead of failing.",
     )
     parser.add_argument(
-        "--save-confusion-matrices",
-        action="store_true",
-        help="Save confusion matrix image per evaluated model/fold.",
-    )
-    parser.add_argument(
-        "--scramble-stations",
-        dest="scramble_stations",
-        action="store_true",
-        help="Randomly permute station order per sample before evaluation.",
-    )
-    parser.add_argument(
-        "--no-scramble-stations",
-        dest="scramble_stations",
-        action="store_false",
-        help="Keep the original station order during evaluation.",
-    )
-    parser.add_argument(
         "--station-scramble-seed",
         type=int,
         default=42,
         help="Base seed used to build deterministic per-sample station permutations.",
     )
-    parser.set_defaults(scramble_stations=DEFAULT_SCRAMBLE_STATIONS)
     return parser.parse_args()
 
 
@@ -170,6 +143,15 @@ def write_aggregate_reports(out_dir: Path) -> None:
     summary_rows = []
     per_class_f1_rows = []
 
+    def _metric_column(df: pd.DataFrame, canonical: str, legacy: str) -> pd.Series:
+        if canonical in df.columns:
+            return df[canonical].astype(float)
+        if legacy in df.columns:
+            return df[legacy].astype(float)
+        raise KeyError(
+            f"Missing metric columns '{canonical}' and '{legacy}' in fold metrics CSV."
+        )
+
     def _normalize_model_key(value) -> str:
         if isinstance(value, tuple):
             if len(value) != 1:
@@ -183,9 +165,16 @@ def write_aggregate_reports(out_dir: Path) -> None:
     grouped = fold_df.groupby(["model_key"], sort=True)
     for model_key, grp in grouped:
         model_key = _normalize_model_key(model_key)
-        mean_f1_summary = compute_summary(grp["test_mean_f1"].astype(float).tolist())
-        mean_iou_summary = compute_summary(grp["test_mean_iou"].astype(float).tolist())
-        loss_summary = compute_summary(grp["test_loss"].astype(float).tolist())
+        macro_f1_summary = summarize_scalar_values(
+            _metric_column(grp, "macro_f1_6c", "test_mean_f1").tolist()
+        )
+        event_f1_agnostic_summary = summarize_scalar_values(
+            _metric_column(grp, "event_f1_agnostic", "test_event_f1_agnostic").tolist()
+        )
+        event_iou_summary = summarize_scalar_values(
+            _metric_column(grp, "event_iou_active_only", "test_mean_iou").tolist()
+        )
+        loss_summary = summarize_scalar_values(grp["test_loss"].astype(float).tolist())
 
         display_names = grp["model_display_name"].dropna().unique().tolist()
         display_name = (
@@ -195,10 +184,12 @@ def write_aggregate_reports(out_dir: Path) -> None:
             "model_key": model_key,
             "model_display_name": display_name,
             "n_folds": int(len(grp)),
-            "test_mean_f1_mean": float(mean_f1_summary["mean"]),
-            "test_mean_f1_std": float(mean_f1_summary["std"]),
-            "test_mean_iou_mean": float(mean_iou_summary["mean"]),
-            "test_mean_iou_std": float(mean_iou_summary["std"]),
+            "macro_f1_6c_mean": float(macro_f1_summary["mean"]),
+            "macro_f1_6c_std": float(macro_f1_summary["std"]),
+            "event_f1_agnostic_mean": float(event_f1_agnostic_summary["mean"]),
+            "event_f1_agnostic_std": float(event_f1_agnostic_summary["std"]),
+            "event_iou_active_only_mean": float(event_iou_summary["mean"]),
+            "event_iou_active_only_std": float(event_iou_summary["std"]),
             "test_loss_mean": float(loss_summary["mean"]),
             "test_loss_std": float(loss_summary["std"]),
         }
@@ -210,7 +201,7 @@ def write_aggregate_reports(out_dir: Path) -> None:
 
         for class_name in CLASS_NAMES:
             f1_col = f"test_f1_{class_name}"
-            f1_summary = compute_summary(grp[f1_col].astype(float).tolist())
+            f1_summary = summarize_scalar_values(grp[f1_col].astype(float).tolist())
 
             summary_row[f"{f1_col}_mean"] = float(f1_summary["mean"])
             summary_row[f"{f1_col}_std"] = float(f1_summary["std"])
@@ -222,7 +213,7 @@ def write_aggregate_reports(out_dir: Path) -> None:
         per_class_f1_rows.append(per_class_f1_row)
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
-        by=["test_mean_f1_mean"],
+        by=["macro_f1_6c_mean"],
         ascending=[False],
     )
     summary_df.to_csv(
@@ -243,15 +234,22 @@ def write_aggregate_reports(out_dir: Path) -> None:
 
     comparisons_dir = out_dir / "comparisons"
     comparisons_dir.mkdir(parents=True, exist_ok=True)
-    summary_df.sort_values(by="test_mean_f1_mean", ascending=False).to_csv(
-        comparisons_dir / "rank_by_mean_f1.csv",
+    summary_df.sort_values(by="macro_f1_6c_mean", ascending=False).to_csv(
+        comparisons_dir / "rank_by_macro_f1_6c.csv",
         index=False,
         encoding="utf-8-sig",
         sep=";",
         decimal=",",
     )
-    summary_df.sort_values(by="test_mean_iou_mean", ascending=False).to_csv(
-        comparisons_dir / "rank_by_mean_iou.csv",
+    summary_df.sort_values(by="event_iou_active_only_mean", ascending=False).to_csv(
+        comparisons_dir / "rank_by_event_iou_active_only.csv",
+        index=False,
+        encoding="utf-8-sig",
+        sep=";",
+        decimal=",",
+    )
+    summary_df.sort_values(by="event_f1_agnostic_mean", ascending=False).to_csv(
+        comparisons_dir / "rank_by_event_f1_agnostic.csv",
         index=False,
         encoding="utf-8-sig",
         sep=";",
@@ -280,9 +278,6 @@ def main() -> None:
     discovered_model_dirs = sorted(
         [p.name for p in ablations_root.iterdir() if p.is_dir()]
     )
-    if args.models is not None and args.ablations is not None:
-        raise ValueError("Use only one of --models or --ablations.")
-
     available_model_keys = [
         model_key for model_key in discovered_model_dirs if model_key in MODEL_SPECS
     ]
@@ -292,10 +287,9 @@ def main() -> None:
             "[WARN] Skipping model folders not present in registry: " f"{unknown_dirs}"
         )
 
-    raw_selection = args.models if args.models is not None else args.ablations
-    if raw_selection is not None:
+    if args.models is not None:
         selected_models = parse_csv_selection(
-            raw_selection,
+            args.models,
             available_model_keys,
             "model keys",
         )
@@ -322,15 +316,13 @@ def main() -> None:
         "data_root": str(data_root),
         "output_dir": str(out_dir),
         "device": str(device),
-        "batch_size_override": (
-            None if args.batch_size is None else int(args.batch_size)
-        ),
+        "batch_size_source": "model_registry",
         "selected_models": selected_models,
-        "scramble_stations": bool(args.scramble_stations),
+        "scramble_stations": True,
         "station_scramble_seed": int(args.station_scramble_seed),
         "allow_missing_models": bool(args.allow_missing_models),
         "allow_missing_folds": bool(args.allow_missing_folds),
-        "save_confusion_matrices": bool(args.save_confusion_matrices),
+        "save_confusion_matrices": True,
         "folds": [int(f) for f in FOLDS],
         "model_specs": {
             key: {
@@ -358,7 +350,7 @@ def main() -> None:
     print(f"Data root: {data_root}")
     print(f"Output dir: {out_dir}")
     print(f"Models ({len(selected_models)}): {selected_models}")
-    print(f"Scramble stations: {bool(args.scramble_stations)}")
+    print("Scramble stations: True")
     print(f"Device: {device}")
     print("=" * 80)
 
@@ -371,7 +363,11 @@ def main() -> None:
         "train_best_epoch",
         "train_best_val_mean_f1",
         "test_loss",
+        "macro_f1_6c",
+        "event_f1_agnostic",
+        "event_iou_active_only",
         "test_mean_f1",
+        "test_event_f1_agnostic",
         "test_mean_iou",
         "test_mAP",
         "n_active_classes",
@@ -419,11 +415,7 @@ def main() -> None:
                 raise FileNotFoundError(msg)
 
             test_npz_path = data_root / f"fold_{fold_id:02d}" / "test.npz"
-            batch_size = (
-                int(args.batch_size)
-                if args.batch_size is not None
-                else int(model_spec.get("batch_size", 16))
-            )
+            batch_size = int(model_spec["batch_size"])
             train_fold_summary = load_training_fold_summary(model_root, fold_id)
             train_best_epoch = (
                 int(train_fold_summary["best_epoch"])
@@ -475,7 +467,7 @@ def main() -> None:
                     test_npz_path=test_npz_path,
                     batch_size=batch_size,
                     device=device,
-                    scramble_stations=bool(args.scramble_stations),
+                    scramble_stations=True,
                     station_scramble_seed=int(args.station_scramble_seed),
                 )
                 test_map = float("nan")
@@ -513,7 +505,7 @@ def main() -> None:
                     device=device,
                     dice_weight=float(dice_weight),
                     ce_weight=float(ce_weight),
-                    scramble_stations=bool(args.scramble_stations),
+                    scramble_stations=True,
                     station_scramble_seed=int(args.station_scramble_seed),
                     class_names=CLASS_NAMES,
                     len_window=LEN_WINDOW,
@@ -542,7 +534,7 @@ def main() -> None:
                     test_npz_path=test_npz_path,
                     batch_size=batch_size,
                     device=device,
-                    scramble_stations=bool(args.scramble_stations),
+                    scramble_stations=True,
                     station_scramble_seed=int(args.station_scramble_seed),
                     model_spec=model_spec,
                 )
@@ -550,6 +542,14 @@ def main() -> None:
                 raise ValueError(
                     f"Unsupported trainer kind '{trainer_kind}' for key '{model_key}'"
                 )
+
+            if int(cm.shape[0]) == int(len(ALL_CLASS_NAMES)):
+                macro_f1_6c = float(macro_f1_6c_from_confusion_matrix(cm))
+                event_f1_agnostic = float(event_f1_agnostic_from_confusion_matrix(cm))
+            else:
+                # Legacy event-only confusion matrices do not include BG.
+                macro_f1_6c = float(mean_f1)
+                event_f1_agnostic = float(mean_f1)
 
             row = {
                 "model_key": model_key,
@@ -560,7 +560,11 @@ def main() -> None:
                 "train_best_epoch": train_best_epoch,
                 "train_best_val_mean_f1": train_best_val_mean_f1,
                 "test_loss": float(eval_loss),
+                "macro_f1_6c": float(macro_f1_6c),
+                "event_f1_agnostic": float(event_f1_agnostic),
+                "event_iou_active_only": float(mean_iou),
                 "test_mean_f1": float(mean_f1),
+                "test_event_f1_agnostic": float(event_f1_agnostic),
                 "test_mean_iou": float(mean_iou),
                 "test_mAP": float(test_map),
                 "n_active_classes": int(len(active_event_ids)),
@@ -584,24 +588,23 @@ def main() -> None:
             completed_keys.add(eval_key)
             newly_completed += 1
 
-            if args.save_confusion_matrices:
-                cm_dir = (
-                    out_dir / "confusion_matrices" / model_key / f"fold_{fold_id:02d}"
-                )
-                cm_dir.mkdir(parents=True, exist_ok=True)
-                cm_labels = (
-                    ALL_CLASS_NAMES
-                    if cm.shape[0] == len(ALL_CLASS_NAMES)
-                    else CLASS_NAMES
-                )
-                save_confusion_matrix_image(
-                    cm=cm,
-                    labels=cm_labels,
-                    out_path=cm_dir / "test_confusion_matrix.png",
-                    title=f"Scrambled station order | {model_key} | fold {fold_id:02d}",
-                )
+            cm_dir = out_dir / "confusion_matrices" / model_key / f"fold_{fold_id:02d}"
+            cm_dir.mkdir(parents=True, exist_ok=True)
+            cm_labels = (
+                ALL_CLASS_NAMES if cm.shape[0] == len(ALL_CLASS_NAMES) else CLASS_NAMES
+            )
+            save_confusion_matrix_image(
+                cm=cm,
+                labels=cm_labels,
+                out_path=cm_dir / "test_confusion_matrix.png",
+                title=f"Scrambled station order | {model_key} | fold {fold_id:02d}",
+            )
 
-            print(f"  fold={fold_id:02d} mean_f1={mean_f1:.4f} mean_iou={mean_iou:.4f}")
+            print(
+                f"  fold={fold_id:02d} macro_f1_6c={float(row['macro_f1_6c']):.4f} "
+                f"event_f1_agnostic={float(row['event_f1_agnostic']):.4f} "
+                f"event_iou_active_only={float(row['event_iou_active_only']):.4f}"
+            )
 
             del cm
             del model
@@ -635,3 +638,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

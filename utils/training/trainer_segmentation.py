@@ -1,4 +1,4 @@
-"""
+﻿"""
 Unified trainer for 2D and 1D segmentation models (UNet, PhaseNet, MuSSeg).
 
 This module provides a single training entry point that handles both 2D and 1D
@@ -16,11 +16,12 @@ import torch
 from torch import optim
 from torch.utils.data import DataLoader
 
-from utils.train_utils import (
+from utils.evaluation.metrics_core import macro_f1_6c_from_confusion_matrix
+from utils.training.train_utils import (
     combined_dice_ce_loss,
     combined_dice_ce_loss_2d,
     save_confusion_matrix_image,
-    compute_event_f1_iou_graphsage,
+    compute_event_f1_iou_multistation,
     save_event_plot_payloads,
     evaluate_unet_model,
     collect_unet_misclassified_event_plots,
@@ -28,13 +29,14 @@ from utils.train_utils import (
     MultiStation1DDataset,
     UNetPatchDataset,
     BalancedBatchSampler,
+    event_vs_bg_f1_from_confusion_matrix,
 )
-from utils.model_registry import get_model_spec
+from utils.core.registry import get_model_spec
 
 
 def train_one_segmentation_fold(
     trainer_kind: str,
-    model_key_or_kwargs: str | dict,
+    model_key: str,
     fold_id: int,
     fold_data_dir: Path,
     fold_out_dir: Path,
@@ -46,7 +48,7 @@ def train_one_segmentation_fold(
 
     Args:
         trainer_kind: "2d" for UNet, "1d" for PhaseNet/MuSSeg
-        model_key_or_kwargs: Model registry key (str) or model_kwargs dict
+        model_key: Model registry key (str)
         fold_id: Fold index
         fold_data_dir: Path to fold data (contains train_aug.npz, val.npz, test.npz)
         fold_out_dir: Output directory for checkpoints, reports, plots
@@ -109,33 +111,9 @@ def train_one_segmentation_fold(
         raise ValueError(f"Unknown trainer_kind: {trainer_kind}")
 
     # Load model
-    if isinstance(model_key_or_kwargs, str):
-        spec = get_model_spec(model_key_or_kwargs)
-        model = spec["model_cls"](**spec["model_kwargs"]).to(device)
-        display_name = spec.get("display_name", model_key_or_kwargs)
-    else:
-        # model_kwargs dict provided
-        model_kwargs_copy = model_key_or_kwargs.copy()
-        model_class = model_kwargs_copy.pop("_model_cls", None)
-        if model_class is None:
-            from utils.data_utils import UNet_GraphSAGE, UNet_MPNN
-
-            model_class_name = model_kwargs_copy.pop("_model_class", "UNet_GraphSAGE")
-            model_class = (
-                UNet_MPNN if model_class_name == "UNet_MPNN" else UNet_GraphSAGE
-            )
-        else:
-            model_class_name = getattr(model_class, "__name__", str(model_class))
-
-        if model_class_name.startswith("PhaseNet"):
-            model_kwargs_copy.setdefault("in_channels", 8)
-            model_kwargs_copy.setdefault("classes", 6)
-        else:
-            model_kwargs_copy.setdefault("in_channels", 1)
-            model_kwargs_copy.setdefault("out_channels", 6)
-
-        model = model_class(**model_kwargs_copy).to(device)
-        display_name = model_class_name
+    spec = get_model_spec(model_key)
+    model = spec["model_cls"](**spec["model_kwargs"]).to(device)
+    display_name = spec.get("display_name", model_key)
 
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -241,7 +219,7 @@ def train_one_segmentation_fold(
                 val_loss,
                 event_plot_payloads,
                 val_cm,
-            ) = compute_event_f1_iou_graphsage(
+            ) = compute_event_f1_iou_multistation(
                 model,
                 val_loader,
                 device,
@@ -255,6 +233,8 @@ def train_one_segmentation_fold(
             )
             val_loss_dice = None
             val_loss_ce = None
+
+        val_event_f1_agnostic = event_vs_bg_f1_from_confusion_matrix(val_cm)
 
         is_best_val_mean_f1_epoch = float(val_mean_f1) > float(best_val_mean_f1)
 
@@ -353,6 +333,7 @@ def train_one_segmentation_fold(
                 float(val_f1_per_class[4]),
                 float(val_f1_per_class[5]),
                 float(val_mean_f1),
+                float(val_event_f1_agnostic),
                 float(val_mean_iou),
             ]
         )
@@ -371,6 +352,7 @@ def train_one_segmentation_fold(
                 "AV_f1",
                 "IC_f1",
                 "mean_f1",
+                "event_f1_agnostic",
                 "mean_iou",
             ],
         )
@@ -384,7 +366,8 @@ def train_one_segmentation_fold(
 
         print(
             f"EPOCH {epoch:03d} | train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"mean_f1={val_mean_f1:.4f} mean_iou={val_mean_iou:.4f} "
+            f"mean_f1={val_mean_f1:.4f} event_f1_agnostic={val_event_f1_agnostic:.4f} "
+            f"mean_iou={val_mean_iou:.4f} "
             f"best_epoch={best_epoch if best_epoch >= 0 else 'NA'} "
             f"no_improve={epochs_without_improvement}/{config['early_stop_patience']} "
             f"saved_best_plots={saved_plot_count}"
@@ -435,7 +418,7 @@ def train_one_segmentation_fold(
             test_mean_iou,
             test_loss,
             test_cm,
-        ) = compute_event_f1_iou_graphsage(
+        ) = compute_event_f1_iou_multistation(
             model,
             test_loader,
             device,
@@ -456,6 +439,11 @@ def train_one_segmentation_fold(
     )
 
     fold_elapsed_sec = float(time.time() - fold_start)
+    test_event_f1_agnostic = event_vs_bg_f1_from_confusion_matrix(test_cm)
+    if int(test_cm.shape[0]) == 6:
+        macro_f1_6c = float(macro_f1_6c_from_confusion_matrix(test_cm))
+    else:
+        macro_f1_6c = float(test_mean_f1)
 
     fold_summary = {
         "trainer_kind": trainer_kind,
@@ -468,7 +456,11 @@ def train_one_segmentation_fold(
         "best_val_loss": float(best_val_loss),
         "best_val_mean_f1": float(best_val_mean_f1),
         "test_loss": float(test_loss),
+        "macro_f1_6c": float(macro_f1_6c),
+        "event_f1_agnostic": float(test_event_f1_agnostic),
+        "event_iou_active_only": float(test_mean_iou),
         "test_mean_f1": float(test_mean_f1),
+        "test_event_f1_agnostic": float(test_event_f1_agnostic),
         "test_mean_iou": float(test_mean_iou),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
         "fold_elapsed_seconds": fold_elapsed_sec,
@@ -483,3 +475,4 @@ def train_one_segmentation_fold(
     cleanup_gpu_cache()
 
     return fold_summary
+

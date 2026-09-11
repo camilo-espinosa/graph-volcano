@@ -1,4 +1,4 @@
-"""
+﻿"""
 Event detection metrics: mAP@tIoU, F1@tIoU, per-class metrics.
 
 Evaluates predictions against ground truth using temporal IoU thresholds.
@@ -11,8 +11,8 @@ from typing import Dict, Tuple
 import numpy as np
 from scipy.special import softmax
 
-from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.event_targets import EventInterval
+from utils.evaluation.detection_prediction_utils import normalize_prediction_intervals
+from utils.evaluation.event_targets import EventInterval
 
 
 def temporal_iou(
@@ -754,3 +754,4 @@ class EventDetectionMetrics:
             confidence_threshold=confidence_threshold,
         )
         return dict(summary["per_class_iou"])
+

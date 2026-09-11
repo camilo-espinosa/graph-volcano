@@ -1,4 +1,4 @@
-"""
+﻿"""
 5-fold ablation runner for the active model registry.
 
 How to run:
@@ -43,15 +43,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.train_utils import (
+from utils.training.train_utils import (
     cleanup_gpu_cache,
     ensure_fold_data_exists,
 )
-from utils.trainer_segmentation import train_one_segmentation_fold
-from utils.trainer_detection import train_one_event_detection_fold
-from utils.fold_io_utils import is_training_fold_complete
-from utils.model_registry import EVENT_DETECTION_EVAL_DEFAULTS, MODEL_SPECS, get_model_spec
-from utils.script_common import resolve_project_path
+from utils.training.trainer_segmentation import train_one_segmentation_fold
+from utils.training.trainer_detection import train_one_event_detection_fold
+from utils.core.io import is_training_fold_complete
+from utils.core.registry import (
+    EVENT_DETECTION_EVAL_DEFAULTS,
+    MODEL_SPECS,
+    get_model_spec,
+)
+from utils.core.paths import resolve_project_path
 
 # Default run set. Override with --models if needed.
 MODEL_KEYS_TO_RUN = list(MODEL_SPECS.keys())
@@ -77,7 +81,9 @@ CONFIG = {
     "event_confidence_threshold": 0.5,
     "match_iou_threshold": float(EVENT_DETECTION_EVAL_DEFAULTS["match_iou_threshold"]),
     "matching_strategy": str(EVENT_DETECTION_EVAL_DEFAULTS["matching_strategy"]),
-    "overlap_recall_threshold": float(EVENT_DETECTION_EVAL_DEFAULTS["overlap_recall_threshold"]),
+    "overlap_recall_threshold": float(
+        EVENT_DETECTION_EVAL_DEFAULTS["overlap_recall_threshold"]
+    ),
 }
 FOLDS = range(1, 6)
 
@@ -94,6 +100,11 @@ EXPERIMENTS_ROOT = RESULTS_ROOT / "experiments"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 EXPERIMENT_NAME = f"EXP_{TIMESTAMP}_{CONFIG['volcano']}_5fold"
 EXPERIMENT_ROOT = EXPERIMENTS_ROOT / EXPERIMENT_NAME
+CANONICAL_METRIC_KEYS = (
+    "macro_f1_6c",
+    "event_f1_agnostic",
+    "event_iou_active_only",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -258,6 +269,40 @@ def summarize_manifest_classes(manifest_path: Path) -> dict[str, object]:
     }
 
 
+def validate_fold_summary_metric_contract(
+    *,
+    fold_summary: dict,
+    model_key: str,
+    fold_id: int,
+) -> None:
+    missing = [key for key in CANONICAL_METRIC_KEYS if key not in fold_summary]
+    if missing:
+        raise ValueError(
+            "Fold summary is missing canonical metric keys "
+            f"for model={model_key} fold={fold_id:02d}: {missing}."
+        )
+
+
+def load_and_validate_existing_fold_summary(
+    *,
+    model_root: Path,
+    model_key: str,
+    fold_id: int,
+) -> None:
+    summary_path = model_root / f"fold_{fold_id:02d}" / "reports" / "fold_summary.json"
+    if not summary_path.exists():
+        raise FileNotFoundError(
+            f"Completed fold summary not found for model={model_key} fold={fold_id:02d}: {summary_path}"
+        )
+    with summary_path.open("r", encoding="utf-8") as f:
+        fold_summary = json.load(f)
+    validate_fold_summary_metric_contract(
+        fold_summary=fold_summary,
+        model_key=model_key,
+        fold_id=fold_id,
+    )
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -410,6 +455,11 @@ def main() -> None:
                 model_root,
                 fold_id,
             ):
+                load_and_validate_existing_fold_summary(
+                    model_root=model_root,
+                    model_key=model_key,
+                    fold_id=fold_id,
+                )
                 completed_folds.append(fold_id)
             else:
                 remaining_folds.append(fold_id)
@@ -443,9 +493,9 @@ def main() -> None:
 
             if trainer_kind in ("2d", "1d"):
                 # Unified segmentation trainer for both 2D and 1D models
-                train_one_segmentation_fold(
+                fold_summary = train_one_segmentation_fold(
                     trainer_kind=trainer_kind,
-                    model_key_or_kwargs=model_key,
+                    model_key=model_key,
                     fold_id=fold_id,
                     fold_data_dir=fold_data_dir,
                     fold_out_dir=fold_out_dir,
@@ -454,8 +504,8 @@ def main() -> None:
                 )
             elif trainer_kind == "event_detection":
                 # Event detection trainer for MuSSED
-                train_one_event_detection_fold(
-                    model_key_or_kwargs=model_key,
+                fold_summary = train_one_event_detection_fold(
+                    model_key=model_key,
                     fold_id=fold_id,
                     fold_data_dir=fold_data_dir,
                     fold_out_dir=fold_out_dir,
@@ -467,6 +517,12 @@ def main() -> None:
                     f"Unknown trainer_kind '{trainer_kind}' for model {model_key}. "
                     f"Expected one of: '2d', '1d', 'event_detection'."
                 )
+
+            validate_fold_summary_metric_contract(
+                fold_summary=fold_summary,
+                model_key=model_key,
+                fold_id=fold_id,
+            )
         cleanup_gpu_cache()
 
     latest_dir = RESULTS_ROOT / "latest"
@@ -491,3 +547,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -25,12 +25,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.data_utils import (
+from utils.data.data_utils import (
     _stratified_train_val_split_from_train,
     collect_volcano_samples,
     save_manifest,
 )
-from utils.finetune_utils import split_indices_stratified
+from utils.finetuning.protocols import split_indices_stratified
 
 DATA_ROOT = PROJECT_ROOT / "data"
 PREPARED_ROOT = DATA_ROOT / "prepared_data"

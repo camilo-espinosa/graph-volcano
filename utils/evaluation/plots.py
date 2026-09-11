@@ -1,4 +1,4 @@
-"""
+﻿"""
 Validation plot generation for segmentation and event detection models.
 
 Handles:
@@ -20,9 +20,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 
-from utils import data_utils
-from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.event_detection_metrics import is_interval_match
+from utils.data import data_utils
+from utils.evaluation.detection_prediction_utils import normalize_prediction_intervals
+from utils.evaluation.event_detection_metrics import is_interval_match
 
 
 def plot_segmentation_validation(
@@ -247,7 +247,7 @@ def plot_event_validation(
         try_attach_temporal_attention_hook(model) if need_temporal_attention else None
     )
 
-    from utils.event_targets import segmentation_to_events
+    from utils.evaluation.event_targets import segmentation_to_events
 
     def _as_query_vector(values: np.ndarray, name: str) -> np.ndarray:
         array = np.asarray(values)
@@ -652,7 +652,7 @@ def plot_event_sample(
         temporal_attn = np.clip(temporal_attn.astype(float), 0, 1)
 
     # Extract ground truth events
-    from utils.event_targets import segmentation_to_events
+    from utils.evaluation.event_targets import segmentation_to_events
 
     events_gt = segmentation_to_events(torch.from_numpy(y_true), normalize=True)
 
@@ -1250,3 +1250,4 @@ class TemporalAttentionHook(AttentionHook):
         if collapse_stations:
             return attn_by_station.mean(axis=1)
         return attn_by_station
+

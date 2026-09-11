@@ -1,4 +1,4 @@
-"""Instantiate all registry models and print/save parameter counts.
+﻿"""Instantiate all registry models and print/save parameter counts.
 
 Usage:
     python scripts/ablation_param_counts.py
@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.model_registry import build_model_from_spec, list_model_specs
+from utils.core.registry import build_model_from_spec, list_model_specs
 
 RESULTS_ROOT = PROJECT_ROOT / "results"
 EXPERIMENTS_ROOT = RESULTS_ROOT / "experiments"
@@ -85,3 +85,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

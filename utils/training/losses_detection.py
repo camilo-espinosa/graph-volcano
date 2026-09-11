@@ -1,4 +1,4 @@
-"""
+﻿"""
 Losses for query-based temporal event detection with dense localization supervision.
 
 Combines:
@@ -16,9 +16,9 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 
-from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.event_targets import EventInterval
-from utils.hungarian_matcher_1d import HungarianMatcher
+from utils.evaluation.detection_prediction_utils import normalize_prediction_intervals
+from utils.evaluation.event_targets import EventInterval
+from utils.training.hungarian_matcher_1d import HungarianMatcher
 
 
 class EventDetectionLoss(torch.nn.Module):
@@ -385,3 +385,4 @@ class EventDetectionLoss(torch.nn.Module):
         focal_loss = -alpha * focal_weight * log_probs_per_sample
         focal_loss[targets == 0] *= weight_unmatched
         return focal_loss.mean()
+

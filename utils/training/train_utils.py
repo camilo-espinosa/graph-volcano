@@ -1,4 +1,4 @@
-import gc
+﻿import gc
 import json
 from pathlib import Path
 import time
@@ -17,8 +17,13 @@ from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.data import BatchSampler, Dataset
 
-from . import data_utils
-from utils.model_registry import get_model_spec
+from utils.data import data_utils
+from utils.evaluation.metrics_core import (
+    event_f1_agnostic_from_confusion_matrix,
+    event_iou_active_only_from_class_indices,
+    summarize_scalar_values,
+)
+from utils.core.registry import get_model_spec
 
 
 def dice_loss_2d(
@@ -38,13 +43,13 @@ def dice_loss_2d(
     return 1 - ((2.0 * intersection + smooth) / (a_sum + b_sum + smooth))
 
 
-def dice_loss_graphsage(
+def dice_loss_multistation(
     pred: torch.Tensor,
     target: torch.Tensor,
     smooth: float = 1e-6,
     class_weights: Optional[torch.Tensor] = None,
 ):
-    """Dice loss for GraphSAGE outputs [B,C,T] or [B,S,C,T]."""
+    """Dice loss for multi-station outputs [B,C,T] or [B,S,C,T]."""
     _ = smooth, class_weights
     if pred.ndim == 4:
         pred = torch.softmax(pred, dim=2)
@@ -65,12 +70,12 @@ def dice_loss_graphsage(
     return 1 - ((2.0 * intersection + 1.0) / (a_sum + b_sum + 1.0))
 
 
-def classwise_dice_graphsage(
+def classwise_dice_multistation(
     pred: torch.Tensor,
     target: torch.Tensor,
     smooth: float = 1e-6,
 ) -> torch.Tensor:
-    """Class-wise Dice scores for GraphSAGE outputs [B,C,T] or [B,S,C,T]."""
+    """Class-wise Dice scores for multi-station outputs [B,C,T] or [B,S,C,T]."""
     if pred.ndim == 4:
         pred = torch.softmax(pred, dim=2).mean(dim=1)
     elif pred.ndim == 3:
@@ -101,7 +106,7 @@ def combined_dice_ce_loss(
     ce_weight: float = 0.3,
 ):
     """Weighted sum of class-wise Dice loss and CrossEntropy."""
-    dice = classwise_dice_graphsage(pred, target_onehot, smooth=1e-6)
+    dice = classwise_dice_multistation(pred, target_onehot, smooth=1e-6)
     target_idx = torch.argmax(target_onehot, dim=1).long()
     ce = torch.nn.functional.cross_entropy(
         pred,
@@ -754,9 +759,13 @@ def compute_event_f1_iou(model, loader, device):
     cm = cm_eval(model, loader, device)
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
     support = np.sum(cm, axis=1)
-    active_mask = support > 0
+    active_mask = support[1:] > 0
     mean_f1 = (
-        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
+        float(
+            np.mean(
+                [f1_scores[i + 1] for i, active in enumerate(active_mask) if active]
+            )
+        )
         if np.any(active_mask)
         else 0.0
     )
@@ -1066,14 +1075,17 @@ def compute_event_f1_iou_multistation(
             # Class-agnostic event-vs-background IoU over time.
             true_max_idx = torch.argmax(y_onehot, dim=1)  # [B, T]
             pred_max_idx = torch.argmax(probs, dim=1)  # [B, T]
-            true_max_idx_np = true_max_idx.detach().cpu().numpy().reshape(-1)
-            pred_max_idx_np = pred_max_idx.detach().cpu().numpy().reshape(-1)
-            pred_event_mask = pred_max_idx_np > 0
-            true_event_mask = true_max_idx_np > 0
-            event_intersection += int(
-                np.logical_and(pred_event_mask, true_event_mask).sum()
+            mean_iou_batch = event_iou_active_only_from_class_indices(
+                pred_class_idx=pred_max_idx.detach().cpu().numpy(),
+                true_class_idx=true_max_idx.detach().cpu().numpy(),
             )
-            event_union += int(np.logical_or(pred_event_mask, true_event_mask).sum())
+            active_windows_batch = np.logical_or(
+                pred_max_idx.detach().cpu().numpy() > 0,
+                true_max_idx.detach().cpu().numpy() > 0,
+            ).any(axis=1)
+            n_active_batch = int(np.sum(active_windows_batch))
+            event_intersection += float(mean_iou_batch) * float(n_active_batch)
+            event_union += int(n_active_batch)
 
             del (
                 xb,
@@ -1096,9 +1108,13 @@ def compute_event_f1_iou_multistation(
     cm = confusion_matrix(true_label, pred_label, labels=list(event_classes))
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
     support = np.sum(cm, axis=1)
-    active_mask = support > 0
+    active_mask = support[1:] > 0
     mean_f1 = (
-        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
+        float(
+            np.mean(
+                [f1_scores[i + 1] for i, active in enumerate(active_mask) if active]
+            )
+        )
         if np.any(active_mask)
         else 0.0
     )
@@ -1120,35 +1136,6 @@ def compute_event_f1_iou_multistation(
     if return_cm:
         return (*result, cm)
     return result
-
-
-def compute_event_f1_iou_graphsage(
-    model,
-    loader,
-    device,
-    descriptor_names: Optional[list[str]] = None,
-    return_cm: bool = False,
-    return_val_loss: bool = False,
-    return_event_plot_payloads: bool = False,
-    save_event_plots: bool = False,
-    event_plots_dir: Path = None,
-    max_event_plots: int = 30,
-    epoch: int = None,
-):
-    """Backward-compatible alias for the legacy helper name."""
-    return compute_event_f1_iou_multistation(
-        model,
-        loader,
-        device,
-        descriptor_names=descriptor_names,
-        return_cm=return_cm,
-        return_val_loss=return_val_loss,
-        return_event_plot_payloads=return_event_plot_payloads,
-        save_event_plots=save_event_plots,
-        event_plots_dir=event_plots_dir,
-        max_event_plots=max_event_plots,
-        epoch=epoch,
-    )
 
 
 class UNetPatchDataset(Dataset):
@@ -1493,6 +1480,11 @@ def f1_score_from_confusion_matrix(confusion_matrix: np.ndarray):
     return f1_scores, recall_scores, precision_scores
 
 
+def event_vs_bg_f1_from_confusion_matrix(confusion_matrix: np.ndarray) -> float:
+    """Backward-compatible wrapper around shared event-vs-BG F1."""
+    return event_f1_agnostic_from_confusion_matrix(confusion_matrix)
+
+
 def event_iou_like_score(pred_idx_window: np.ndarray, true_idx_window: np.ndarray):
     pred_event = (pred_idx_window != 0).astype(np.int32)
     true_event = (true_idx_window != 0).astype(np.int32)
@@ -1510,15 +1502,8 @@ def cleanup_gpu_cache() -> None:
 
 
 def compute_summary(values: list[float]) -> dict[str, float]:
-    arr = np.asarray(values, dtype=np.float64)
-    if arr.size == 0:
-        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
-    return {
-        "mean": float(arr.mean()),
-        "std": float(arr.std(ddof=0)),
-        "min": float(arr.min()),
-        "max": float(arr.max()),
-    }
+    """Backward-compatible wrapper around shared scalar summaries."""
+    return summarize_scalar_values(values)
 
 
 def ensure_fold_data_exists(fold_data_dir: Path) -> None:
@@ -1530,341 +1515,6 @@ def ensure_fold_data_exists(fold_data_dir: Path) -> None:
     missing = [str(p) for p in needed if not p.exists()]
     if missing:
         raise FileNotFoundError("Missing fold manifest files:\n" + "\n".join(missing))
-
-
-def train_one_ablation_fold(
-    ablation_name: str,
-    model_kwargs: dict,
-    fold_id: int,
-    fold_data_dir: Path,
-    fold_out_dir: Path,
-    device: torch.device,
-    config: dict,
-) -> dict:
-
-    checkpoints_dir = fold_out_dir / "checkpoints"
-    reports_dir = fold_out_dir / "reports"
-    cm_dir = fold_out_dir / "confusion_matrices"
-    val_plot_dir = fold_out_dir / "validation_event_plots"
-
-    for p in (checkpoints_dir, reports_dir, cm_dir, val_plot_dir):
-        p.mkdir(parents=True, exist_ok=True)
-
-    train_ds = MultiStation1DDataset(
-        fold_data_dir / "train_aug.npz",
-    )
-    val_ds = MultiStation1DDataset(
-        fold_data_dir / "val.npz",
-    )
-    test_ds = MultiStation1DDataset(
-        fold_data_dir / "test.npz",
-    )
-
-    balanced_batch_sampler = BalancedBatchSampler(
-        train_ds.label_ids, batch_size=config["batch_size"]
-    )
-    train_loader = DataLoader(train_ds, batch_sampler=balanced_batch_sampler)
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config["batch_size"],
-        shuffle=False,
-    )
-    test_loader = DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False)
-
-    # Extract the model class if one is provided by the registry.
-    model_kwargs_copy = model_kwargs.copy()
-    model_class = model_kwargs_copy.pop("_model_cls", None)
-    if model_class is None:
-        model_class_name = model_kwargs_copy.pop("_model_class", "UNet_GraphSAGE")
-        model_class = UNet_MPNN if model_class_name == "UNet_MPNN" else UNet_GraphSAGE
-    else:
-        model_class_name = getattr(model_class, "__name__", str(model_class))
-
-    if model_class_name.startswith("PhaseNet"):
-        model_kwargs_copy.setdefault("in_channels", 8)
-        model_kwargs_copy.setdefault("classes", 6)
-    else:
-        model_kwargs_copy.setdefault("in_channels", 1)
-        model_kwargs_copy.setdefault("out_channels", 6)
-
-    model = model_class(**model_kwargs_copy).to(device)
-
-    model_name = (
-        f"{model_class_name}_{ablation_name}_{config['volcano']}_fold_{fold_id:02d}"
-    )
-
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, int(config["epochs"] / 2)),
-        eta_min=config["lr_final"],
-    )
-
-    best_train_loss = float("inf")
-    best_val_loss = float("inf")
-    best_val_mean_f1 = float("-inf")
-    best_epoch = -1
-    epochs_without_improvement = 0
-
-    metrics_rows = []
-    fold_start = time.time()
-
-    print("=" * 80)
-    print(
-        f"Training {ablation_name} | fold={fold_id:02d} | "
-        f"train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}"
-    )
-    print(f"Output folder: {fold_out_dir}")
-    print("=" * 80)
-
-    for epoch in range(config["epochs"]):
-        model.train()
-        train_loss = 0.0
-
-        for batch_idx, batch in enumerate(train_loader):
-            xb = batch[0].to(device)
-            y_onehot = batch[1].to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-            out = model(xb)
-            loss, dice_component, ce_component = combined_dice_ce_loss(
-                out,
-                y_onehot,
-                class_weights=None,
-                dice_weight=config["dice_weight"],
-                ce_weight=config["ce_weight"],
-            )
-            loss.backward()
-            optimizer.step()
-            train_loss += float(loss.item())
-
-            if batch_idx % 100 == 0:
-                print(
-                    f"  Epoch {epoch:03d} batch {batch_idx:04d}/{len(train_loader)} | "
-                    f"loss={loss.item():.4f} dice={dice_component.item():.4f} ce={ce_component.item():.4f}"
-                )
-
-            del (
-                xb,
-                y_onehot,
-                out,
-                loss,
-                dice_component,
-                ce_component,
-            )
-
-        scheduler.step()
-
-        (
-            f1_per_class,
-            mean_f1,
-            mean_iou,
-            val_loss,
-            event_plot_payloads,
-            cm,
-        ) = compute_event_f1_iou_graphsage(
-            model,
-            val_loader,
-            device,
-            return_cm=True,
-            return_val_loss=True,
-            return_event_plot_payloads=True,
-            save_event_plots=False,
-            event_plots_dir=val_plot_dir,
-            max_event_plots=config["val_plot_events"],
-            epoch=epoch,
-        )
-
-        is_best_val_mean_f1_epoch = float(mean_f1) > float(best_val_mean_f1)
-        if is_best_val_mean_f1_epoch:
-            saved_plot_count = save_event_plot_payloads(
-                event_plot_payloads,
-                val_plot_dir,
-                epoch=epoch,
-            )
-            save_confusion_matrix_image(
-                cm=cm,
-                labels=["VT", "LP", "TR", "AV", "IC"],
-                out_path=cm_dir / "confusion_matrix_val_best_f1.png",
-                title=f"Validation Confusion Matrix - {model_name} - best_f1",
-            )
-            best_val_mean_f1 = float(mean_f1)
-            best_epoch = int(epoch)
-            epochs_without_improvement = 0
-
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": float(val_loss),
-                    "f1score": float(mean_f1),
-                },
-                checkpoints_dir / "best_f1.pt",
-            )
-        else:
-            saved_plot_count = 0
-            epochs_without_improvement += 1
-
-        if float(train_loss) < float(best_train_loss):
-            best_train_loss = float(train_loss)
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": float(val_loss),
-                    "f1score": float(mean_f1),
-                },
-                checkpoints_dir / "best_train_loss.pt",
-            )
-
-        if float(val_loss) < float(best_val_loss):
-            best_val_loss = float(val_loss)
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": float(val_loss),
-                    "f1score": float(mean_f1),
-                },
-                checkpoints_dir / "best_val_loss.pt",
-            )
-
-        if config["save_confusion_matrix_each_epoch"]:
-            cm_labels = ["VT", "LP", "TR", "AV", "IC"]
-            cm_path = cm_dir / f"confusion_matrix_epoch_{epoch:03d}.png"
-            save_confusion_matrix_image(
-                cm=cm,
-                labels=cm_labels,
-                out_path=cm_path,
-                title=f"Confusion Matrix - {model_name} - Epoch {epoch}",
-            )
-
-        current_lr = float(optimizer.param_groups[0]["lr"])
-        metrics_rows.append(
-            [
-                current_lr,
-                epoch,
-                float(train_loss),
-                float(val_loss),
-                float(f1_per_class[0]),
-                float(f1_per_class[1]),
-                float(f1_per_class[2]),
-                float(f1_per_class[3]),
-                float(f1_per_class[4]),
-                float(mean_f1),
-                float(mean_iou),
-            ]
-        )
-
-        metrics_df = pd.DataFrame(
-            metrics_rows,
-            columns=[
-                "lr",
-                "epoch",
-                "train_loss",
-                "val_loss",
-                "VT_f1",
-                "LP_f1",
-                "TR_f1",
-                "AV_f1",
-                "IC_f1",
-                "mean_f1",
-                "mean_iou",
-            ],
-        )
-        metrics_df.to_csv(
-            reports_dir / "training_metrics.csv",
-            index=False,
-            encoding="utf-8-sig",
-            sep=";",
-            decimal=",",
-        )
-
-        print(
-            f"EPOCH {epoch:03d} | train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"mean_f1={mean_f1:.4f} mean_iou={mean_iou:.4f} "
-            f"best_epoch={best_epoch if best_epoch >= 0 else 'NA'} "
-            f"no_improve={epochs_without_improvement}/{config['early_stop_patience']} "
-            f"saved_best_plots={saved_plot_count}"
-        )
-
-        del event_plot_payloads, cm
-        cleanup_gpu_cache()
-
-        if epochs_without_improvement >= int(config["early_stop_patience"]):
-            print(
-                f"Early stopping at epoch {epoch:03d}: no mean_f1 improvement for "
-                f"{config['early_stop_patience']} consecutive epochs."
-            )
-            break
-
-    best_f1_ckpt = checkpoints_dir / "best_f1.pt"
-    if not best_f1_ckpt.exists():
-        raise RuntimeError(
-            f"best_f1 checkpoint not found for fold output: {best_f1_ckpt}"
-        )
-
-    ckpt = torch.load(best_f1_ckpt, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-
-    (
-        test_f1_per_class,
-        test_mean_f1,
-        test_mean_iou,
-        test_loss,
-        test_cm,
-    ) = compute_event_f1_iou_graphsage(
-        model,
-        test_loader,
-        device,
-        return_cm=True,
-        return_val_loss=True,
-        return_event_plot_payloads=False,
-        save_event_plots=False,
-        max_event_plots=0,
-        epoch=None,
-    )
-
-    test_cm_path = cm_dir / "confusion_matrix_test_best_f1.png"
-    save_confusion_matrix_image(
-        cm=test_cm,
-        labels=["VT", "LP", "TR", "AV", "IC"],
-        out_path=test_cm_path,
-        title=f"Test Confusion Matrix - {model_name} - best_f1",
-    )
-
-    fold_elapsed_sec = float(time.time() - fold_start)
-
-    fold_summary = {
-        "ablation": ablation_name,
-        "fold": int(fold_id),
-        "n_train": int(len(train_ds)),
-        "n_val": int(len(val_ds)),
-        "n_test": int(len(test_ds)),
-        "best_epoch": int(best_epoch),
-        "best_train_loss": float(best_train_loss),
-        "best_val_loss": float(best_val_loss),
-        "best_val_mean_f1": float(best_val_mean_f1),
-        "test_loss": float(test_loss),
-        "test_mean_f1": float(test_mean_f1),
-        "test_mean_iou": float(test_mean_iou),
-        "test_f1_per_class": [float(x) for x in test_f1_per_class],
-        "fold_elapsed_seconds": fold_elapsed_sec,
-    }
-
-    with (reports_dir / "fold_summary.json").open("w", encoding="utf-8") as f:
-        json.dump(fold_summary, f, indent=2)
-
-    del train_ds, val_ds, test_ds
-    del train_loader, val_loader, test_loader
-    del optimizer, scheduler, model, ckpt
-    cleanup_gpu_cache()
-
-    return fold_summary
 
 
 def evaluate_unet_model(
@@ -1898,14 +1548,16 @@ def evaluate_unet_model(
 
             pred_idx = torch.argmax(out, dim=1)
             true_idx = torch.argmax(y_onehot, dim=1)
-            pred_event_mask = pred_idx > 0
-            true_event_mask = true_idx > 0
-            event_intersection += int(
-                torch.logical_and(pred_event_mask, true_event_mask).sum().item()
+            mean_iou_batch = event_iou_active_only_from_class_indices(
+                pred_class_idx=pred_idx.detach().cpu().numpy(),
+                true_class_idx=true_idx.detach().cpu().numpy(),
             )
-            event_union += int(
-                torch.logical_or(pred_event_mask, true_event_mask).sum().item()
+            active_windows_batch = torch.logical_or(pred_idx > 0, true_idx > 0).any(
+                dim=1
             )
+            n_active_batch = int(active_windows_batch.sum().item())
+            event_intersection += float(mean_iou_batch) * float(n_active_batch)
+            event_union += int(n_active_batch)
             del xb, y_onehot, out, loss
 
     mean_loss = float(total_loss / n_batches) if n_batches > 0 else 0.0
@@ -1923,9 +1575,13 @@ def evaluate_unet_model(
     f1_scores, _, _ = f1_score_from_confusion_matrix(cm)
     f1_scores = [float(x) for x in f1_scores]
     support = np.sum(cm, axis=1)
-    active_mask = support > 0
+    active_mask = support[1:] > 0
     mean_f1 = (
-        float(np.mean([f1_scores[i] for i, active in enumerate(active_mask) if active]))
+        float(
+            np.mean(
+                [f1_scores[i + 1] for i, active in enumerate(active_mask) if active]
+            )
+        )
         if np.any(active_mask)
         else 0.0
     )
@@ -2036,6 +1692,7 @@ def train_one_unet_fold(
             im_size=im_size,
             config=config,
         )
+        val_event_f1_agnostic = event_vs_bg_f1_from_confusion_matrix(val_cm)
 
         is_best_val_mean_f1_epoch = float(val_mean_f1) > float(best_val_mean_f1)
         if is_best_val_mean_f1_epoch:
@@ -2125,6 +1782,7 @@ def train_one_unet_fold(
                 float(val_f1_per_class[3]),
                 float(val_f1_per_class[4]),
                 float(val_mean_f1),
+                float(val_event_f1_agnostic),
                 float(val_mean_iou),
             ]
         )
@@ -2141,6 +1799,7 @@ def train_one_unet_fold(
                 "AV_f1",
                 "IC_f1",
                 "mean_f1",
+                "event_f1_agnostic",
                 "mean_iou",
             ],
         )
@@ -2154,7 +1813,8 @@ def train_one_unet_fold(
 
         print(
             f"EPOCH {epoch:03d} | train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"mean_f1={val_mean_f1:.4f} mean_iou={val_mean_iou:.4f} "
+            f"mean_f1={val_mean_f1:.4f} event_f1_agnostic={val_event_f1_agnostic:.4f} "
+            f"mean_iou={val_mean_iou:.4f} "
             f"best_epoch={best_epoch if best_epoch >= 0 else 'NA'} "
             f"no_improve={epochs_without_improvement}/{config['early_stop_patience']} "
             f"saved_best_plots={saved_plot_count}"
@@ -2194,6 +1854,7 @@ def train_one_unet_fold(
         im_size=im_size,
         config=config,
     )
+    test_event_f1_agnostic = event_vs_bg_f1_from_confusion_matrix(test_cm)
 
     save_confusion_matrix_image(
         cm=test_cm,
@@ -2219,6 +1880,7 @@ def train_one_unet_fold(
         "best_val_mean_f1": float(best_val_mean_f1),
         "test_loss": float(test_loss),
         "test_mean_f1": float(test_mean_f1),
+        "test_event_f1_agnostic": float(test_event_f1_agnostic),
         "test_mean_iou": float(test_mean_iou),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
         "fold_elapsed_seconds": fold_elapsed_sec,

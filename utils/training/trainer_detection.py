@@ -1,4 +1,4 @@
-"""
+﻿"""
 Trainer for event detection models (MuSSED).
 
 This module provides training for event detector models that output temporal
@@ -17,18 +17,22 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import confusion_matrix
 from scipy.special import softmax
 
-from utils.train_utils import (
+from utils.evaluation.metrics_core import (
+    event_f1_agnostic_from_confusion_matrix,
+    macro_f1_6c_from_confusion_matrix,
+)
+from utils.training.train_utils import (
     cleanup_gpu_cache,
     save_confusion_matrix_image,
     MultiStation1DDataset,
     BalancedBatchSampler,
 )
-from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.model_registry import EVENT_DETECTION_EVAL_DEFAULTS, get_model_spec
-from utils.event_detection_loss import EventDetectionLoss
-from utils.event_detection_metrics import EventDetectionMetrics, is_interval_match
-from utils.event_targets import batch_segmentation_to_events
-from utils.validation_plots import plot_event_validation
+from utils.evaluation.detection_prediction_utils import normalize_prediction_intervals
+from utils.core.registry import EVENT_DETECTION_EVAL_DEFAULTS, get_model_spec
+from utils.training.losses_detection import EventDetectionLoss
+from utils.evaluation.event_detection_metrics import EventDetectionMetrics, is_interval_match
+from utils.evaluation.event_targets import batch_segmentation_to_events
+from utils.evaluation.plots import plot_event_validation
 
 DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS = {
     "class_loss": 4.0,
@@ -43,7 +47,9 @@ DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS = {
 DEFAULT_EVENT_DETECTION_LOSS_CONFIG = {}
 
 
-def _normalize_event_detection_loss_weights(raw_weights: dict | None) -> dict[str, float]:
+def _normalize_event_detection_loss_weights(
+    raw_weights: dict | None,
+) -> dict[str, float]:
     """Normalize alias keys to EventDetectionLoss schema and cast to float."""
     if not raw_weights:
         return {}
@@ -72,11 +78,15 @@ def _normalize_event_detection_loss_weights(raw_weights: dict | None) -> dict[st
     return normalized
 
 
-def _resolve_event_detection_loss_weights(model_spec: dict, config: dict) -> dict[str, float]:
+def _resolve_event_detection_loss_weights(
+    model_spec: dict, config: dict
+) -> dict[str, float]:
     """Resolve final event-detection loss weights with precedence config > model spec > default."""
     resolved = dict(DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS)
 
-    spec_weights = _normalize_event_detection_loss_weights(model_spec.get("loss_weights"))
+    spec_weights = _normalize_event_detection_loss_weights(
+        model_spec.get("loss_weights")
+    )
     config_weights = _normalize_event_detection_loss_weights(config.get("loss_weights"))
 
     resolved.update(spec_weights)
@@ -84,14 +94,18 @@ def _resolve_event_detection_loss_weights(model_spec: dict, config: dict) -> dic
     return resolved
 
 
-def _resolve_event_detection_loss_config(model_spec: dict, config: dict) -> dict[str, str]:
+def _resolve_event_detection_loss_config(
+    model_spec: dict, config: dict
+) -> dict[str, str]:
     """Resolve non-numeric loss configuration (currently no active options)."""
     _ = model_spec
     _ = config
     return dict(DEFAULT_EVENT_DETECTION_LOSS_CONFIG)
 
 
-def _resolve_event_detection_eval_matching(model_spec: dict, config: dict) -> dict[str, float | str]:
+def _resolve_event_detection_eval_matching(
+    model_spec: dict, config: dict
+) -> dict[str, float | str]:
     """Resolve event-detection evaluation matching settings with config > model spec > defaults."""
     resolved: dict[str, float | str] = dict(EVENT_DETECTION_EVAL_DEFAULTS)
 
@@ -121,13 +135,10 @@ def _resolve_event_detection_eval_matching(model_spec: dict, config: dict) -> di
     overlap_threshold = float(resolved.get("overlap_recall_threshold", 0.8))
 
     if not (0.0 <= iou_threshold <= 1.0):
-        raise ValueError(
-            f"match_iou_threshold must be in [0, 1], got {iou_threshold}."
-        )
+        raise ValueError(f"match_iou_threshold must be in [0, 1], got {iou_threshold}.")
     if not (0.0 <= overlap_threshold <= 1.0):
         raise ValueError(
-            "overlap_recall_threshold must be in [0, 1], got "
-            f"{overlap_threshold}."
+            "overlap_recall_threshold must be in [0, 1], got " f"{overlap_threshold}."
         )
 
     return {
@@ -331,7 +342,10 @@ def build_validation_event_predictions_dataframe(
         raise ValueError(
             f"End shape mismatch: ends {pred_ends.shape} vs class_logits {class_logits.shape}."
         )
-    if pred_mask_logits is not None and pred_mask_logits.shape[:2] != class_logits.shape[:2]:
+    if (
+        pred_mask_logits is not None
+        and pred_mask_logits.shape[:2] != class_logits.shape[:2]
+    ):
         raise ValueError(
             "Mask logits shape mismatch: "
             f"mask_logits {pred_mask_logits.shape} vs class_logits {class_logits.shape}."
@@ -611,7 +625,9 @@ def build_validation_event_predictions_dataframe(
                     "pred_start": float(pred["start"]),
                     "pred_end": float(pred["end"]),
                     "pred_confidence": float(pred["pred_confidence"]),
-                    "pred_background_probability": float(pred["background_probability"]),
+                    "pred_background_probability": float(
+                        pred["background_probability"]
+                    ),
                     "mask_iou": np.nan,
                     "mask_start": np.nan,
                     "mask_end": np.nan,
@@ -660,7 +676,9 @@ def _class_agnostic_detection_iou_from_rows(
         return 0.0, 0.0
 
     matched = predictions_df[
-        predictions_df["match_type"].isin(["matched_correct_class", "matched_wrong_class"])
+        predictions_df["match_type"].isin(
+            ["matched_correct_class", "matched_wrong_class"]
+        )
     ]
     if matched.empty:
         return 0.0, 0.0
@@ -675,7 +693,7 @@ def _class_agnostic_detection_iou_from_rows(
 
 
 def train_one_event_detection_fold(
-    model_key_or_kwargs: str | dict,
+    model_key: str,
     fold_id: int,
     fold_data_dir: Path,
     fold_out_dir: Path,
@@ -686,7 +704,7 @@ def train_one_event_detection_fold(
     Train an event detection model (MuSSED) for one fold.
 
     Args:
-        model_key_or_kwargs: Model registry key (str) or model_kwargs dict
+        model_key: Model registry key (str)
         fold_id: Fold index
         fold_data_dir: Path to fold data (contains train_aug.npz, val.npz, test.npz)
         fold_out_dir: Output directory for checkpoints, reports, plots
@@ -726,16 +744,8 @@ def train_one_event_detection_fold(
     test_loader = DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False)
 
     # Load model
-    if isinstance(model_key_or_kwargs, str):
-        spec = get_model_spec(model_key_or_kwargs)
-        model = spec["model_cls"](**spec["model_kwargs"]).to(device)
-        model_key = model_key_or_kwargs
-    else:
-        # model_kwargs dict provided
-        raise NotImplementedError(
-            "Direct model_kwargs dict for MuSSED not yet implemented. "
-            "Please use model registry key."
-        )
+    spec = get_model_spec(model_key)
+    model = spec["model_cls"](**spec["model_kwargs"]).to(device)
 
     # Initialize loss function and metrics
     loss_weights = _resolve_event_detection_loss_weights(spec, config)
@@ -884,7 +894,9 @@ def train_one_event_detection_fold(
             train_loss_mask_dice += loss_dict.get("loss_mask_dice", 0.0).item()
             train_loss_unmatched_query += loss_dict["loss_unmatched_query"].item()
             train_metric_mask_iou += loss_dict.get("metric_mask_iou", 0.0).item()
-            train_metric_interval_iou += loss_dict.get("metric_interval_iou", 0.0).item()
+            train_metric_interval_iou += loss_dict.get(
+                "metric_interval_iou", 0.0
+            ).item()
             num_train_batches += 1
 
             # Print progress every few batches
@@ -949,7 +961,9 @@ def train_one_event_detection_fold(
                 val_loss_mask_dice += loss_dict.get("loss_mask_dice", 0.0).item()
                 val_loss_unmatched_query += loss_dict["loss_unmatched_query"].item()
                 val_metric_mask_iou += loss_dict.get("metric_mask_iou", 0.0).item()
-                val_metric_interval_iou += loss_dict.get("metric_interval_iou", 0.0).item()
+                val_metric_interval_iou += loss_dict.get(
+                    "metric_interval_iou", 0.0
+                ).item()
                 num_val_batches += 1
 
                 # Collect predictions for metrics computation
@@ -990,7 +1004,9 @@ def train_one_event_detection_fold(
             train_metric_mask_iou / num_train_batches if num_train_batches > 0 else 0.0
         )
         avg_train_interval_iou = (
-            train_metric_interval_iou / num_train_batches if num_train_batches > 0 else 0.0
+            train_metric_interval_iou / num_train_batches
+            if num_train_batches > 0
+            else 0.0
         )
 
         avg_val_loss = (
@@ -1340,7 +1356,7 @@ def train_one_event_detection_fold(
         )
 
         # Save metrics incrementally after each epoch (so data is preserved if training crashes)
-        from utils.metrics_reporter import save_training_history_detection
+        from utils.reports.training_history import save_training_history_detection
 
         save_training_history_detection(
             metrics_rows=metrics_rows,
@@ -1504,6 +1520,14 @@ def train_one_event_detection_fold(
             ]
         )
     )
+    test_macro_f1_6c = float(
+        macro_f1_6c_from_confusion_matrix(test_detection_summary["confusion_matrix"])
+    )
+    test_event_f1_agnostic = float(
+        event_f1_agnostic_from_confusion_matrix(
+            test_detection_summary["confusion_matrix"]
+        )
+    )
     test_mean_iou = float(test_temporal_iou_agnostic)
     fold_elapsed_sec = float(time.time() - fold_start)
 
@@ -1534,13 +1558,18 @@ def train_one_event_detection_fold(
         "last_val_pred_start_err_true": float(last_val_pred_start_err_true),
         "last_val_pred_end_err_true": float(last_val_pred_end_err_true),
         "test_loss": float(avg_test_loss),
+        "macro_f1_6c": float(test_macro_f1_6c),
+        "event_f1_agnostic": float(test_event_f1_agnostic),
+        "event_iou_active_only": float(test_mean_iou),
         "test_mean_f1": float(test_macro_f1),
         "test_mean_iou": float(test_mean_iou),
         "test_f1_per_class": [float(x) for x in test_f1_per_class],
         "test_temporal_iou_detection_agnostic": float(test_temporal_iou_agnostic),
         "test_mask_iou_detection_agnostic": float(test_mask_iou_agnostic),
         "test_interval_iou": float(avg_test_interval_iou),
-        "test_interval_mask_iou_gap": float(abs(avg_test_interval_iou - avg_test_mask_iou)),
+        "test_interval_mask_iou_gap": float(
+            abs(avg_test_interval_iou - avg_test_mask_iou)
+        ),
         "test_mAP": float(test_metrics.get("mAP", 0.0)),
         "test_mask_iou": float(avg_test_mask_iou),
         "matching_strategy": matching_strategy,
@@ -1596,3 +1625,4 @@ def train_one_event_detection_fold(
     cleanup_gpu_cache()
 
     return fold_summary
+

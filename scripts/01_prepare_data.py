@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.data_utils import (
+from utils.data.data_utils import (
     CLASS_TO_ID,
     build_stratified_kfold_specs,
     collect_volcano_samples,
@@ -124,9 +124,9 @@ def main() -> None:
             extra_fields=common_fields,
         )
 
-        val_perm = np.random.default_rng(seed=RANDOM_SEED + 30000 + fold_idx).permutation(
-            len(val_paths)
-        )
+        val_perm = np.random.default_rng(
+            seed=RANDOM_SEED + 30000 + fold_idx
+        ).permutation(len(val_paths))
         save_manifest(
             split_dir / "val.npz",
             filepaths=val_paths[val_perm],
@@ -135,9 +135,9 @@ def main() -> None:
             extra_fields=common_fields,
         )
 
-        test_perm = np.random.default_rng(seed=RANDOM_SEED + 40000 + fold_idx).permutation(
-            len(test_paths)
-        )
+        test_perm = np.random.default_rng(
+            seed=RANDOM_SEED + 40000 + fold_idx
+        ).permutation(len(test_paths))
         save_manifest(
             split_dir / "test.npz",
             filepaths=test_paths[test_perm],

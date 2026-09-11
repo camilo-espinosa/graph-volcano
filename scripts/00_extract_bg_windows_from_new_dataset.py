@@ -1,4 +1,4 @@
-"""Extract fixed background windows from NEW_DATASET AV traces.
+﻿"""Extract fixed background windows from NEW_DATASET AV traces.
 
 Behavior per input trace:
 1) Load trace.
@@ -27,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.script_common import resolve_project_path
+from utils.core.paths import resolve_project_path
 
 DEFAULT_TRACES_DIR = Path(r"D:\Camilo\Volcanes_UFRO\DATOS\NEW_DATASET\traces\AV")
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "NVCHVC" / "BG"
@@ -230,3 +230,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

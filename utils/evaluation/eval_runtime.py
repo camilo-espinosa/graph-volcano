@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -8,17 +8,21 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from utils.detection_prediction_utils import normalize_prediction_intervals
-from utils.event_detection_loss import EventDetectionLoss
-from utils.event_detection_metrics import EventDetectionMetrics
-from utils.event_targets import batch_segmentation_to_events
-from utils.trainer_detection import (
-    _class_agnostic_detection_iou_from_rows,
+from utils.evaluation.detection_prediction_utils import normalize_prediction_intervals
+from utils.evaluation.metrics_core import (
+    detection_temporal_iou_active_only_from_rows,
+    event_iou_active_only_from_class_indices,
+    macro_f1_6c_from_confusion_matrix,
+)
+from utils.training.losses_detection import EventDetectionLoss
+from utils.evaluation.event_detection_metrics import EventDetectionMetrics
+from utils.evaluation.event_targets import batch_segmentation_to_events
+from utils.training.trainer_detection import (
     build_validation_event_predictions_dataframe,
     _resolve_event_detection_eval_matching,
     _resolve_event_detection_loss_weights,
 )
-from utils.train_utils import (
+from utils.training.train_utils import (
     MultiStation1DDataset,
     UNetPatchDataset,
     cleanup_gpu_cache,
@@ -203,9 +207,9 @@ def evaluate_unet_checkpoint(
         else 0.0
     )
 
-    # Class-agnostic event-vs-background IoU over temporal masks.
-    event_inter = 0
-    event_union = 0
+    # Event IoU over active windows only (windows with any true or predicted event).
+    event_iou_weighted_sum = 0.0
+    active_window_count = 0
     with torch.inference_mode():
         for xb, y_onehot, _ in loader:
             xb = xb.to(device)
@@ -213,13 +217,23 @@ def evaluate_unet_checkpoint(
             out = model(xb)
             pred_idx = torch.argmax(out, dim=1)
             true_idx = torch.argmax(y_onehot, dim=1)
-            pred_event = pred_idx > 0
-            true_event = true_idx > 0
-            event_inter += int(torch.logical_and(pred_event, true_event).sum().item())
-            event_union += int(torch.logical_or(pred_event, true_event).sum().item())
+            iou_batch = event_iou_active_only_from_class_indices(
+                pred_class_idx=pred_idx.detach().cpu().numpy(),
+                true_class_idx=true_idx.detach().cpu().numpy(),
+            )
+            active_windows_batch = torch.logical_or(pred_idx > 0, true_idx > 0).any(
+                dim=1
+            )
+            n_active_batch = int(active_windows_batch.sum().item())
+            event_iou_weighted_sum += float(iou_batch) * float(n_active_batch)
+            active_window_count += int(n_active_batch)
             del xb, y_onehot, out
 
-    mean_iou = float(event_inter / event_union) if event_union > 0 else 0.0
+    mean_iou = (
+        float(event_iou_weighted_sum / active_window_count)
+        if active_window_count > 0
+        else 0.0
+    )
 
     n_samples = int(len(ds))
     del ds, loader
@@ -263,8 +277,12 @@ def evaluate_event_detection_checkpoint(
 
     active_event_ids, _ = active_event_ids_from_label_ids(ds.label_ids)
 
-    loss_weights = _resolve_event_detection_loss_weights(model_spec=model_spec, config={})
-    eval_matching = _resolve_event_detection_eval_matching(model_spec=model_spec, config={})
+    loss_weights = _resolve_event_detection_loss_weights(
+        model_spec=model_spec, config={}
+    )
+    eval_matching = _resolve_event_detection_eval_matching(
+        model_spec=model_spec, config={}
+    )
     loss_fn = EventDetectionLoss(
         num_classes=6,
         loss_weights=loss_weights,
@@ -310,7 +328,9 @@ def evaluate_event_detection_checkpoint(
         matching_strategy=str(eval_matching["matching_strategy"]),
         overlap_recall_threshold=float(eval_matching["overlap_recall_threshold"]),
     )
-    temporal_iou_agnostic, _ = _class_agnostic_detection_iou_from_rows(predictions_df)
+    temporal_iou_agnostic, _ = detection_temporal_iou_active_only_from_rows(
+        predictions_df
+    )
 
     detection_summary = metrics_fn.compute_detection_summary(
         all_predictions,
@@ -335,12 +355,7 @@ def evaluate_event_detection_checkpoint(
             "No active event classes found in event-detection evaluation target set."
         )
     mean_f1 = float(
-        np.mean(
-            [
-                float(detection_summary["per_class_f1"].get(class_id, 0.0))
-                for class_id in active_event_class_ids
-            ]
-        )
+        macro_f1_6c_from_confusion_matrix(detection_summary["confusion_matrix"])
     )
     mean_iou = float(temporal_iou_agnostic)
 
@@ -394,3 +409,4 @@ def load_checkpoint_into_model(
 
     del ckpt
     cleanup_gpu_cache()
+

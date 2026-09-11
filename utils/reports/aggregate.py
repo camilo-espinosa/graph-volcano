@@ -1,6 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from utils.train_utils import compute_summary
+from utils.training.train_utils import compute_summary
 
 
 def compute_per_class_summary(
@@ -12,3 +12,4 @@ def compute_per_class_summary(
         values = [float(v[class_idx]) for v in per_fold_values]
         per_class_summary[class_name] = compute_summary(values)
     return per_class_summary
+
