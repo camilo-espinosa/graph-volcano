@@ -27,24 +27,10 @@ EVENT_DETECTION_EVAL_DEFAULTS: dict[str, float | str] = {
 }
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {
-   "MuSSED": {
-        "family": "event_detection",
-        "trainer_kind": "event_detection",
-        "model_cls": MuSSED,
-        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False},
-        "batch_size": 16,
-    },
-    "MuSSeg": {
-        "family": "phasenet",
-        "trainer_kind": "1d",
-        "model_cls": MuSSeg,
-        "model_kwargs": {},
-        "batch_size": 32,
-    },
-   # ---- Tier B: baselines ----
+    # ---- Tier B: baselines ----
     "unet": {
         "family": "unet",
-        "trainer_kind": "2d",
+        "trainer_kind": "segmentation",
         "model_cls": UNet,
         "model_kwargs": {
             "in_channels": 1,
@@ -56,7 +42,7 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "unet_attention": {
         "family": "unet",
-        "trainer_kind": "2d",
+        "trainer_kind": "segmentation",
         "model_cls": UNetBottleneckAttention,
         "model_kwargs": {
             "in_channels": 1,
@@ -72,14 +58,28 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "phasenet": {
         "family": "phasenet",
-        "trainer_kind": "1d",
+        "trainer_kind": "segmentation",
         "model_cls": PhaseNet,
         "model_kwargs": {},
         "batch_size": 64,
     },
+    "MuSSED": {
+        "family": "event_detection",
+        "trainer_kind": "event_detection",
+        "model_cls": MuSSED,
+        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False},
+        "batch_size": 16,
+    },
+    "MuSSeg": {
+        "family": "phasenet",
+        "trainer_kind": "segmentation",
+        "model_cls": MuSSeg,
+        "model_kwargs": {},
+        "batch_size": 32,
+    },
     "phasenet_bottleneck_attention": {
         "family": "phasenet",
-        "trainer_kind": "1d",
+        "trainer_kind": "segmentation",
         "model_cls": PhaseNetBottleneckAttention,
         "model_kwargs": {},
         "batch_size": 64,
@@ -137,7 +137,9 @@ MODEL_SPECS = {
         "trainer_kind": spec["trainer_kind"],
         "batch_size": spec["batch_size"],
         "loss_weights": deepcopy(spec.get("loss_weights", {})),
-        "eval_matching": deepcopy(spec.get("eval_matching", EVENT_DETECTION_EVAL_DEFAULTS)),
+        "eval_matching": deepcopy(
+            spec.get("eval_matching", EVENT_DETECTION_EVAL_DEFAULTS)
+        ),
     }
     for key, spec in MODEL_REGISTRY.items()
 }

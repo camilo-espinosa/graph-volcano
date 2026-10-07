@@ -1,15 +1,8 @@
-﻿"""
-Unified trainer for 2D and 1D segmentation models (UNet, PhaseNet, MuSSeg).
-
-This module provides a single training entry point that handles both 2D and 1D
-segmentation models using conditional logic based on trainer_kind.
-"""
+"""Shared fold trainer for all segmentation models."""
 
 import json
 import time
 from pathlib import Path
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 import torch
@@ -19,15 +12,11 @@ from torch.utils.data import DataLoader
 from utils.evaluation.metrics_core import macro_f1_6c_from_confusion_matrix
 from utils.training.train_utils import (
     combined_dice_ce_loss,
-    combined_dice_ce_loss_2d,
     save_confusion_matrix_image,
     compute_event_f1_iou_multistation,
     save_event_plot_payloads,
-    evaluate_unet_model,
-    collect_unet_misclassified_event_plots,
     cleanup_gpu_cache,
     MultiStation1DDataset,
-    UNetPatchDataset,
     BalancedBatchSampler,
     event_vs_bg_f1_from_confusion_matrix,
 )
@@ -35,7 +24,6 @@ from utils.core.registry import get_model_spec
 
 
 def train_one_segmentation_fold(
-    trainer_kind: str,
     model_key: str,
     fold_id: int,
     fold_data_dir: Path,
@@ -44,10 +32,9 @@ def train_one_segmentation_fold(
     config: dict,
 ) -> dict:
     """
-    Train a segmentation model (2D or 1D) for one fold.
+    Train a segmentation model for one fold.
 
     Args:
-        trainer_kind: "2d" for UNet, "1d" for PhaseNet/MuSSeg
         model_key: Model registry key (str)
         fold_id: Fold index
         fold_data_dir: Path to fold data (contains train_aug.npz, val.npz, test.npz)
@@ -72,43 +59,18 @@ def train_one_segmentation_fold(
     train_manifest_name = str(config.get("train_manifest_name", "train_aug.npz"))
     train_manifest_path = fold_data_dir / train_manifest_name
 
-    # Load datasets and dataloaders based on trainer_kind
-    if trainer_kind == "2d":
-        train_ds = UNetPatchDataset(train_manifest_path)
-        val_ds = UNetPatchDataset(fold_data_dir / "val.npz")
-        test_ds = UNetPatchDataset(fold_data_dir / "test.npz")
+    train_ds = MultiStation1DDataset(train_manifest_path)
+    val_ds = MultiStation1DDataset(fold_data_dir / "val.npz")
+    test_ds = MultiStation1DDataset(fold_data_dir / "test.npz")
 
-        balanced_batch_sampler = BalancedBatchSampler(
-            train_ds.label_ids, batch_size=config["batch_size"]
-        )
-        train_loader = DataLoader(train_ds, batch_sampler=balanced_batch_sampler)
-        val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
-        test_loader = DataLoader(
-            test_ds, batch_size=config["batch_size"], shuffle=False
-        )
-
-        len_window = int(config.get("len_window", 8192))
-        im_size = int(config.get("im_size", 256))
-
-    elif trainer_kind == "1d":
-        train_ds = MultiStation1DDataset(train_manifest_path)
-        val_ds = MultiStation1DDataset(fold_data_dir / "val.npz")
-        test_ds = MultiStation1DDataset(fold_data_dir / "test.npz")
-
-        balanced_batch_sampler = BalancedBatchSampler(
-            train_ds.label_ids, batch_size=config["batch_size"]
-        )
-        train_loader = DataLoader(train_ds, batch_sampler=balanced_batch_sampler)
-        val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
-        test_loader = DataLoader(
-            test_ds, batch_size=config["batch_size"], shuffle=False
-        )
-
-        len_window = None
-        im_size = None
-
-    else:
-        raise ValueError(f"Unknown trainer_kind: {trainer_kind}")
+    balanced_batch_sampler = BalancedBatchSampler(
+        train_ds.label_ids, batch_size=config["batch_size"]
+    )
+    train_loader = DataLoader(train_ds, batch_sampler=balanced_batch_sampler)
+    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
+    test_loader = DataLoader(
+        test_ds, batch_size=config["batch_size"], shuffle=False
+    )
 
     # Load model
     spec = get_model_spec(model_key)
@@ -148,10 +110,7 @@ def train_one_segmentation_fold(
         train_loss_ce = 0.0
 
         for batch_idx, batch in enumerate(train_loader):
-            if trainer_kind == "2d":
-                xb, y_onehot, _y_idx = batch
-            else:  # 1d
-                xb, y_onehot = batch[0], batch[1]
+            xb, y_onehot, _y_idx = batch
 
             xb = xb.to(device)
             y_onehot = y_onehot.to(device)
@@ -159,22 +118,13 @@ def train_one_segmentation_fold(
             optimizer.zero_grad(set_to_none=True)
             out = model(xb)
 
-            if trainer_kind == "2d":
-                loss, dice_component, ce_component = combined_dice_ce_loss_2d(
-                    out,
-                    y_onehot,
-                    class_weights=None,
-                    dice_weight=config["dice_weight"],
-                    ce_weight=config["ce_weight"],
-                )
-            else:  # 1d
-                loss, dice_component, ce_component = combined_dice_ce_loss(
-                    out,
-                    y_onehot,
-                    class_weights=None,
-                    dice_weight=config["dice_weight"],
-                    ce_weight=config["ce_weight"],
-                )
+            loss, dice_component, ce_component = combined_dice_ce_loss(
+                out,
+                y_onehot,
+                class_weights=None,
+                dice_weight=config["dice_weight"],
+                ce_weight=config["ce_weight"],
+            )
 
             loss.backward()
             optimizer.step()
@@ -194,69 +144,36 @@ def train_one_segmentation_fold(
         scheduler.step()
 
         # Validation
-        if trainer_kind == "2d":
-            (
-                val_f1_per_class,
-                val_mean_f1,
-                val_mean_iou,
-                val_loss,
-                val_cm,
-            ) = evaluate_unet_model(
-                model=model,
-                dataloader=val_loader,
-                device=device,
-                len_window=len_window,
-                im_size=im_size,
-                config=config,
-            )
-            val_loss_dice = None
-            val_loss_ce = None
-        else:  # 1d
-            (
-                val_f1_per_class,
-                val_mean_f1,
-                val_mean_iou,
-                val_loss,
-                event_plot_payloads,
-                val_cm,
-            ) = compute_event_f1_iou_multistation(
-                model,
-                val_loader,
-                device,
-                return_cm=True,
-                return_val_loss=True,
-                return_event_plot_payloads=True,
-                save_event_plots=False,
-                event_plots_dir=val_plot_dir,
-                max_event_plots=config.get("val_plot_events", 15),
-                epoch=epoch,
-            )
-            val_loss_dice = None
-            val_loss_ce = None
+        (
+            val_f1_per_class,
+            val_mean_f1,
+            val_mean_iou,
+            val_loss,
+            event_plot_payloads,
+            val_cm,
+        ) = compute_event_f1_iou_multistation(
+            model,
+            val_loader,
+            device,
+            return_cm=True,
+            return_val_loss=True,
+            return_event_plot_payloads=True,
+            save_event_plots=False,
+            event_plots_dir=val_plot_dir,
+            max_event_plots=config.get("val_plot_events", 15),
+            epoch=epoch,
+        )
 
         val_event_f1_agnostic = event_vs_bg_f1_from_confusion_matrix(val_cm)
 
         is_best_val_mean_f1_epoch = float(val_mean_f1) > float(best_val_mean_f1)
 
         if is_best_val_mean_f1_epoch:
-            if trainer_kind == "1d":
-                saved_plot_count = save_event_plot_payloads(
-                    event_plot_payloads,
-                    val_plot_dir,
-                    epoch=epoch,
-                )
-            else:  # 2d
-                saved_plot_count = save_event_plot_payloads(
-                    collect_unet_misclassified_event_plots(
-                        model=model,
-                        npz_path=fold_data_dir / "val.npz",
-                        device=device,
-                        max_per_class=int(config.get("val_plot_events", 0)),
-                        class_names=["BG", "VT", "LP", "TR", "AV", "IC"],
-                    ),
-                    val_plot_dir,
-                    epoch=epoch,
-                )
+            saved_plot_count = save_event_plot_payloads(
+                event_plot_payloads,
+                val_plot_dir,
+                epoch=epoch,
+            )
 
             save_confusion_matrix_image(
                 cm=val_cm,
@@ -373,8 +290,7 @@ def train_one_segmentation_fold(
             f"saved_best_plots={saved_plot_count}"
         )
 
-        if trainer_kind == "1d":
-            del event_plot_payloads
+        del event_plot_payloads
         del val_cm
         cleanup_gpu_cache()
 
@@ -396,39 +312,23 @@ def train_one_segmentation_fold(
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    if trainer_kind == "2d":
-        (
-            test_f1_per_class,
-            test_mean_f1,
-            test_mean_iou,
-            test_loss,
-            test_cm,
-        ) = evaluate_unet_model(
-            model=model,
-            dataloader=test_loader,
-            device=device,
-            len_window=len_window,
-            im_size=im_size,
-            config=config,
-        )
-    else:  # 1d
-        (
-            test_f1_per_class,
-            test_mean_f1,
-            test_mean_iou,
-            test_loss,
-            test_cm,
-        ) = compute_event_f1_iou_multistation(
-            model,
-            test_loader,
-            device,
-            return_cm=True,
-            return_val_loss=True,
-            return_event_plot_payloads=False,
-            save_event_plots=False,
-            max_event_plots=0,
-            epoch=None,
-        )
+    (
+        test_f1_per_class,
+        test_mean_f1,
+        test_mean_iou,
+        test_loss,
+        test_cm,
+    ) = compute_event_f1_iou_multistation(
+        model,
+        test_loader,
+        device,
+        return_cm=True,
+        return_val_loss=True,
+        return_event_plot_payloads=False,
+        save_event_plots=False,
+        max_event_plots=0,
+        epoch=None,
+    )
 
     test_cm_path = cm_dir / "confusion_matrix_test_best_f1.png"
     save_confusion_matrix_image(
@@ -446,7 +346,7 @@ def train_one_segmentation_fold(
         macro_f1_6c = float(test_mean_f1)
 
     fold_summary = {
-        "trainer_kind": trainer_kind,
+        "trainer_kind": "segmentation",
         "fold": int(fold_id),
         "n_train": int(len(train_ds)),
         "n_val": int(len(val_ds)),
@@ -475,4 +375,3 @@ def train_one_segmentation_fold(
     cleanup_gpu_cache()
 
     return fold_summary
-

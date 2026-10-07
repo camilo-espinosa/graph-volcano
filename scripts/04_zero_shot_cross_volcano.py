@@ -42,9 +42,7 @@ from utils.core.registry import MODEL_SPECS
 from utils.evaluation.eval_runtime import (
     evaluate_event_detection_checkpoint,
     evaluate_multistation_checkpoint as evaluate_multistation_checkpoint_on_target,
-    evaluate_unet_checkpoint as evaluate_unet_checkpoint_on_target,
     load_checkpoint_into_model,
-    load_unet_shape_and_loss,
 )
 from utils.evaluation.metrics_core import (
     event_f1_agnostic_from_confusion_matrix,
@@ -62,8 +60,6 @@ from utils.training.train_utils import (
 
 CLASS_NAMES = ["VT", "LP", "TR", "AV", "IC"]
 FOLDS = range(1, 6)
-LEN_WINDOW = 8192
-IM_SIZE = 256
 
 RESULTS_ROOT = PROJECT_ROOT / "results"
 EXPERIMENTS_ROOT = RESULTS_ROOT / "experiments"
@@ -364,10 +360,6 @@ def main() -> None:
         args.targets, discovered_targets, "target volcanoes"
     )
 
-    init_features, depth, dice_weight, ce_weight = load_unet_shape_and_loss(
-        experiment_root
-    )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     run_manifest = {
@@ -392,14 +384,6 @@ def main() -> None:
         "save_confusion_matrices": True,
         "scramble_stations": False,
         "station_scramble_seed": int(args.station_scramble_seed),
-        "unet_shape": {
-            "init_features": int(init_features),
-            "depth": int(depth),
-        },
-        "unet_loss": {
-            "dice_weight": float(dice_weight),
-            "ce_weight": float(ce_weight),
-        },
         "folds": [int(f) for f in FOLDS],
         "model_specs": {
             key: {
@@ -514,7 +498,7 @@ def main() -> None:
 
                     batch_size = int(model_spec["batch_size"])
 
-                    if trainer_kind == "1d":
+                    if trainer_kind == "segmentation":
                         model_kwargs_runtime = dict(model_kwargs)
                         uses_station_info = bool(
                             model_kwargs_runtime.get("use_distance_attn_bias", False)
@@ -560,51 +544,6 @@ def main() -> None:
                             device=device,
                             scramble_stations=False,
                             station_scramble_seed=int(args.station_scramble_seed),
-                        )
-                    elif trainer_kind == "2d":
-                        model = model_spec["model_cls"](
-                            in_channels=1,
-                            out_channels=6,
-                            init_features=int(init_features),
-                            depth=int(depth),
-                            **{
-                                k: v
-                                for k, v in model_kwargs.items()
-                                if k
-                                not in {
-                                    "in_channels",
-                                    "out_channels",
-                                    "init_features",
-                                    "depth",
-                                }
-                            },
-                        ).to(device)
-                        load_checkpoint_into_model(
-                            model=model,
-                            checkpoint_path=ckpt_path,
-                            device=device,
-                            trainer_kind=trainer_kind,
-                        )
-                        (
-                            f1_per_class,
-                            mean_f1,
-                            mean_iou,
-                            eval_loss,
-                            cm,
-                            n_samples,
-                            active_event_ids,
-                        ) = evaluate_unet_checkpoint_on_target(
-                            model=model,
-                            test_npz_path=test_npz_path,
-                            batch_size=batch_size,
-                            device=device,
-                            dice_weight=float(dice_weight),
-                            ce_weight=float(ce_weight),
-                            scramble_stations=False,
-                            station_scramble_seed=int(args.station_scramble_seed),
-                            class_names=CLASS_NAMES,
-                            len_window=LEN_WINDOW,
-                            im_size=IM_SIZE,
                         )
                     elif trainer_kind == "event_detection":
                         model = model_spec["model_cls"](**model_kwargs).to(device)
@@ -753,4 +692,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

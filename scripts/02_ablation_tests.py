@@ -491,10 +491,8 @@ def main() -> None:
             fold_out_dir = model_root / f"fold_{fold_id:02d}"
             trainer_kind = spec["trainer_kind"]
 
-            if trainer_kind in ("2d", "1d"):
-                # Unified segmentation trainer for both 2D and 1D models
+            if trainer_kind == "segmentation":
                 fold_summary = train_one_segmentation_fold(
-                    trainer_kind=trainer_kind,
                     model_key=model_key,
                     fold_id=fold_id,
                     fold_data_dir=fold_data_dir,
@@ -515,7 +513,7 @@ def main() -> None:
             else:
                 raise ValueError(
                     f"Unknown trainer_kind '{trainer_kind}' for model {model_key}. "
-                    f"Expected one of: '2d', '1d', 'event_detection'."
+                    "Expected one of: 'segmentation', 'event_detection'."
                 )
 
             validate_fold_summary_metric_contract(
@@ -547,4 +545,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

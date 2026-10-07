@@ -32,7 +32,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.evaluation.eval_runtime import load_checkpoint_into_model
-from utils.data.data_utils import activation_unstacking, patch_stacking_X
 from utils.evaluation.detection_prediction_utils import normalize_prediction_intervals
 from utils.core.io import checkpoint_path_for_fold
 from utils.core.registry import MODEL_SPECS, build_model_from_spec
@@ -1372,29 +1371,13 @@ def infer_one_model_fold(
             xb = torch.from_numpy(batch_x).to(device)
             trainer_kind = str(model_spec["trainer_kind"])
 
-            if trainer_kind == "1d":
+            if trainer_kind == "segmentation":
                 logits = model(xb)  # [B, C, T]
                 batch_events = decode_segmentation_events(
                     logits,
                     min_event_len_samples=seg_min_event_len_samples,
                     max_bg_hole_samples=seg_max_bg_hole_samples,
                 )
-            elif trainer_kind == "2d":
-                x2d = patch_stacking_X(xb, N=256)
-                logits_2d = model(x2d)
-                logits = activation_unstacking(
-                    logits_2d,
-                    len_window=window_size,
-                    N=256,
-                    n_classes=6,
-                    n_stations=8,
-                )
-                batch_events = decode_segmentation_events(
-                    logits,
-                    min_event_len_samples=seg_min_event_len_samples,
-                    max_bg_hole_samples=seg_max_bg_hole_samples,
-                )
-                del x2d, logits_2d
             elif trainer_kind == "event_detection":
                 missing_threshold = float(
                     getattr(

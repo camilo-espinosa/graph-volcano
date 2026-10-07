@@ -11,10 +11,15 @@ import torch.nn as nn
 
 
 class UNet(nn.Module):
+    _N_STATIONS = 8
+    _TRACE_LENGTH = 8192
+    _PATCH_SIZE = 256
+    _PATCHES_PER_TRACE = _TRACE_LENGTH // _PATCH_SIZE
+    _PATCH_GRID_SIZE = _N_STATIONS * _PATCHES_PER_TRACE
 
     def __init__(
         self,
-        in_channels=3,
+        in_channels=1,
         out_channels=1,
         init_features=32,
         depth=4,
@@ -22,6 +27,11 @@ class UNet(nn.Module):
     ):
         super(UNet, self).__init__()
 
+        if in_channels != 1:
+            raise ValueError(
+                "Trace-domain UNet input conversion produces one image channel; "
+                f"in_channels must be 1. Got: {in_channels}."
+            )
         if feature_dropout < 0.0 or feature_dropout >= 1.0:
             raise ValueError(
                 f"feature_dropout must be in [0, 1). Got: {feature_dropout}."
@@ -77,6 +87,7 @@ class UNet(nn.Module):
         )
 
     def forward(self, x):
+        x = self._waveforms_to_image(x)
         encodings = []
         for i in range(len(self.encoder_list)):
             x = self.encoder_list[i](x)
@@ -91,7 +102,41 @@ class UNet(nn.Module):
             x = torch.cat((x, encodings[-(i + 1)]), dim=1)
             x = self.decoder_list[i](x)
         x = self.final_dropout(x)
-        return self.conv(x)
+        return self._image_logits_to_trace(self.conv(x))
+
+    def _waveforms_to_image(self, x):
+        expected_shape = (self._N_STATIONS, self._TRACE_LENGTH)
+        if x.ndim != 3 or tuple(x.shape[1:]) != expected_shape:
+            raise ValueError(
+                "Expected waveform input [B, "
+                f"{self._N_STATIONS}, {self._TRACE_LENGTH}], "
+                f"got shape {tuple(x.shape)}."
+            )
+
+        patches = x.unfold(2, self._PATCH_SIZE, self._PATCH_SIZE)
+        return patches.permute(0, 2, 1, 3).reshape(
+            x.shape[0], 1, self._PATCH_GRID_SIZE, self._PATCH_SIZE
+        )
+
+    def _image_logits_to_trace(self, logits):
+        expected_spatial_shape = (self._PATCH_GRID_SIZE, self._PATCH_SIZE)
+        if logits.ndim != 4 or tuple(logits.shape[2:]) != expected_spatial_shape:
+            raise ValueError(
+                "Expected UNet image logits [B, C, "
+                f"{self._PATCH_GRID_SIZE}, {self._PATCH_SIZE}], "
+                f"got shape {tuple(logits.shape)}."
+            )
+
+        batch_size, n_classes = logits.shape[:2]
+        station_logits = logits.reshape(
+            batch_size,
+            n_classes,
+            self._PATCHES_PER_TRACE,
+            self._N_STATIONS,
+            self._PATCH_SIZE,
+        )
+        trace_logits = station_logits.mean(dim=3)
+        return trace_logits.reshape(batch_size, n_classes, self._TRACE_LENGTH)
 
     @staticmethod
     def _block(in_channels, features, name, feature_dropout):

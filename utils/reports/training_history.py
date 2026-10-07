@@ -261,7 +261,7 @@ def aggregate_fold_metrics(
 
     Args:
         fold_summaries: List of fold summary dicts from train_one_*_fold()
-        trainer_kind: "2d", "1d", or "event_detection"
+        trainer_kind: "segmentation" or "event_detection"
 
     Returns:
         Aggregated metrics dict with mean and std for:
@@ -310,7 +310,7 @@ def format_aggregated_results(
 
     Args:
         aggregated: Aggregated metrics dict from aggregate_fold_metrics()
-        trainer_kind: "2d", "1d", or "event_detection"
+        trainer_kind: "segmentation" or "event_detection"
 
     Returns:
         Formatted string for printing

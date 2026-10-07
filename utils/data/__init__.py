@@ -5,8 +5,6 @@ from .data_utils import (
     collect_volcano_samples,
     expand_training_set_with_augmentation,
     save_manifest,
-    activation_unstacking,
-    patch_stacking_X,
 )
 
 __all__ = [
@@ -16,6 +14,4 @@ __all__ = [
     "collect_volcano_samples",
     "expand_training_set_with_augmentation",
     "save_manifest",
-    "activation_unstacking",
-    "patch_stacking_X",
 ]

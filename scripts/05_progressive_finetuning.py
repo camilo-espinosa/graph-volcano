@@ -41,13 +41,10 @@ from utils.training.trainer_detection import (
 from utils.training.train_utils import (
     BalancedBatchSampler,
     MultiStation1DDataset,
-    UNetPatchDataset,
     cleanup_gpu_cache,
     combined_dice_ce_loss,
-    combined_dice_ce_loss_2d,
     compute_event_f1_iou_multistation,
     compute_summary,
-    evaluate_unet_model,
     save_confusion_matrix_image,
 )
 
@@ -143,8 +140,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--dice-weight", type=float, default=0.7)
     parser.add_argument("--ce-weight", type=float, default=0.3)
-    parser.add_argument("--len-window", type=int, default=8192)
-    parser.add_argument("--im-size", type=int, default=256)
     parser.add_argument(
         "--log-batches",
         type=int,
@@ -281,8 +276,6 @@ def _build_run_config(
         ),
         "dice_weight": float(args.dice_weight),
         "ce_weight": float(args.ce_weight),
-        "len_window": int(args.len_window),
-        "im_size": int(args.im_size),
         "log_batches": int(max(0, args.log_batches)),
     }
 
@@ -570,16 +563,10 @@ def _prepare_dataloaders(
     val_npz: Path,
     test_npz: Path,
     batch_size: int,
-    trainer_kind: str,
 ) -> tuple[object, object, object, DataLoader, DataLoader, DataLoader]:
-    if str(trainer_kind) == "2d":
-        train_ds = UNetPatchDataset(train_npz)
-        val_ds = UNetPatchDataset(val_npz)
-        test_ds = UNetPatchDataset(test_npz)
-    else:
-        train_ds = MultiStation1DDataset(train_npz)
-        val_ds = MultiStation1DDataset(val_npz)
-        test_ds = MultiStation1DDataset(test_npz)
+    train_ds = MultiStation1DDataset(train_npz)
+    val_ds = MultiStation1DDataset(val_npz)
+    test_ds = MultiStation1DDataset(test_npz)
 
     effective_batch_size = max(1, min(int(batch_size), len(train_ds)))
     train_sampler = BalancedBatchSampler(
@@ -646,7 +633,6 @@ def _train_one_run(
             val_npz=val_npz,
             test_npz=test_npz,
             batch_size=int(config["batch_size"]),
-            trainer_kind=str(trainer_kind),
         )
     )
 
@@ -722,23 +708,18 @@ def _train_one_run(
                 targets = batch_segmentation_to_events(y_onehot, normalize=True)
                 loss_dict = event_detection_loss_fn(out, targets)
                 loss = loss_dict["loss_total"]
-            else:
+            elif str(trainer_kind) == "segmentation":
                 out = model(xb)
-            if str(trainer_kind) == "2d":
-                loss, _, _ = combined_dice_ce_loss_2d(
-                    out,
-                    y_onehot,
-                    class_weights=None,
-                    dice_weight=float(config["dice_weight"]),
-                    ce_weight=float(config["ce_weight"]),
-                )
-            elif str(trainer_kind) == "1d":
                 loss, _, _ = combined_dice_ce_loss(
                     out,
                     y_onehot,
                     class_weights=None,
                     dice_weight=float(config["dice_weight"]),
                     ce_weight=float(config["ce_weight"]),
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported trainer kind '{trainer_kind}' for model '{model_key}'."
                 )
             loss.backward()
             optimizer.step()
@@ -757,22 +738,7 @@ def _train_one_run(
 
         mean_train_loss = float(train_loss / batch_count) if batch_count > 0 else 0.0
 
-        if str(trainer_kind) == "2d":
-            (
-                val_f1_per_class,
-                val_mean_f1,
-                val_mean_iou,
-                val_loss,
-                val_cm,
-            ) = evaluate_unet_model(
-                model=model,
-                dataloader=val_loader,
-                device=device,
-                len_window=int(config["len_window"]),
-                im_size=int(config["im_size"]),
-                config=config,
-            )
-        elif str(trainer_kind) == "1d":
+        if str(trainer_kind) == "segmentation":
             (
                 val_f1_per_class,
                 val_mean_f1,
@@ -783,7 +749,6 @@ def _train_one_run(
                 model,
                 val_loader,
                 device,
-                descriptor_names=None,
                 return_cm=True,
                 return_val_loss=True,
                 return_event_plot_payloads=False,
@@ -934,23 +899,7 @@ def _train_one_run(
     best_ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(best_ckpt["model_state_dict"])
 
-    if str(trainer_kind) == "2d":
-        (
-            test_f1_per_class,
-            test_mean_f1,
-            test_mean_iou,
-            test_loss,
-            test_cm,
-        ) = evaluate_unet_model(
-            model=model,
-            dataloader=test_loader,
-            device=device,
-            len_window=int(config["len_window"]),
-            im_size=int(config["im_size"]),
-            config=config,
-        )
-        test_map = float("nan")
-    elif str(trainer_kind) == "1d":
+    if str(trainer_kind) == "segmentation":
         (
             test_f1_per_class,
             test_mean_f1,
@@ -961,7 +910,6 @@ def _train_one_run(
             model,
             test_loader,
             device,
-            descriptor_names=None,
             return_cm=True,
             return_val_loss=True,
             return_event_plot_payloads=False,
@@ -1109,8 +1057,6 @@ def main() -> None:
         "lr_final": float(args.lr_final),
         "dice_weight": float(args.dice_weight),
         "ce_weight": float(args.ce_weight),
-        "len_window": int(args.len_window),
-        "im_size": int(args.im_size),
         "log_batches": int(max(0, args.log_batches)),
         "protocol": str(args.protocol),
         "rerun_completed": bool(args.rerun_completed),
@@ -1208,9 +1154,9 @@ def main() -> None:
                 raise KeyError(f"Unknown model key: {model_key}")
             spec = get_model_spec(model_key)
             trainer_kind = str(spec["trainer_kind"])
-            if trainer_kind not in {"1d", "2d", "event_detection"}:
+            if trainer_kind not in {"segmentation", "event_detection"}:
                 raise ValueError(
-                    f"Progressive finetuning currently supports only 1d/2d/event_detection models; got {model_key} ({trainer_kind})"
+                    f"Progressive finetuning currently supports only segmentation/event_detection models; got {model_key} ({trainer_kind})"
                 )
 
             for repeat_idx in selected_folds:
@@ -1369,4 +1315,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
