@@ -1,14 +1,11 @@
 # Third-party dependencies used in models/, scripts/, and utils/
 # Install PyTorch separately to select the proper CUDA build.
-# This project uses torch 2.12.0+cu132 in the venv.
-# Use the matching PyG wheel index to avoid source builds.
+# This project uses torch 2.6.0+cu124 in the venv.
 
--f https://data.pyg.org/whl/torch-2.12.0+cu132.html
-
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
 numpy
 pandas
 matplotlib
 scikit-learn
-packaging
-pyg-lib
-torch-geometric
