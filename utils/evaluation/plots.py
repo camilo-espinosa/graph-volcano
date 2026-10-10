@@ -8,6 +8,7 @@ Handles:
 """
 
 import gc
+import warnings
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -238,7 +239,16 @@ def plot_event_validation(
     tracked_class_ids: list[int] | None = None
 
     need_station_attention = attention_mode in {"station", "full"}
-    need_temporal_attention = attention_mode == "full"
+    need_temporal_attention = attention_mode == "full" and getattr(
+        model, "supports_temporal_attention", True
+    )
+    if attention_mode == "full" and not need_temporal_attention:
+        warnings.warn(
+            "This model has no temporal-attention module; generating station-only "
+            "attention plots.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     station_hook = (
         try_attach_station_attention_hook(model) if need_station_attention else None
@@ -1250,4 +1260,3 @@ class TemporalAttentionHook(AttentionHook):
         if collapse_stations:
             return attn_by_station.mean(axis=1)
         return attn_by_station
-

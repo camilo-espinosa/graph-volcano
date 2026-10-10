@@ -83,7 +83,13 @@ class StationAttentionBlock(nn.Module):
     Permutation-equivariant over the station dimension.
     """
 
-    def __init__(self, channels: int, heads: int = 4, ff_mult: int = 2):
+    def __init__(
+        self,
+        channels: int,
+        heads: int = 4,
+        ff_mult: int = 2,
+        attention_dropout: float = 0.0,
+    ):
         super().__init__()
         if channels % heads != 0:
             raise ValueError(
@@ -92,7 +98,7 @@ class StationAttentionBlock(nn.Module):
             )
         self.norm1 = nn.LayerNorm(channels)
         self.attn = nn.MultiheadAttention(
-            channels, heads, dropout=0.0, batch_first=True
+            channels, heads, dropout=attention_dropout, batch_first=True
         )
         self.norm2 = nn.LayerNorm(channels)
         self.ff = nn.Sequential(
@@ -140,7 +146,13 @@ class TemporalBottleneckAttention(nn.Module):
     temporal context.
     """
 
-    def __init__(self, channels: int, heads: int = 4, ff_mult: int = 2):
+    def __init__(
+        self,
+        channels: int,
+        heads: int = 4,
+        ff_mult: int = 2,
+        attention_dropout: float = 0.0,
+    ):
         super().__init__()
         if channels % heads != 0:
             raise ValueError(
@@ -149,7 +161,7 @@ class TemporalBottleneckAttention(nn.Module):
             )
         self.norm1 = nn.LayerNorm(channels)
         self.attn = nn.MultiheadAttention(
-            channels, heads, dropout=0.0, batch_first=True
+            channels, heads, dropout=attention_dropout, batch_first=True
         )
         self.norm2 = nn.LayerNorm(channels)
         self.ff = nn.Sequential(
@@ -256,6 +268,8 @@ class MultiStationTemporalEncoder(nn.Module):
         station_attn_ff_mult: int,
         station_mask_abs_sum_threshold: float = 0.0,
         memory_levels: Sequence[int] = (),
+        feature_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
     ):
         super().__init__()
         if depth < 2:
@@ -275,6 +289,7 @@ class MultiStationTemporalEncoder(nn.Module):
         self.use_bottleneck_attention = bool(bottleneck_attention)
         self.station_mask_abs_sum_threshold = float(station_mask_abs_sum_threshold)
         self.memory_levels = _validate_memory_levels(memory_levels, self.depth)
+        self.feature_dropout = nn.Dropout(float(feature_dropout))
 
         self.stem_conv = nn.Conv1d(
             1,
@@ -327,11 +342,17 @@ class MultiStationTemporalEncoder(nn.Module):
         self.last_bottleneck_effective_stride = self.bottleneck_stride
         self.capture_attention_weights = False
         self.station_attention = StationAttentionBlock(
-            self.output_channels, station_attn_heads, station_attn_ff_mult
+            self.output_channels,
+            station_attn_heads,
+            station_attn_ff_mult,
+            attention_dropout,
         )
         if self.use_bottleneck_attention:
             self.bottleneck_attention = TemporalBottleneckAttention(
-                self.output_channels, bottleneck_attn_heads, bottleneck_attn_ff_mult
+                self.output_channels,
+                bottleneck_attn_heads,
+                bottleneck_attn_ff_mult,
+                attention_dropout,
             )
         else:
             self.bottleneck_attention = None
@@ -429,6 +450,7 @@ class MultiStationTemporalEncoder(nn.Module):
 
         x = x[:, :, None, :]  # [B, S, 1, T]
         x = self._station_conv(x, self.stem_conv, self.stem_bn)
+        x = self.feature_dropout(x)
         x = x * station_valid_scale
 
         raw_level_station_features: dict[int, torch.Tensor] = {}
@@ -439,6 +461,7 @@ class MultiStationTemporalEncoder(nn.Module):
 
         for level, (conv_same, bn_same, conv_down, bn_down) in enumerate(self.levels):
             x = self._station_conv(x, conv_same, bn_same)
+            x = self.feature_dropout(x)
             x = x * station_valid_scale
 
             if level in self.memory_levels:
@@ -447,6 +470,7 @@ class MultiStationTemporalEncoder(nn.Module):
                 x = self.station_attention(
                     x, station_key_padding_mask=station_missing_mask
                 )
+                x = self.feature_dropout(x)
                 bottleneck_station_weights = self.station_attention.last_station_weights
                 x = x * station_valid_scale
             if conv_down is not None:
@@ -457,12 +481,14 @@ class MultiStationTemporalEncoder(nn.Module):
                     dilation=self.dilations[level],
                 )
                 x = self._station_conv(x, conv_down, bn_down)
+                x = self.feature_dropout(x)
                 x = x * station_valid_scale
 
         if self.bottleneck_attention is not None:
             bsz, n_stations, channels, t_len = x.shape
             x = x.reshape(bsz * n_stations, channels, t_len)
             x = self.bottleneck_attention(x)
+            x = self.feature_dropout(x)
             x = x.reshape(bsz, n_stations, channels, t_len)
             x = x * station_valid_scale
 
@@ -507,6 +533,7 @@ class SegmentationQueryHead(nn.Module):
         query_head_kernel_size: int = 31,
         use_query_cross_attention: bool = False,
         boundary_attn_heads: int = 4,
+        attention_dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -564,7 +591,7 @@ class SegmentationQueryHead(nn.Module):
             self.query_cross_attn = nn.MultiheadAttention(
                 embed_dim=self.query_head_channels,
                 num_heads=int(boundary_attn_heads),
-                dropout=0.0,
+                dropout=attention_dropout,
                 batch_first=True,
             )
             self.query_cross_ff_norm = nn.LayerNorm(self.query_head_channels)
@@ -702,11 +729,21 @@ class MuSSED(nn.Module):
         query_head_kernel_size: int = 3,
         use_query_cross_attention: bool = False,
         boundary_attn_heads: int = 4,
+        feature_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
     ):
         super().__init__()
 
         if query_dim < 1:
             raise ValueError(f"query_dim must be >= 1, got {query_dim}.")
+        if not 0.0 <= feature_dropout <= 1.0:
+            raise ValueError(
+                f"feature_dropout must be in [0, 1], got {feature_dropout}."
+            )
+        if not 0.0 <= attention_dropout <= 1.0:
+            raise ValueError(
+                f"attention_dropout must be in [0, 1], got {attention_dropout}."
+            )
 
         self.encoder = MultiStationTemporalEncoder(
             depth=depth,
@@ -721,7 +758,10 @@ class MuSSED(nn.Module):
             station_attn_ff_mult=station_attn_ff_mult,
             station_mask_abs_sum_threshold=station_mask_abs_sum_threshold,
             memory_levels=memory_levels,
+            feature_dropout=feature_dropout,
+            attention_dropout=attention_dropout,
         )
+        self.feature_dropout = nn.Dropout(float(feature_dropout))
 
         self.memory_levels = self.encoder.memory_levels
 
@@ -807,6 +847,7 @@ class MuSSED(nn.Module):
             query_head_kernel_size=int(query_head_kernel_size),
             use_query_cross_attention=bool(use_query_cross_attention),
             boundary_attn_heads=int(boundary_attn_heads),
+            attention_dropout=attention_dropout,
         )
 
         self.query_dim = int(query_dim)
@@ -848,6 +889,7 @@ class MuSSED(nn.Module):
             dim=2
         )
         fused_memory = self.fused_refine(fused_memory)
+        fused_memory = self.feature_dropout(fused_memory)
 
         predictions = self.detection_head(fused_memory)
         predictions["encoder_features"] = encoder_features

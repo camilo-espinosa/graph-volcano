@@ -1,4 +1,4 @@
-﻿"""
+"""
 5-fold ablation runner for the active model registry.
 
 How to run:
@@ -48,7 +48,12 @@ from utils.training.train_utils import (
     ensure_fold_data_exists,
 )
 from utils.training.trainer_segmentation import train_one_segmentation_fold
-from utils.training.trainer_detection import train_one_event_detection_fold
+from utils.training.trainer_detection import (
+    DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS,
+    build_test1_sweep_stage,
+    rank_test1_sweep_trials,
+    train_one_event_detection_fold,
+)
 from utils.core.io import is_training_fold_complete
 from utils.core.registry import (
     EVENT_DETECTION_EVAL_DEFAULTS,
@@ -66,7 +71,7 @@ CONFIG = {
     "batch_size": 16,
     "epochs": 100,
     "early_stop_patience": 15,
-    "lr": 5e-4,
+    "lr": 3e-4,
     "lr_final": 1e-5,
     "dice_weight": 0.7,
     "ce_weight": 0.3,
@@ -86,12 +91,6 @@ CONFIG = {
     ),
 }
 FOLDS = range(1, 6)
-
-# Learning-rate scaling defaults.
-# Effective LR per model is computed as:
-#   lr_eff = lr_base * (batch_size / lr_scale_ref_batch) ** lr_scale_alpha
-LR_SCALE_REF_BATCH = 16
-LR_SCALE_ALPHA = -0.25
 
 # ------------------------------ PATHS AND OUTPUTS -------------------------------
 DATA_ROOT = PROJECT_ROOT / "data" / "prepared_data" / CONFIG["volcano"] / "cv_5fold"
@@ -140,36 +139,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not skip folds that already have reports/fold_summary.json.",
     )
-    parser.add_argument(
-        "--lr-scale-ref-batch",
-        type=float,
-        default=LR_SCALE_REF_BATCH,
-        help=(
-            "Reference batch size used for LR scaling. "
-            "Effective lr = base_lr * (batch/ref_batch)^alpha."
-        ),
-    )
-    parser.add_argument(
-        "--lr-scale-alpha",
-        type=float,
-        default=1,  # LR_SCALE_ALPHA,
-        help=(
-            "Exponent for LR scaling by batch size. "
-            "Use 0 to disable scaling, 0.5 for sqrt scaling."
-        ),
-    )
     return parser.parse_args()
-
-
-def compute_scaled_lr(
-    base_lr: float, batch_size: int, ref_batch: float, alpha: float
-) -> float:
-    if ref_batch <= 0:
-        raise ValueError("--lr-scale-ref-batch must be > 0.")
-    if batch_size <= 0:
-        raise ValueError("Batch size must be > 0 for LR scaling.")
-    scale = (float(batch_size) / float(ref_batch)) ** float(alpha)
-    return float(base_lr) * scale
 
 
 def select_model_keys(raw_models: str | None) -> list[str]:
@@ -394,134 +364,154 @@ def main() -> None:
         if summary["label_counts"]:
             print(f"    label_counts={summary['label_counts']}")
     print(
-        "LR scaling: "
-        f"base_lr={CONFIG['lr']:.3e}, "
-        f"base_lr_final={CONFIG['lr_final']:.3e}, "
-        f"ref_batch={float(args.lr_scale_ref_batch):g}, "
-        f"alpha={float(args.lr_scale_alpha):g}"
+        "Test-1 staged sweep: capacity/loss screening -> "
+        "optimizer/LR/scheduler -> loss refinement -> dropout"
     )
+    print("Batch size is fixed at 16; learning rates are used without scaling.")
     print(f"Train manifest selected: {train_manifest_name}")
     if args.rerun_completed_folds:
         print("Completed folds will be rerun.")
     else:
         print("Completed folds will be skipped when fold summaries already exist.")
 
-    for model_key in selected:
-        spec = selected_specs[model_key]
-        model_root = experiment_root / "ablations" / model_key
-
-        model_config = dict(CONFIG)
-        model_batch_size = int(spec["batch_size"] or CONFIG["batch_size"])
-        model_config["batch_size"] = model_batch_size
-
-        scaled_lr = compute_scaled_lr(
-            base_lr=float(CONFIG["lr"]),
-            batch_size=model_batch_size,
-            ref_batch=float(args.lr_scale_ref_batch),
-            alpha=float(args.lr_scale_alpha),
-        )
-        scaled_lr_final = compute_scaled_lr(
-            base_lr=float(CONFIG["lr_final"]),
-            batch_size=model_batch_size,
-            ref_batch=float(args.lr_scale_ref_batch),
-            alpha=float(args.lr_scale_alpha),
-        )
-        model_config["lr"] = float(scaled_lr)
-        model_config["lr_final"] = float(scaled_lr_final)
-        model_config["train_manifest_name"] = train_manifest_name
-        explicit_loss_weights = resolve_event_detection_loss_weights(spec)
-        explicit_loss_config = resolve_event_detection_loss_config(spec)
-        if explicit_loss_weights:
-            model_config["loss_weights"] = explicit_loss_weights
-        if explicit_loss_config:
-            model_config["loss_config"] = explicit_loss_config
-
+    current_trials = build_test1_sweep_stage(
+        "a",
+        model_specs=selected_specs,
+        base_lr=float(CONFIG["lr"]),
+    )
+    for stage in ("a", "b", "c", "d"):
         print(
-            f"[{model_key}] batch_size={model_batch_size} | "
-            f"lr={model_config['lr']:.3e} | lr_final={model_config['lr_final']:.3e}"
+            f"Starting sweep stage {stage.upper()} with "
+            f"{len(current_trials)} trial configurations."
         )
-        if spec["trainer_kind"] == "event_detection":
-            if "loss_weights" in model_config:
-                print(f"[{model_key}] loss_weights=" f"{model_config['loss_weights']}")
-            else:
-                print(f"[{model_key}] loss_weights=<trainer defaults>")
-            if "loss_config" in model_config:
-                print(f"[{model_key}] loss_config={model_config['loss_config']}")
+        for trial in current_trials:
+            model_key = trial["model_key"]
+            spec = selected_specs[model_key]
+            trial_root = experiment_root / "ablations" / trial["trial_name"]
 
-        completed_folds = []
-        remaining_folds = []
-        for fold_id in selected_folds:
-            if not args.rerun_completed_folds and is_training_fold_complete(
-                model_root,
-                fold_id,
-            ):
-                load_and_validate_existing_fold_summary(
-                    model_root=model_root,
+            model_config = dict(CONFIG)
+            model_config.update(
+                {
+                    "batch_size": 16,
+                    "lr": float(trial["lr"]),
+                    "optimizer": trial["optimizer"],
+                    "scheduler": trial["scheduler"],
+                    "model_kwargs": {
+                        "feature_dropout": float(trial["feature_dropout"]),
+                        "attention_dropout": float(trial["attention_dropout"]),
+                    },
+                    "loss_weights": dict(trial["loss_weights"]),
+                    "matcher_costs": {
+                        "class": float(
+                            DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS["class_loss"]
+                        ),
+                        "bbox": float(
+                            DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS["bbox_loss"]
+                        ),
+                        "giou": float(
+                            DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS["giou_loss"]
+                        ),
+                    },
+                    "train_manifest_name": train_manifest_name,
+                }
+            )
+
+            print(
+                f"[{trial['trial_name']}] batch_size=16 "
+                f"lr={trial['lr']:.3e} optimizer={trial['optimizer']} "
+                f"scheduler={trial['scheduler']} "
+                f"feature_dropout={trial['feature_dropout']:.1f} "
+                f"attention_dropout={trial['attention_dropout']:.1f}"
+            )
+            print(f"  loss_weights={trial['loss_weights']}")
+
+            remaining_folds = []
+            for fold_id in selected_folds:
+                if not args.rerun_completed_folds and is_training_fold_complete(
+                    trial_root,
+                    fold_id,
+                ):
+                    load_and_validate_existing_fold_summary(
+                        model_root=trial_root,
+                        model_key=model_key,
+                        fold_id=fold_id,
+                    )
+                else:
+                    remaining_folds.append(fold_id)
+
+            for fold_id in remaining_folds:
+                fold_data_dir = DATA_ROOT / f"fold_{fold_id:02d}"
+                ensure_fold_data_exists(fold_data_dir)
+                selected_train_manifest = fold_data_dir / train_manifest_name
+                if not selected_train_manifest.exists():
+                    raise FileNotFoundError(
+                        f"Missing {train_manifest_name} for fold {fold_id:02d}: "
+                        f"{selected_train_manifest}. Run scripts/01_prepare_data.py first."
+                    )
+
+                fold_out_dir = trial_root / f"fold_{fold_id:02d}"
+                if spec["trainer_kind"] == "segmentation":
+                    fold_summary = train_one_segmentation_fold(
+                        model_key=model_key,
+                        fold_id=fold_id,
+                        fold_data_dir=fold_data_dir,
+                        fold_out_dir=fold_out_dir,
+                        device=device,
+                        config=model_config,
+                    )
+                elif spec["trainer_kind"] == "event_detection":
+                    fold_summary = train_one_event_detection_fold(
+                        model_key=model_key,
+                        fold_id=fold_id,
+                        fold_data_dir=fold_data_dir,
+                        fold_out_dir=fold_out_dir,
+                        device=device,
+                        config=model_config,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown trainer_kind '{spec['trainer_kind']}' for model "
+                        f"{model_key}."
+                    )
+
+                validate_fold_summary_metric_contract(
+                    fold_summary=fold_summary,
                     model_key=model_key,
                     fold_id=fold_id,
                 )
-                completed_folds.append(fold_id)
-            else:
-                remaining_folds.append(fold_id)
+            cleanup_gpu_cache()
 
-        if completed_folds:
+        ranked_trials = rank_test1_sweep_trials(
+            current_trials,
+            experiment_root,
+            selected_folds,
+        )
+        finalists = ranked_trials[:5]
+        print(f"Stage {stage.upper()} top configurations:")
+        for rank, trial in enumerate(finalists, start=1):
             print(
-                f"[{model_key}] Skipping completed folds: "
-                f"{[int(x) for x in completed_folds]}"
+                f"  {rank}. {trial['trial_name']} "
+                f"macro_f1_6c={trial['mean_macro_f1_6c']:.4f} "
+                f"event_iou_active_only={trial['mean_event_iou_active_only']:.4f}"
             )
-        if remaining_folds:
-            print(
-                f"[{model_key}] Remaining folds to run: "
-                f"{[int(x) for x in remaining_folds]}"
+
+        if stage == "a":
+            current_trials = build_test1_sweep_stage(
+                "b",
+                parent_trials=finalists,
+            )
+        elif stage == "b":
+            current_trials = build_test1_sweep_stage(
+                "c",
+                parent_trials=finalists,
+            )
+        elif stage == "c":
+            current_trials = build_test1_sweep_stage(
+                "d",
+                parent_trials=finalists,
             )
         else:
-            print(f"[{model_key}] All folds already completed; nothing to run.")
-            continue
-
-        for fold_id in remaining_folds:
-            fold_data_dir = DATA_ROOT / f"fold_{fold_id:02d}"
-            ensure_fold_data_exists(fold_data_dir)
-            selected_train_manifest = fold_data_dir / train_manifest_name
-            if not selected_train_manifest.exists():
-                raise FileNotFoundError(
-                    f"Missing {train_manifest_name} for fold {fold_id:02d}: {selected_train_manifest}. "
-                    "Run scripts/01_prepare_data.py first."
-                )
-
-            fold_out_dir = model_root / f"fold_{fold_id:02d}"
-            trainer_kind = spec["trainer_kind"]
-
-            if trainer_kind == "segmentation":
-                fold_summary = train_one_segmentation_fold(
-                    model_key=model_key,
-                    fold_id=fold_id,
-                    fold_data_dir=fold_data_dir,
-                    fold_out_dir=fold_out_dir,
-                    device=device,
-                    config=model_config,
-                )
-            elif trainer_kind == "event_detection":
-                # Event detection trainer for MuSSED
-                fold_summary = train_one_event_detection_fold(
-                    model_key=model_key,
-                    fold_id=fold_id,
-                    fold_data_dir=fold_data_dir,
-                    fold_out_dir=fold_out_dir,
-                    device=device,
-                    config=model_config,
-                )
-            else:
-                raise ValueError(
-                    f"Unknown trainer_kind '{trainer_kind}' for model {model_key}. "
-                    "Expected one of: 'segmentation', 'event_detection'."
-                )
-
-            validate_fold_summary_metric_contract(
-                fold_summary=fold_summary,
-                model_key=model_key,
-                fold_id=fold_id,
-            )
-        cleanup_gpu_cache()
+            print("Final Test-1 sweep ranking is shown above.")
 
     latest_dir = RESULTS_ROOT / "latest"
     latest_dir.mkdir(parents=True, exist_ok=True)

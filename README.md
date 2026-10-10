@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 - `scripts/01_prepare_data.py`: generates NVCHVC 5-fold dataset with inner validation and train-only augmentation.
 - `scripts/01b_prepare_cross-volcano_data.py`: prepares progressive finetuning splits (80/20) for CAU, VCA, and LDM target volcanoes.
-- `scripts/02_ablation_tests.py`: runs 5-fold training for the active registry models on NVCHVC.
+- `scripts/02_ablation_tests.py`: runs the staged 5-fold Test-1 MuSSED sweep on NVCHVC.
 - `scripts/02b_aggregate_ablation_results.py`: re-aggregates already completed ablation folds into summary/comparison tables.
 - `scripts/03_evaluate_nvchvc_station_scramble.py`: evaluates NVCHVC fold test sets with randomly scrambled station ordering.
 - `scripts/04_zero_shot_cross_volcano.py`: evaluates trained checkpoints in zero-shot mode on the progressive-finetuning held-out test sets.
@@ -59,6 +59,19 @@ python scripts/01b_prepare_cross-volcano_data.py
 ```bash
 python scripts/02_ablation_tests.py
 ```
+
+The Test-1 sweep keeps batch size fixed at 16 and compares MuSSED capacity,
+targeted loss-weight profiles, learning rate, optimizer, scheduler, feature
+dropout, and attention dropout in stages. It uses the active MuSSED capacity
+entries in `utils/core/registry.py`; restore the commented baseline registry
+entries before running the other model-evaluation workflows.
+
+With all 16 capacity entries selected, the default stages evaluate 208
+capacity/loss profiles, 80 optimizer/LR/scheduler configurations, 60 loss-weight
+refinements, and 45 independent feature-/attention-dropout combinations, each
+across the selected folds. The LR sweep uses `1e-4`, `3e-4`, `1e-3`, and `3e-3`;
+the optimizer/scheduler stage keeps the top five configurations from the prior
+stage by mean five-fold macro F1, with active-only event IoU as the tie-breaker.
 
 ### 3. Aggregate ablation outputs (optional if already trained)
 
@@ -85,5 +98,3 @@ python scripts/04b_zero_shot_cross_volcano_scrambled.py
 - Many evaluation/aggregation scripts default to `results/experiments/complete_experiment`.
 - `results/latest/` stores pointers to most recent artifacts.
 - The active evaluation scripts now write model-centric outputs without a `family` column in their new fold/summary CSVs.
-
-

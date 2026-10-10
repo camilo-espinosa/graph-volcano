@@ -9,6 +9,9 @@ from models.PhaseNet import PhaseNet
 from models.PhaseNet_bottleneck_attention import PhaseNetBottleneckAttention
 from models.MuSSeg import MuSSeg
 from models.MuSSED import MuSSED
+from models.MuSSED_FB import MuSSEDFB
+from models.MuSSED_TCN import MuSSEDTCN
+from models.MuSSED_v2 import MuSSED as MuSSEDv2
 from models.UNet import UNet
 from models.UNet_bottleneck_attention import UNetBottleneckAttention
 
@@ -26,64 +29,183 @@ EVENT_DETECTION_EVAL_DEFAULTS: dict[str, float | str] = {
     "overlap_recall_threshold": 0.8,
 }
 
-MODEL_REGISTRY: dict[str, dict[str, Any]] = {
-    # ---- Tier B: baselines ----
-    "unet": {
-        "family": "unet",
-        "trainer_kind": "segmentation",
-        "model_cls": UNet,
-        "model_kwargs": {
-            "in_channels": 1,
-            "out_channels": 6,
-            "init_features": 16,
-            "depth": 5,
-        },
-        "batch_size": 32,
-    },
-    "unet_attention": {
-        "family": "unet",
-        "trainer_kind": "segmentation",
-        "model_cls": UNetBottleneckAttention,
-        "model_kwargs": {
-            "in_channels": 1,
-            "out_channels": 6,
-            "init_features": 16,
-            "depth": 5,
-            "bottleneck_attn_heads": 4,
-            "bottleneck_attn_dropout": 0.2,
-            "bottleneck_attn_ff_mult": 2,
-            "feature_dropout": 0.2,
-        },
-        "batch_size": 32,
-    },
-    "phasenet": {
-        "family": "phasenet",
-        "trainer_kind": "segmentation",
-        "model_cls": PhaseNet,
-        "model_kwargs": {},
-        "batch_size": 64,
-    },
-    "MuSSED": {
+
+def _detection_spec(model_cls, model_kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {
         "family": "event_detection",
         "trainer_kind": "event_detection",
-        "model_cls": MuSSED,
-        "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False},
+        "model_cls": model_cls,
+        "model_kwargs": model_kwargs,
         "batch_size": 16,
-    },
-    "MuSSeg": {
-        "family": "phasenet",
-        "trainer_kind": "segmentation",
-        "model_cls": MuSSeg,
-        "model_kwargs": {},
-        "batch_size": 32,
-    },
-    "phasenet_bottleneck_attention": {
-        "family": "phasenet",
-        "trainer_kind": "segmentation",
-        "model_cls": PhaseNetBottleneckAttention,
-        "model_kwargs": {},
-        "batch_size": 64,
-    },
+    }
+
+
+def _baseline_mussed(key: str) -> tuple[str, type, dict[str, Any]]:
+    _, root, depth = key.split("_")
+    filters_root = int(root[1:])
+    layers = int(depth[1:])
+    return (
+        key,
+        MuSSED,
+        {
+            "num_queries": 1,
+            "use_query_cross_attention": False,
+            "filters_root": filters_root,
+            "depth": layers,
+            "stride": 2,
+            "dilation": 1,
+            "memory_levels": (0, 1) if layers == 3 else (0, 1, 2),
+        },
+    )
+
+
+def _tcn_config(channels: int, blocks: int) -> tuple[str, type, dict[str, Any]]:
+    return (
+        f"MuSSED_TCN_c{channels}_b{blocks}",
+        MuSSEDTCN,
+        {"channels": channels, "num_blocks": blocks, "num_queries": 1},
+    )
+
+
+def _filterbank_config(
+    bands: int, filters_root: int
+) -> tuple[str, type, dict[str, Any]]:
+    return (
+        f"MuSSED_FB_f{bands}_r{filters_root}",
+        MuSSEDFB,
+        {
+            "num_bands": bands,
+            "filters_root": filters_root,
+            "num_queries": 1,
+        },
+    )
+
+
+def _v2_config(root: int, depth: int) -> tuple[str, type, dict[str, Any]]:
+    return (
+        f"MuSSEDv2_r{root}_d{depth}",
+        MuSSEDv2,
+        {
+            "num_queries": 1,
+            "use_query_cross_attention": False,
+            "filters_root": root,
+            "depth": depth,
+            "stride": 2,
+            "dilation": 1,
+            "memory_levels": (0, 1, 2),
+        },
+    )
+
+
+def _ordered_detection_specs() -> dict[str, dict[str, Any]]:
+    medium = [
+        _baseline_mussed("MuSSED_r32_d4"),
+        _tcn_config(48, 10),
+        _filterbank_config(16, 48),
+        _v2_config(32, 4),
+    ]
+    light = [
+        _baseline_mussed("MuSSED_r24_d3"),
+        _tcn_config(32, 8),
+        _filterbank_config(8, 24),
+        _baseline_mussed("MuSSED_r32_d3"),
+        _tcn_config(32, 10),
+        _filterbank_config(8, 48),
+        _baseline_mussed("MuSSED_r24_d4"),
+        _tcn_config(32, 12),
+        _filterbank_config(16, 24),
+        _baseline_mussed("MuSSED_r48_d3"),
+        _tcn_config(48, 8),
+        _filterbank_config(32, 24),
+    ]
+    large = [
+        _baseline_mussed("MuSSED_r48_d4"),
+        _tcn_config(48, 12),
+        _filterbank_config(32, 48),
+        _baseline_mussed("MuSSED_r24_d5"),
+        _tcn_config(64, 8),
+        _baseline_mussed("MuSSED_r64_d3"),
+        _v2_config(48, 5),
+        _baseline_mussed("MuSSED_r32_d5"),
+        _tcn_config(64, 10),
+        _baseline_mussed("MuSSED_r24_d6"),
+        _baseline_mussed("MuSSED_r64_d4"),
+        _tcn_config(64, 12),
+        _baseline_mussed("MuSSED_r48_d5"),
+        _baseline_mussed("MuSSED_r32_d6"),
+        _baseline_mussed("MuSSED_r48_d6"),
+        _baseline_mussed("MuSSED_r64_d5"),
+        _baseline_mussed("MuSSED_r64_d6"),
+    ]
+
+    specs: dict[str, dict[str, Any]] = {}
+    for key, model_cls, model_kwargs in medium + light + large:
+        if key in specs:
+            raise ValueError(f"Duplicate event-detection model key: {key}")
+        specs[key] = _detection_spec(model_cls, model_kwargs)
+    return specs
+
+
+MODEL_REGISTRY: dict[str, dict[str, Any]] = {
+    # Disabled during the Test-1 MuSSED sweep. Restore these entries when
+    # running the other evaluation protocols.
+    # "unet": {
+    #     "family": "unet",
+    #     "trainer_kind": "segmentation",
+    #     "model_cls": UNet,
+    #     "model_kwargs": {
+    #         "in_channels": 1,
+    #         "out_channels": 6,
+    #         "init_features": 16,
+    #         "depth": 5,
+    #     },
+    #     "batch_size": 32,
+    # },
+    # "unet_attention": {
+    #     "family": "unet",
+    #     "trainer_kind": "segmentation",
+    #     "model_cls": UNetBottleneckAttention,
+    #     "model_kwargs": {
+    #         "in_channels": 1,
+    #         "out_channels": 6,
+    #         "init_features": 16,
+    #         "depth": 5,
+    #         "bottleneck_attn_heads": 4,
+    #         "bottleneck_attn_dropout": 0.2,
+    #         "bottleneck_attn_ff_mult": 2,
+    #         "feature_dropout": 0.2,
+    #     },
+    #     "batch_size": 32,
+    # },
+    # "phasenet": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "segmentation",
+    #     "model_cls": PhaseNet,
+    #     "model_kwargs": {},
+    #     "batch_size": 64,
+    # },
+    # "MuSSED": {
+    #     "family": "event_detection",
+    #     "trainer_kind": "event_detection",
+    #     "model_cls": MuSSED,
+    #     "model_kwargs": {"num_queries": 1, "use_query_cross_attention": False},
+    #     "batch_size": 16,
+    # },
+    # "MuSSeg": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "segmentation",
+    #     "model_cls": MuSSeg,
+    #     "model_kwargs": {},
+    #     "batch_size": 32,
+    # },
+    # "phasenet_bottleneck_attention": {
+    #     "family": "phasenet",
+    #     "trainer_kind": "segmentation",
+    #     "model_cls": PhaseNetBottleneckAttention,
+    #     "model_kwargs": {},
+    #     "batch_size": 64,
+    # },
+    **_ordered_detection_specs(),
 }
 
 

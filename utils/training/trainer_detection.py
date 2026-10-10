@@ -1,10 +1,11 @@
-﻿"""
+"""
 Trainer for event detection models (MuSSED).
 
 This module provides training for event detector models that output temporal
 event predictions rather than segmentation masks. Currently supports MuSSED.
 """
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -45,6 +46,285 @@ DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS = {
 }
 
 DEFAULT_EVENT_DETECTION_LOSS_CONFIG = {}
+EVENT_DETECTION_LOSS_COMPONENTS = (
+    "class_loss",
+    "confidence_loss",
+    "bbox_loss",
+    "giou_loss",
+    "mask_bce_loss",
+    "mask_dice_loss",
+)
+
+
+def build_event_detection_optimizer(
+    param_groups: list[dict],
+    optimizer_name: str,
+) -> torch.optim.Optimizer:
+    """Build the requested event-detection optimizer with the existing decay."""
+    name = str(optimizer_name).strip().lower()
+    if name == "adam":
+        return optim.Adam(param_groups, weight_decay=1e-4)
+    if name == "adamw":
+        return optim.AdamW(param_groups, weight_decay=1e-4)
+    raise ValueError(
+        f"Unsupported event-detection optimizer {optimizer_name!r}; "
+        "expected 'Adam' or 'AdamW'."
+    )
+
+
+def build_event_detection_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau:
+    """Build a configured scheduler while preserving the current cosine defaults."""
+    name = str(config.get("scheduler", "cosine")).strip().lower()
+    if name == "cosine":
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, int(config["epochs"] / 2)),
+        )
+    if name == "reduce_on_plateau":
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=float(config.get("plateau_factor", 0.5)),
+            patience=int(config.get("plateau_patience", 5)),
+            min_lr=[float(group.get("eta_min", config["lr_final"])) for group in optimizer.param_groups],
+        )
+    raise ValueError(
+        f"Unsupported event-detection scheduler {config.get('scheduler')!r}; "
+        "expected 'cosine' or 'reduce_on_plateau'."
+    )
+
+
+def _make_test1_sweep_trial(
+    *,
+    stage: str,
+    model_key: str,
+    parent_trial: str | None,
+    label: str,
+    model_kwargs: dict,
+    loss_weights: dict[str, float],
+    lr: float,
+    optimizer: str,
+    scheduler: str,
+    feature_dropout: float = 0.0,
+    attention_dropout: float = 0.0,
+) -> dict:
+    trial = {
+        "stage": stage,
+        "model_key": model_key,
+        "parent_trial": parent_trial,
+        "model_kwargs": dict(model_kwargs),
+        "loss_weights": dict(loss_weights),
+        "lr": float(lr),
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "feature_dropout": float(feature_dropout),
+        "attention_dropout": float(attention_dropout),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(trial, sort_keys=True, default=list).encode("utf-8")
+    ).hexdigest()[:8]
+    trial["trial_name"] = (
+        f"{model_key}__{stage}__{label}__{fingerprint}"
+    )
+    return trial
+
+
+def build_test1_sweep_stage(
+    stage: str,
+    *,
+    model_specs: dict[str, dict] | None = None,
+    parent_trials: list[dict] | None = None,
+    base_lr: float = 5e-4,
+) -> list[dict]:
+    """Return one staged set of Test-1 MuSSED sweep configurations."""
+    stage = str(stage).strip().lower()
+    trials: list[dict] = []
+
+    if stage == "a":
+        if not model_specs:
+            raise ValueError("Stage A requires at least one model specification.")
+        for model_key, spec in model_specs.items():
+            base_weights = dict(DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS)
+            base_weights.update(
+                _normalize_event_detection_loss_weights(spec.get("loss_weights"))
+            )
+            profiles: list[tuple[str, dict[str, float]]] = [("base", base_weights)]
+            for component in EVENT_DETECTION_LOSS_COMPONENTS:
+                for scale in (0.5, 2.0):
+                    weights = dict(base_weights)
+                    weights[component] *= scale
+                    profiles.append(
+                        (
+                            f"{component}_{str(scale).replace('.', 'p')}",
+                            weights,
+                        )
+                    )
+            for label, loss_weights in profiles:
+                trials.append(
+                    _make_test1_sweep_trial(
+                        stage="stage_a",
+                        model_key=model_key,
+                        parent_trial=None,
+                        label=label,
+                        model_kwargs=spec["model_kwargs"],
+                        loss_weights=loss_weights,
+                        lr=base_lr,
+                        optimizer="AdamW",
+                        scheduler="cosine",
+                    )
+                )
+        return trials
+
+    if not parent_trials:
+        raise ValueError(f"Stage {stage.upper()} requires parent trials.")
+
+    if stage == "b":
+        for parent in parent_trials:
+            for lr in (1e-4, 3e-4, 1e-3, 3e-3):
+                for optimizer_name in ("Adam", "AdamW"):
+                    for scheduler_name in ("cosine", "reduce_on_plateau"):
+                        label = (
+                            f"lr_{lr:.0e}_{optimizer_name.lower()}_"
+                            f"{scheduler_name}"
+                        )
+                        trials.append(
+                            _make_test1_sweep_trial(
+                                stage="stage_b",
+                                model_key=parent["model_key"],
+                                parent_trial=parent["trial_name"],
+                                label=label,
+                                model_kwargs=parent["model_kwargs"],
+                                loss_weights=parent["loss_weights"],
+                                lr=lr,
+                                optimizer=optimizer_name,
+                                scheduler=scheduler_name,
+                            )
+                        )
+        return trials
+
+    if stage == "c":
+        for parent in parent_trials:
+            for component in EVENT_DETECTION_LOSS_COMPONENTS:
+                for scale in (0.75, 1.25):
+                    weights = dict(parent["loss_weights"])
+                    weights[component] *= scale
+                    label = (
+                        f"{component}_{str(scale).replace('.', 'p')}"
+                    )
+                    trials.append(
+                        _make_test1_sweep_trial(
+                            stage="stage_c",
+                            model_key=parent["model_key"],
+                            parent_trial=parent["trial_name"],
+                            label=label,
+                            model_kwargs=parent["model_kwargs"],
+                            loss_weights=weights,
+                            lr=parent["lr"],
+                            optimizer=parent["optimizer"],
+                            scheduler=parent["scheduler"],
+                        )
+                    )
+        return trials
+
+    if stage == "d":
+        for parent in parent_trials:
+            for feature_dropout in (0.0, 0.1, 0.2):
+                for attention_dropout in (0.0, 0.1, 0.2):
+                    label = (
+                        f"feature_dropout_{str(feature_dropout).replace('.', 'p')}_"
+                        f"attention_dropout_{str(attention_dropout).replace('.', 'p')}"
+                    )
+                    trials.append(
+                        _make_test1_sweep_trial(
+                            stage="stage_d",
+                            model_key=parent["model_key"],
+                            parent_trial=parent["trial_name"],
+                            label=label,
+                            model_kwargs=parent["model_kwargs"],
+                            loss_weights=parent["loss_weights"],
+                            lr=parent["lr"],
+                            optimizer=parent["optimizer"],
+                            scheduler=parent["scheduler"],
+                            feature_dropout=feature_dropout,
+                            attention_dropout=attention_dropout,
+                        )
+                    )
+        return trials
+
+    raise ValueError(
+        f"Unsupported Test-1 sweep stage {stage!r}; expected 'a', 'b', 'c', or 'd'."
+    )
+
+
+def rank_test1_sweep_trials(
+    trials: list[dict],
+    experiment_root: Path,
+    folds: list[int],
+) -> list[dict]:
+    """Rank complete CV trials by mean macro F1, then active-only event IoU."""
+    ranked: list[dict] = []
+    for trial in trials:
+        trial_root = experiment_root / "ablations" / trial["trial_name"]
+        summaries = []
+        for fold_id in folds:
+            summary_path = (
+                trial_root / f"fold_{fold_id:02d}" / "reports" / "fold_summary.json"
+            )
+            if not summary_path.exists():
+                raise FileNotFoundError(
+                    f"Cannot rank incomplete sweep trial {trial['trial_name']}: "
+                    f"missing {summary_path}."
+                )
+            with summary_path.open("r", encoding="utf-8") as summary_file:
+                summaries.append(json.load(summary_file))
+
+        for metric in ("macro_f1_6c", "event_iou_active_only"):
+            missing = [summary for summary in summaries if metric not in summary]
+            if missing:
+                raise KeyError(
+                    f"Sweep trial {trial['trial_name']} is missing metric {metric!r} "
+                    "in one or more fold summaries."
+                )
+        ranked_trial = dict(trial)
+        ranked_trial["mean_macro_f1_6c"] = float(
+            np.mean([float(summary["macro_f1_6c"]) for summary in summaries])
+        )
+        ranked_trial["mean_event_iou_active_only"] = float(
+            np.mean(
+                [float(summary["event_iou_active_only"]) for summary in summaries]
+            )
+        )
+        ranked.append(ranked_trial)
+
+    return sorted(
+        ranked,
+        key=lambda trial: (
+            trial["mean_macro_f1_6c"],
+            trial["mean_event_iou_active_only"],
+        ),
+        reverse=True,
+    )
+
+
+def resolve_event_detection_matcher_costs(
+    model_spec: dict,
+    config: dict,
+) -> dict[str, float]:
+    """Keep assignment costs independent from loss-weight sweep values."""
+    costs = {
+        "class": float(DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS["class_loss"]),
+        "bbox": float(DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS["bbox_loss"]),
+        "giou": float(DEFAULT_EVENT_DETECTION_LOSS_WEIGHTS["giou_loss"]),
+    }
+    for source in (model_spec.get("matcher_costs"), config.get("matcher_costs")):
+        if source:
+            for key in costs:
+                if key in source:
+                    costs[key] = float(source[key])
+    return costs
 
 
 def _normalize_event_detection_loss_weights(
@@ -745,7 +1025,9 @@ def train_one_event_detection_fold(
 
     # Load model
     spec = get_model_spec(model_key)
-    model = spec["model_cls"](**spec["model_kwargs"]).to(device)
+    model_kwargs = dict(spec["model_kwargs"])
+    model_kwargs.update(config.get("model_kwargs", {}))
+    model = spec["model_cls"](**model_kwargs).to(device)
 
     # Initialize loss function and metrics
     loss_weights = _resolve_event_detection_loss_weights(spec, config)
@@ -755,6 +1037,7 @@ def train_one_event_detection_fold(
     matching_strategy = str(eval_matching["matching_strategy"])
     overlap_recall_threshold = float(eval_matching["overlap_recall_threshold"])
     eval_confidence_threshold = float(config.get("event_confidence_threshold", 0.5))
+    matcher_costs = resolve_event_detection_matcher_costs(spec, config)
 
     print(f"Resolved event-detection loss weights for {model_key}: {loss_weights}")
     print(f"Resolved event-detection loss config for {model_key}: {loss_config}")
@@ -767,6 +1050,9 @@ def train_one_event_detection_fold(
     loss_fn = EventDetectionLoss(
         num_classes=6,
         loss_weights=loss_weights,
+        matcher_cost_class=matcher_costs["class"],
+        matcher_cost_bbox=matcher_costs["bbox"],
+        matcher_cost_giou=matcher_costs["giou"],
     )
     metrics_fn = EventDetectionMetrics(num_classes=6)
 
@@ -807,11 +1093,11 @@ def train_one_event_detection_fold(
         group["initial_lr"] = group["lr"]
         group["eta_min"] = group["lr"] * (config["lr_final"] / config["lr"])
 
-    optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, int(config["epochs"] / 2)),
+    optimizer = build_event_detection_optimizer(
+        param_groups,
+        str(config.get("optimizer", "AdamW")),
     )
+    scheduler = build_event_detection_scheduler(optimizer, config)
 
     # Set eta_min for scheduler (will be overridden per param_group)
     for param_group in optimizer.param_groups:
@@ -913,8 +1199,6 @@ def train_one_event_detection_fold(
                     f"mask_dice={train_loss_mask_dice / (batch_idx + 1):.4f} "
                     f"unmatched={train_loss_unmatched_query / (batch_idx + 1):.4f}]"
                 )
-
-        scheduler.step()
 
         # Validation evaluation
         model.eval()
@@ -1148,6 +1432,10 @@ def train_one_event_detection_fold(
         # Keep a single IoU logic path: class-agnostic temporal IoU from the
         # same validation rows used for reporting.
         mean_iou = float(val_temporal_iou_agnostic)
+        if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(mean_f1)
+        else:
+            scheduler.step()
         class_precision_scores = [
             float(per_class_stats[class_id]["precision"]) for class_id in range(1, 6)
         ]
@@ -1625,4 +1913,3 @@ def train_one_event_detection_fold(
     cleanup_gpu_cache()
 
     return fold_summary
-
